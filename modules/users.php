@@ -7,20 +7,78 @@ include_once __DIR__ . '/../core/guard.php';
 // Router entry point. index.php calls this with the parsed action/id/method.
 function handle($action, $id, $method)
 {
-    // Every user-management action requires an authenticated Administrator.
-    requireAdmin();
-
+    // User management lives under the "security" module:
+    //   viewing the list needs Security = Viewer,
+    //   creating/updating/deleting needs Security = Editor.
+    // Administrators always pass (handled inside requirePermission).
     switch ($action) {
         case 'list':
+            requirePermission('security', 'Viewer');
             return usersList();
         case 'create':
+            requirePermission('security', 'Editor');
             return usersCreate();
         case 'update':
+            requirePermission('security', 'Editor');
             return usersUpdate($id);
         case 'delete':
+            requirePermission('security', 'Editor');
             return usersDelete($id);
         default:
             error("Unknown users action: {$action}", 404);
+    }
+}
+
+// Is the currently logged-in actor a true Administrator?
+// Used to stop non-admins from creating/elevating/deleting Administrator accounts.
+function actorIsAdmin()
+{
+    $id = currentUserId();
+    if (!$id) {
+        return false;
+    }
+    $stmt = db()->prepare("SELECT role FROM users WHERE user_id = :id");
+    $stmt->execute([':id' => $id]);
+    return $stmt->fetchColumn() === 'Administrator';
+}
+
+// The view-/manage- permission names the current actor personally holds.
+// Administrators hold the full set.
+function actorPermissionNames()
+{
+    $id = currentUserId();
+    if (!$id) {
+        return [];
+    }
+    $stmt = db()->prepare("SELECT role FROM users WHERE user_id = :id");
+    $stmt->execute([':id' => $id]);
+    if ($stmt->fetchColumn() === 'Administrator') {
+        return allPermissionNames();
+    }
+
+    $stmt = db()->prepare(
+        "SELECT p.permission_name, up.permission_level
+         FROM user_permissions up
+         JOIN permissions p ON p.permission_id = up.permission_id
+         WHERE up.user_id = :id"
+    );
+    $stmt->execute([':id' => $id]);
+    $names = [];
+    foreach ($stmt->fetchAll() as $r) {
+        $names = array_merge($names, expandModuleNames($r['permission_name'], $r['permission_level']));
+    }
+    return $names;
+}
+
+// Stop a non-Administrator from granting any permission they don't hold themselves.
+function guardGrantablePermissions($requested)
+{
+    if (actorIsAdmin()) {
+        return; // Administrators may grant anything.
+    }
+    $extra = array_values(array_diff($requested, actorPermissionNames()));
+    if (!empty($extra)) {
+        error('You can only grant permissions that you hold yourself.', 403);
     }
 }
 
@@ -34,14 +92,17 @@ function usersList()
 
     // Pull every user's permissions in one query, then group by user.
     $rows = db()->query(
-        "SELECT up.user_id, p.permission_name
+        "SELECT up.user_id, p.permission_name, up.permission_level
          FROM user_permissions up
          JOIN permissions p ON p.permission_id = up.permission_id"
     )->fetchAll();
 
     $permsByUser = [];
     foreach ($rows as $r) {
-        $permsByUser[$r['user_id']][] = $r['permission_name'];
+        $names = expandModuleNames($r['permission_name'], $r['permission_level']);
+        foreach ($names as $n) {
+            $permsByUser[$r['user_id']][] = $n;
+        }
     }
 
     // Administrators always have full access, regardless of stored rows.
@@ -85,6 +146,10 @@ function usersCreate()
     if (strlen($password) < 8) {
         error('Password must be at least 8 characters.', 422);
     }
+    // Only a true Administrator may create another Administrator (prevents escalation).
+    if ($role === 'Administrator' && !actorIsAdmin()) {
+        error('Only an Administrator can create an Administrator account.', 403);
+    }
 
     // Username must be unique.
     $check = db()->prepare("SELECT 1 FROM users WHERE username = :u");
@@ -96,7 +161,15 @@ function usersCreate()
     // Administrators get the full permission set automatically.
     if ($role === 'Administrator') {
         $perms = allPermissionNames();
+    } else {
+        // Security is an administrator-only module; never grant it to Staff.
+        $perms = array_values(array_filter($perms, function ($p) {
+            return $p !== 'view-security' && $p !== 'manage-security';
+        }));
     }
+
+    // A non-Administrator may only grant permissions they hold themselves.
+    guardGrantablePermissions($perms);
 
     $hash      = password_hash($password, PASSWORD_DEFAULT);
     $createdBy = currentUserId();
@@ -141,9 +214,10 @@ function usersUpdate($id)
         error('A valid user id is required.', 422);
     }
 
-    $existing = db()->prepare("SELECT user_id FROM users WHERE user_id = :id");
+    $existing = db()->prepare("SELECT role FROM users WHERE user_id = :id");
     $existing->execute([':id' => $id]);
-    if (!$existing->fetch()) {
+    $target = $existing->fetch();
+    if (!$target) {
         error('User not found.', 404);
     }
 
@@ -165,6 +239,11 @@ function usersUpdate($id)
     if (!in_array($status, validStatuses(), true)) {
         error('Status must be Active or Inactive.', 422);
     }
+    // Only a true Administrator may edit an existing Administrator, or promote anyone
+    // to Administrator (prevents a Security-Editor from escalating privileges).
+    if (!actorIsAdmin() && ($target['role'] === 'Administrator' || $role === 'Administrator')) {
+        error('Only an Administrator can modify Administrator accounts.', 403);
+    }
 
     // Username must be unique among OTHER users.
     $check = db()->prepare("SELECT 1 FROM users WHERE username = :u AND user_id <> :id");
@@ -176,7 +255,15 @@ function usersUpdate($id)
     // Administrators get the full permission set automatically.
     if ($role === 'Administrator') {
         $perms = allPermissionNames();
+    } else {
+        // Security is an administrator-only module; never grant it to Staff.
+        $perms = array_values(array_filter($perms, function ($p) {
+            return $p !== 'view-security' && $p !== 'manage-security';
+        }));
     }
+
+    // A non-Administrator may only grant permissions they hold themselves.
+    guardGrantablePermissions($perms);
 
     // Don't let the last active Administrator be demoted/deactivated into lockout.
     guardLastAdmin($id, $role, $status);
@@ -232,6 +319,11 @@ function usersDelete($id)
         error('User not found.', 404);
     }
 
+    // Only a true Administrator may delete an Administrator account.
+    if ($user['role'] === 'Administrator' && !actorIsAdmin()) {
+        error('Only an Administrator can delete an Administrator account.', 403);
+    }
+
     // Never delete the last administrator.
     if ($user['role'] === 'Administrator' && countAdmins() <= 1) {
         error('Cannot delete the last administrator account.', 409);
@@ -253,37 +345,62 @@ function usersDelete($id)
 
 // ── helpers ──────────────────────────────────────────────────────────────────
 
-// Replace a user's permissions with the given list of permission names.
+// Replace a user's permissions, storing ONE row per module with the real level.
+// The frontend sends names like 'view-cdsp' / 'manage-cdsp'. We collapse them per
+// module: 'manage-X' present => Editor, otherwise 'view-X' => Viewer.
 function syncUserPermissions($userId, $permissionNames)
 {
     $pdo = db();
     $pdo->prepare("DELETE FROM user_permissions WHERE user_id = :id")->execute([':id' => $userId]);
 
-    $permissionNames = array_values(array_unique($permissionNames));
-    if (empty($permissionNames)) {
+    // Collapse the incoming names into one level per module key.
+    $levelByModule = [];
+    foreach ($permissionNames as $name) {
+        if (strpos($name, 'manage-') === 0) {
+            $module = substr($name, 7);
+            $levelByModule[$module] = 'Editor';
+        } elseif (strpos($name, 'view-') === 0) {
+            $module = substr($name, 5);
+            if (!isset($levelByModule[$module])) {
+                $levelByModule[$module] = 'Viewer';
+            }
+        }
+    }
+    if (empty($levelByModule)) {
         return;
     }
 
-    // Map permission names -> ids.
-    $placeholders = implode(',', array_fill(0, count($permissionNames), '?'));
+    // Map module key -> permission_id.
+    $modules = array_keys($levelByModule);
+    $placeholders = implode(',', array_fill(0, count($modules), '?'));
     $stmt = $pdo->prepare("SELECT permission_id, permission_name FROM permissions WHERE permission_name IN ($placeholders)");
-    $stmt->execute($permissionNames);
+    $stmt->execute($modules);
 
-    $idByName = [];
+    $idByModule = [];
     foreach ($stmt->fetchAll() as $r) {
-        $idByName[$r['permission_name']] = $r['permission_id'];
+        $idByModule[$r['permission_name']] = $r['permission_id'];
     }
 
-    // Presence of a permission = granted. Level is stored as 'Editor'.
+    // One row per module, carrying the real Viewer/Editor level.
     $ins = $pdo->prepare(
         "INSERT INTO user_permissions (user_id, permission_id, permission_level)
-         VALUES (:u, :p, 'Editor')"
+         VALUES (:u, :p, :lvl)"
     );
-    foreach ($permissionNames as $name) {
-        if (isset($idByName[$name])) {
-            $ins->execute([':u' => $userId, ':p' => $idByName[$name]]);
+    foreach ($levelByModule as $module => $level) {
+        if (isset($idByModule[$module])) {
+            $ins->execute([':u' => $userId, ':p' => $idByModule[$module], ':lvl' => $level]);
         }
     }
+}
+
+// Expand one stored module row into the frontend's view-/manage- name list.
+function expandModuleNames($module, $level)
+{
+    $names = ["view-{$module}"];
+    if ($level === 'Editor') {
+        $names[] = "manage-{$module}";
+    }
+    return $names;
 }
 
 // Fetch a single user (with permissions) in the frontend shape.
@@ -308,22 +425,33 @@ function fetchUser($userId)
     }
 
     $perms = db()->prepare(
-        "SELECT p.permission_name
+        "SELECT p.permission_name, up.permission_level
          FROM user_permissions up
          JOIN permissions p ON p.permission_id = up.permission_id
          WHERE up.user_id = :id"
     );
     $perms->execute([':id' => $userId]);
 
-    $pub['permissions'] = $perms->fetchAll(PDO::FETCH_COLUMN);
+    $names = [];
+    foreach ($perms->fetchAll() as $r) {
+        $names = array_merge($names, expandModuleNames($r['permission_name'], $r['permission_level']));
+    }
+    $pub['permissions'] = $names;
     return $pub;
 }
 
-// Every permission name in the system (used to grant Administrators full access).
+// Full view-/manage- name set (used to grant Administrators full access).
+// Derived from the 11 module rows: each module yields view-X and manage-X.
 function allPermissionNames()
 {
-    return db()->query("SELECT permission_name FROM permissions ORDER BY permission_id")
+    $modules = db()->query("SELECT permission_name FROM permissions ORDER BY permission_id")
         ->fetchAll(PDO::FETCH_COLUMN);
+    $names = [];
+    foreach ($modules as $m) {
+        $names[] = "view-{$m}";
+        $names[] = "manage-{$m}";
+    }
+    return $names;
 }
 
 function countAdmins()

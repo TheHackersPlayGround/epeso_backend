@@ -32,3 +32,47 @@ function requireAdmin()
     }
     return $id;
 }
+
+// Module-level permission gate. Mirrors the frontend canManage()/canView() rules.
+//
+//   $module  one of the 11 dashboard keys: 'employment','cdsp','gip','spes',
+//            'livelihood','skills','ofw','documents','maintenance','security','report'
+//   $level   'Viewer'  -> user may read the module (Viewer OR Editor row)
+//            'Editor'  -> user may add/edit/delete (Editor row required)
+//
+// Administrators always pass. Returns the user id so callers can use it.
+//
+// Usage inside a module:
+//   requirePermission('cdsp', 'Viewer');   // for GET/list/read endpoints
+//   requirePermission('cdsp', 'Editor');   // for create/update/delete endpoints
+function requirePermission($module, $level = 'Viewer')
+{
+    $id = requireLogin();
+
+    // Administrators have full access to every module.
+    $stmt = db()->prepare("SELECT role FROM users WHERE user_id = :id");
+    $stmt->execute([':id' => $id]);
+    if ($stmt->fetchColumn() === 'Administrator') {
+        return $id;
+    }
+
+    // Look up the user's stored level for this module (one row per module).
+    $stmt = db()->prepare(
+        "SELECT up.permission_level
+         FROM user_permissions up
+         JOIN permissions p ON p.permission_id = up.permission_id
+         WHERE up.user_id = :id AND p.permission_name = :module"
+    );
+    $stmt->execute([':id' => $id, ':module' => $module]);
+    $stored = $stmt->fetchColumn(); // 'Viewer' | 'Editor' | false (no access)
+
+    // Editor satisfies both Viewer and Editor requests; Viewer satisfies only Viewer.
+    $ok = ($level === 'Editor')
+        ? ($stored === 'Editor')
+        : ($stored === 'Viewer' || $stored === 'Editor');
+
+    if (!$ok) {
+        error('You do not have permission to perform this action.', 403);
+    }
+    return $id;
+}
