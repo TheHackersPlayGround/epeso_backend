@@ -1,0 +1,7 @@
+RewriteEngine On
+RewriteBase /epeso_backend/
+
+# Route every request that is not a real file or directory through index.php
+RewriteCond %{REQUEST_FILENAME} !-f
+RewriteCond %{REQUEST_FILENAME} !-d
+RewriteRule ^ index.php [QSA,L]

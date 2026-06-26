@@ -1,0 +1,2 @@
+<?php
+// Activity Logs tab
