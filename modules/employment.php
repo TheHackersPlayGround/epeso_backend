@@ -27,6 +27,9 @@ function handle($action, $id, $method)
         case 'getApplicant':
             requirePermission('employment', 'Viewer');
             return employmentGetApplicant($id);
+        case 'getApplicantPhoto':
+            requirePermission('employment', 'Viewer');
+            return employmentGetApplicantPhoto($id);
         case 'createApplicant':
             requirePermission('employment', 'Editor');
             return employmentCreateApplicant();
@@ -214,7 +217,7 @@ function employmentCreateApplicant()
         $pdo->commit();
     } catch (Throwable $e) {
         if ($pdo->inTransaction()) $pdo->rollBack();
-        error('Failed to save applicant. Please try again.', 500);
+        error('Failed to save applicant: ' . $e->getMessage(), 500);
     }
 
     json(['status' => 'ok', 'message' => 'Applicant saved.', 'data' => ['id' => $beneficiaryId]]);
@@ -288,11 +291,11 @@ function employmentInsertEfProfile($pdo, $bsId, $d)
     $stmt = $pdo->prepare(
         "INSERT INTO employment_facilitation_profiles
             (beneficiary_service_id, tin, religion, height_cm, is_ofw, ofw_country,
-             is_former_ofw, former_ofw_country, former_ofw_return_date, is_4ps_beneficiary,
+             is_former_ofw, former_ofw_country, former_ofw_return_date,
              household_id_no, currently_in_school, referred_program, other_referred_program)
          VALUES
             (:bsid, :tin, :religion, :height, :is_ofw, :ofw_country,
-             :is_former, :former_country, :former_date, :is4ps,
+             :is_former, :former_country, :former_date,
              :household, :in_school, :referred, :referred_other)"
     );
     $referred = efReferredProgram($d);
@@ -307,7 +310,6 @@ function employmentInsertEfProfile($pdo, $bsId, $d)
         ':is_former'      => $isFormerOfw ? 'true' : 'false',
         ':former_country' => $isFormerOfw ? (string) ($d['formerOFWCountry'] ?? '') : null,
         ':former_date'    => efDateOrNull($d['formerOFWReturnDate'] ?? ''),
-        ':is4ps'          => efYes($d['is4PsBeneficiary'] ?? '') ? 'true' : 'false',
         ':household'      => efNull($d['householdIdNo'] ?? ''),
         ':in_school'      => efYes($d['currentlyInSchool'] ?? '') ? 'true' : 'false',
         ':referred'       => $referred,
@@ -637,12 +639,20 @@ function employmentInsertResumeTables($pdo, $bid, $d)
         ]);
     }
 
-    // Other skills.
+    // Other skills: the predefined checkboxes (otherSkills, minus the 'OTHERS'
+    // marker) plus the free-text "OTHERS: specify" entries (otherSkillsSpecify).
+    // Both are stored as plain skill rows.
     $skillInsert = $pdo->prepare("INSERT INTO skills (beneficiary_id, skill_name) VALUES (:bid, :name)");
-    foreach (($d['otherSkills'] ?? []) as $name) {
-        if (efNull($name) !== null) {
-            $skillInsert->execute([':bid' => $bid, ':name' => trim($name)]);
-        }
+    $seenSkills = [];
+    foreach (array_merge($d['otherSkills'] ?? [], $d['otherSkillsSpecify'] ?? []) as $name) {
+        if ($name === 'OTHERS') continue; // UI marker, not a real skill
+        $clean = efNull($name);
+        if ($clean === null) continue;
+        $clean = trim($clean);
+        $key = mb_strtolower($clean);
+        if (isset($seenSkills[$key])) continue; // avoid duplicate rows
+        $seenSkills[$key] = true;
+        $skillInsert->execute([':bid' => $bid, ':name' => $clean]);
     }
 }
 
@@ -668,6 +678,34 @@ function employmentListApplicants()
         $out[] = employmentBuildApplicant((int) $bid);
     }
     json(['status' => 'ok', 'data' => $out]);
+}
+
+// GET /api/employment/getApplicantPhoto/{id}
+// Returns the applicant's 2x2 photo as a base64 data URL so the front end can
+// embed it directly (e.g. in the Resume Builder PDF) without cross-origin
+// canvas-tainting issues. Returns null when no photo is attached.
+function employmentGetApplicantPhoto($id)
+{
+    if (!is_numeric($id)) {
+        error('Invalid applicant id.', 422);
+    }
+    $stmt = db()->prepare(
+        "SELECT file_path, mime_type FROM documents
+         WHERE beneficiary_id = :id AND document_type = '2x2 ID Picture'
+         ORDER BY document_id DESC LIMIT 1"
+    );
+    $stmt->execute([':id' => (int) $id]);
+    $row = $stmt->fetch();
+
+    $dataUrl = null;
+    if ($row) {
+        $abs = __DIR__ . '/../' . $row['file_path'];
+        if (is_file($abs)) {
+            $mime = $row['mime_type'] ?: 'image/jpeg';
+            $dataUrl = 'data:' . $mime . ';base64,' . base64_encode(file_get_contents($abs));
+        }
+    }
+    json(['status' => 'ok', 'data' => ['dataUrl' => $dataUrl]]);
 }
 
 // GET /api/employment/getApplicant/{id}
@@ -739,11 +777,13 @@ function employmentBuildApplicant($bid)
     $photoPath = $photo->fetchColumn();
     $profileImage = $photoPath ? efUploadBaseUrl() . $photoPath : '';
 
-    // ── Other attachments (documents table) → savedDocuments with download URLs ──
+    // ── Attachments (documents table) → savedDocuments with download URLs ──
+    // Includes the 2x2 ID Picture so it is visible in the Documents/Attachments
+    // list where it was uploaded (it is also surfaced separately as profileImage).
     $docRows = db()->prepare(
         "SELECT document_id, document_type, title, file_name, file_path, file_size
          FROM documents
-         WHERE beneficiary_id = :id AND document_type IS DISTINCT FROM '2x2 ID Picture'
+         WHERE beneficiary_id = :id
          ORDER BY document_id"
     );
     $docRows->execute([':id' => $bid]);
@@ -752,7 +792,7 @@ function employmentBuildApplicant($bid)
         return [
             'id'           => (string) $r['document_id'],
             'documentType' => $dtype,
-            'customName'   => ($dtype === 'Others') ? ($r['title'] ?? '') : null,
+            'customName'   => ($dtype === 'Others (Specify)') ? ($r['title'] ?? '') : null,
             'fileName'     => $r['file_name'],
             'fileSize'     => efFormatBytes($r['file_size'] ?? 0),
             'url'          => efUploadBaseUrl() . $r['file_path'],
@@ -781,6 +821,19 @@ function employmentBuildApplicant($bid)
 
     $skillNames = array_map(fn($s) => $s['skill_name'], $skills);
 
+    // Split stored skills back into the form's two inputs: predefined skills go
+    // to the checkboxes (otherSkills), the rest to the free-text "OTHERS" list.
+    $predefinedSkills = ['AUTO MECHANIC', 'BEAUTICIAN', 'CARPENTRY WORK', 'COMPUTER LITERATE', 'DOMESTIC CHORES',
+        'DRIVER', 'ELECTRICIAN', 'EMBROIDERY', 'GARDENING', 'MASONRY', 'PAINTER/ARTIST', 'PAINTING JOBS',
+        'PHOTOGRAPHY', 'PLUMBING', 'SEWING DRESSES', 'STENOGRAPHY', 'TAILORING'];
+    $otherSkillsChecks = [];
+    $otherSkillsCustom = [];
+    foreach ($skillNames as $sn) {
+        if (in_array($sn, $predefinedSkills, true)) $otherSkillsChecks[] = $sn;
+        else $otherSkillsCustom[] = $sn;
+    }
+    if ($otherSkillsCustom) $otherSkillsChecks[] = 'OTHERS';
+
     // ── fullFormData (mirrors ApplicantFormData; unmapped fields default empty) ──
     $full = [
         'surname' => $b['last_name'], 'firstName' => $b['first_name'], 'middleName' => $b['middle_name'] ?? '', 'suffix' => $b['suffix'] ?? '',
@@ -807,7 +860,7 @@ function employmentBuildApplicant($bid)
         'eligibilities' => array_map(fn($e) => ['eligibility' => $e['eligibility_name'], 'dateTaken' => $e['date_taken'] ?? ''], $eligibilities),
         'professionalLicenses' => array_map(fn($l) => ['license' => $l['license_name'], 'validUntil' => $l['valid_until'] ?? ''], $licenses),
         'workExperiences' => array_map(fn($w) => ['companyName' => $w['company_name'] ?? '', 'position' => $w['position'] ?? '', 'from' => $w['date_from'] ? substr($w['date_from'], 0, 7) : '', 'to' => $w['date_to'] ? substr($w['date_to'], 0, 7) : '', 'status' => $w['employment_status'] ?? ''], $workExp),
-        'otherSkills' => $skillNames, 'otherSkillsSpecify' => [''],
+        'otherSkills' => $otherSkillsChecks, 'otherSkillsSpecify' => $otherSkillsCustom ?: [''],
         // Referred program (stored on the EF profile).
         'referredProgram' => $ef['referred_program'] ?? '', 'referredProgramOther' => $ef['other_referred_program'] ?? '',
         // 2x2 photo (stored in the documents table).
@@ -827,9 +880,13 @@ function employmentBuildApplicant($bid)
     if (!empty($b['birth_date'])) {
         $age = (int) (new DateTime())->diff(new DateTime($b['birth_date']))->y;
     }
+    // Prefer detailed resume info (course/level from the educations table);
+    // fall back to the derived educational_attainment so the column isn't blank
+    // when the applicant only selected a graduation level (no school name typed).
     $education = $tert['course'] ? $tert['course'] . ' (Tertiary)'
         : ($sec['schoolName'] && $sec['graduated'] === 'Yes' ? 'Senior High School Graduate'
-        : ($elem['schoolName'] && $elem['graduated'] === 'Yes' ? 'Elementary Graduate' : ''));
+        : ($elem['schoolName'] && $elem['graduated'] === 'Yes' ? 'Elementary Graduate'
+        : ($b['educational_attainment'] ?? '')));
 
     return [
         'id' => (int) $b['beneficiary_id'],
@@ -838,6 +895,7 @@ function employmentBuildApplicant($bid)
         'age' => $age,
         'education' => $education,
         'skills' => implode(', ', $skillNames),
+        'trainingCourses' => implode(', ', array_filter(array_map(fn($t) => trim($t['course'] ?? ''), $trainings))),
         'employmentStatus' => 'Unemployed',
         'contactNumber' => $b['contact_no'] ?? '',
         'email' => $b['email'] ?? '',
@@ -1256,8 +1314,8 @@ function efValidateVacancy($d)
 {
     if (efNull($d['jobTitle'] ?? '') === null) return 'Job title is required.';
     if (!isset($d['employerId']) || !is_numeric($d['employerId'])) return 'Please select an employer.';
-    if (efNull($d['description'] ?? '') === null) return 'Description is required.';
-    if (efNull($d['requirements'] ?? '') === null) return 'Requirements is required.';
+    // Description and requirements are optional (the form does not mark them
+    // required); the NOT NULL columns are satisfied by an empty-string default.
     return '';
 }
 
