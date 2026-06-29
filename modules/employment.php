@@ -30,6 +30,9 @@ function handle($action, $id, $method)
         case 'getApplicantPhoto':
             requirePermission('employment', 'Viewer');
             return employmentGetApplicantPhoto($id);
+        case 'getApplicantHistory':
+            requirePermission('employment', 'Viewer');
+            return efGetApplicantHistory($id);
         case 'createApplicant':
             requirePermission('employment', 'Editor');
             return employmentCreateApplicant();
@@ -1002,8 +1005,34 @@ function employmentBuildApplicant($bid)
         'is4PsBeneficiary' => !empty($b['is_4ps_beneficiary']),
         'jobPreference' => $jobPrefs[0]['occupation'] ?? '',
         'language' => $languageSummary,
+        'referralState' => efApplicantReferralState($bsId),
         'fullFormData' => $full,
     ];
+}
+
+// Refer-action lock state for an applicant, keyed on beneficiary_service_id:
+//   'Hired'    -> has an active placement (status Active); cannot be referred.
+//   'Referred' -> has a live referral (status Pending or Interviewed); cannot be referred.
+//   'Refer'    -> free to be referred (no active placement, no live referral).
+// Releases back to 'Refer' happen naturally: a referral set to 'Not Hired', or a
+// placement set to Resigned/Terminated/Completed, no longer match the conditions.
+function efApplicantReferralState($bsId)
+{
+    $pl = db()->prepare(
+        "SELECT 1 FROM employment_facilitation_placements
+         WHERE beneficiary_service_id = :id AND status = 'Active' LIMIT 1"
+    );
+    $pl->execute([':id' => (int) $bsId]);
+    if ($pl->fetchColumn()) return 'Hired';
+
+    $rf = db()->prepare(
+        "SELECT 1 FROM employment_facilitation_referrals
+         WHERE beneficiary_service_id = :id AND status IN ('Pending', 'Interviewed') LIMIT 1"
+    );
+    $rf->execute([':id' => (int) $bsId]);
+    if ($rf->fetchColumn()) return 'Referred';
+
+    return 'Refer';
 }
 
 function employmentFetchAll($sql, $bid)
@@ -1545,6 +1574,64 @@ function efBuildReferral($row)
     ];
 }
 
+// GET /api/employment/getApplicantHistory/{beneficiaryId}
+// One applicant's full referral history (ALL statuses) as a referral -> placement
+// timeline. Each referral carries its linked placement (via placement.referral_id)
+// when one exists, so the UI can render Referred -> [referral status] -> [placement
+// status]. Ordered oldest-first so newer attempts appear below older ones.
+function efGetApplicantHistory($id)
+{
+    if (!is_numeric($id)) error('Invalid applicant id.', 422);
+
+    $bsId = efGetBsId((int) $id);
+    if (!$bsId) error('Applicant is not enrolled in Employment Facilitation.', 404);
+
+    // Applicant display name (same CONCAT pattern used elsewhere).
+    $nameStmt = db()->prepare(
+        "SELECT CONCAT(b.last_name, ', ', b.first_name,
+                       CASE WHEN b.middle_name IS NOT NULL
+                            THEN ' ' || LEFT(b.middle_name, 1) || '.'
+                            ELSE '' END) AS applicant_name
+         FROM beneficiaries b WHERE b.beneficiary_id = :bid"
+    );
+    $nameStmt->execute([':bid' => (int) $id]);
+    $applicantName = $nameStmt->fetchColumn() ?: '';
+
+    $stmt = db()->prepare(
+        "SELECT r.referral_id, r.date_referred, r.status AS referral_status,
+                v.job_title, e.company_name,
+                p.placement_id, p.status AS placement_status, p.date_hired
+         FROM employment_facilitation_referrals r
+         JOIN vacancies v ON v.vacancy_id = r.vacancy_id
+         JOIN employers e ON e.employer_id = v.employer_id
+         LEFT JOIN employment_facilitation_placements p ON p.referral_id = r.referral_id
+         WHERE r.beneficiary_service_id = :bsid
+         ORDER BY r.referral_id ASC"
+    );
+    $stmt->execute([':bsid' => $bsId]);
+
+    $history = array_map(function ($row) {
+        return [
+            'referralId'   => (int) $row['referral_id'],
+            'employer'     => $row['company_name'],
+            'jobTitle'     => $row['job_title'],
+            'referralDate' => $row['date_referred'],
+            'status'       => $row['referral_status'],
+            'placement'    => $row['placement_id'] !== null ? [
+                'placementId' => (int) $row['placement_id'],
+                'status'      => $row['placement_status'],
+                'dateHired'   => $row['date_hired'],
+            ] : null,
+        ];
+    }, $stmt->fetchAll(PDO::FETCH_ASSOC));
+
+    json(['status' => 'ok', 'data' => [
+        'applicantId'   => (int) $id,
+        'applicantName' => $applicantName,
+        'history'       => $history,
+    ]]);
+}
+
 // GET /api/employment/listReferrals  — excludes Hired (those become placements)
 function efListReferrals()
 {
@@ -1587,13 +1674,12 @@ function efCreateReferral()
     $vac->execute([':id' => $vacancyId]);
     if (!$vac->fetchColumn()) error('Vacancy not found or is closed.', 404);
 
-    // Prevent duplicate active referral
-    $dup = db()->prepare(
-        "SELECT 1 FROM employment_facilitation_referrals
-         WHERE beneficiary_service_id = :bsid AND vacancy_id = :vid AND status != 'Not Hired' LIMIT 1"
-    );
-    $dup->execute([':bsid' => $bsId, ':vid' => $vacancyId]);
-    if ($dup->fetchColumn()) error('This applicant already has an active referral for this vacancy.', 409);
+    // Global lock: an applicant who is already hired (active placement) or already
+    // has a live referral cannot be referred again — to any employer — until released
+    // (referral -> Not Hired, or placement -> Resigned/Terminated/Completed).
+    $state = efApplicantReferralState($bsId);
+    if ($state === 'Hired')    error('This applicant is already hired and cannot be referred.', 409);
+    if ($state === 'Referred') error('This applicant already has an active referral.', 409);
 
     try {
         $stmt = db()->prepare(
