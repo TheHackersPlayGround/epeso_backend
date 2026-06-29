@@ -137,10 +137,29 @@ function efDateOrNull($v)
 }
 
 // height_cm must be a positive number (check constraint) or null. The form's
-// free-text height (e.g. 5'4") can't be parsed reliably, so only keep numerics.
+// height field is free text, so accept a plain number ("165") or pull the first
+// numeric value out of input like "165 cm". Capped at the numeric(5,2) range.
 function efHeightCm($v)
 {
-    return (is_numeric($v) && (float) $v > 0) ? (float) $v : null;
+    if (is_numeric($v)) {
+        $n = (float) $v;
+    } elseif (is_string($v) && preg_match('/\d+(?:\.\d+)?/', $v, $m)) {
+        $n = (float) $m[0];
+    } else {
+        return null;
+    }
+    return ($n > 0 && $n < 1000) ? $n : null;
+}
+
+// True when an education level has any data worth saving. (School name is no
+// longer collected, so we look at the graduation status and the year/level/course.)
+function efEduHasData($row)
+{
+    if (!is_array($row)) return false;
+    foreach (['graduated', 'yearGraduated', 'levelReached', 'yearLastAttended', 'course', 'strand', 'seniorHighStrand'] as $k) {
+        if (efNull($row[$k] ?? '') !== null) return true;
+    }
+    return false;
 }
 
 // Best-effort educational_attainment_enum from the education section.
@@ -151,11 +170,11 @@ function efDeriveEducation($d)
     $elem = isset($d['elementary']) && is_array($d['elementary']) ? $d['elementary'] : [];
 
     if (efYes($tert['graduated'] ?? '')) return 'College Graduate';
-    if (efNull($tert['schoolName'] ?? '') !== null) return 'College Undergraduate';
+    if (efEduHasData($tert)) return 'College Undergraduate';
     if (efYes($sec['graduated'] ?? '')) return 'Senior High School Graduate';
-    if (efNull($sec['schoolName'] ?? '') !== null) return 'Senior High School Undergraduate';
+    if (efEduHasData($sec)) return 'Senior High School Undergraduate';
     if (efYes($elem['graduated'] ?? '')) return 'Elementary Graduate';
-    if (efNull($elem['schoolName'] ?? '') !== null) return 'Elementary Undergraduate';
+    if (efEduHasData($elem)) return 'Elementary Undergraduate';
     return null;
 }
 
@@ -292,13 +311,18 @@ function employmentInsertEfProfile($pdo, $bsId, $d)
         "INSERT INTO employment_facilitation_profiles
             (beneficiary_service_id, tin, religion, height_cm, is_ofw, ofw_country,
              is_former_ofw, former_ofw_country, former_ofw_return_date,
-             household_id_no, currently_in_school, referred_program, other_referred_program)
+             household_id_no, currently_in_school, referred_program, other_referred_program,
+             employment_status, employment_type, self_employment_type,
+             unemployment_reason, other_reason, months_looking_for_work)
          VALUES
             (:bsid, :tin, :religion, :height, :is_ofw, :ofw_country,
              :is_former, :former_country, :former_date,
-             :household, :in_school, :referred, :referred_other)"
+             :household, :in_school, :referred, :referred_other,
+             :emp_status, :emp_type, :self_type,
+             :unemp_reason, :other_reason, :months)"
     );
     $referred = efReferredProgram($d);
+    $emp = efEmploymentFields($d);
     $stmt->execute([
         ':bsid'           => $bsId,
         ':tin'            => efNull($d['tin'] ?? ''),
@@ -314,7 +338,43 @@ function employmentInsertEfProfile($pdo, $bsId, $d)
         ':in_school'      => efYes($d['currentlyInSchool'] ?? '') ? 'true' : 'false',
         ':referred'       => $referred,
         ':referred_other' => ($referred === 'Others') ? efNull($d['referredProgramOther'] ?? '') : null,
+        ':emp_status'     => $emp['status'],
+        ':emp_type'       => $emp['type'],
+        ':self_type'      => $emp['selfType'],
+        ':unemp_reason'   => $emp['reason'],
+        ':other_reason'   => $emp['otherReason'],
+        ':months'         => $emp['months'],
     ]);
+}
+
+// Normalize the Employment Status / Type form fields to DB-safe enum values.
+function efEmploymentFields($d)
+{
+    $statusValid = ['Employed', 'Unemployed'];
+    $typeValid   = ['Wage Employed', 'Self-employed'];
+    $reasonValid = ['New Entrant/Fresh Graduate', 'Finished Contract', 'Resigned',
+                    'Retired', 'Terminated/Laid-off', 'Terminated due to Calamity', 'Others'];
+
+    $status = in_array($d['employmentStatus'] ?? '', $statusValid, true) ? $d['employmentStatus'] : null;
+
+    $type = null; $selfType = null;
+    if ($status === 'Employed') {
+        $type = in_array($d['employmentType'] ?? '', $typeValid, true) ? $d['employmentType'] : null;
+        if ($type === 'Self-employed') {
+            $selfType = (($d['selfEmploymentType'] ?? '') === 'Others')
+                ? efNull($d['selfEmploymentOther'] ?? '')
+                : efNull($d['selfEmploymentType'] ?? '');
+        }
+    }
+
+    $reason = null; $otherReason = null; $months = null;
+    if ($status === 'Unemployed') {
+        $reason = in_array($d['unemploymentReason'] ?? '', $reasonValid, true) ? $d['unemploymentReason'] : null;
+        if ($reason === 'Others') $otherReason = efNull($d['unemploymentReasonOther'] ?? '');
+        $months = efIntOrNull($d['monthsLookingForWork'] ?? '');
+    }
+
+    return compact('status', 'type', 'selfType', 'reason', 'otherReason', 'months');
 }
 
 // ─── Disabilities + 2x2 photo (separate tables) ──────────────────────────────
@@ -500,10 +560,11 @@ function employmentUnlinkDocs($pdo, $bid)
 // Insert all resume sub-tables for a beneficiary from the form payload.
 function employmentInsertResumeTables($pdo, $bid, $d)
 {
-    // Educations: the three fixed levels + any graduate studies.
+    // Educations: the three fixed levels + any graduate studies. School name is
+    // not collected at intake, so a level is saved when it has any other data.
     $eduInsert = $pdo->prepare(
-        "INSERT INTO educations (beneficiary_id, education_level, school_name, course, year_graduated, year_last_attended, graduated, strand)
-         VALUES (:bid, :level, :school, :course, :ygrad, :ylast, :grad, :strand)"
+        "INSERT INTO educations (beneficiary_id, education_level, course, year_graduated, year_last_attended, graduated, strand)
+         VALUES (:bid, :level, :course, :ygrad, :ylast, :grad, :strand)"
     );
     $levels = [
         ['Elementary', $d['elementary'] ?? null],
@@ -511,11 +572,10 @@ function employmentInsertResumeTables($pdo, $bid, $d)
         ['Tertiary',   $d['tertiary'] ?? null],
     ];
     foreach ($levels as [$levelName, $row]) {
-        if (is_array($row) && efNull($row['schoolName'] ?? '') !== null) {
+        if (efEduHasData($row)) {
             $eduInsert->execute([
                 ':bid'    => $bid,
                 ':level'  => $levelName,
-                ':school' => trim($row['schoolName']),
                 ':course' => efNull($row['course'] ?? ''),
                 ':ygrad'  => efYearOrNull($row['yearGraduated'] ?? ''),
                 ':ylast'  => efYearOrNull($row['yearLastAttended'] ?? ''),
@@ -525,15 +585,15 @@ function employmentInsertResumeTables($pdo, $bid, $d)
         }
     }
     foreach (($d['graduateStudies'] ?? []) as $row) {
-        if (is_array($row) && efNull($row['schoolName'] ?? '') !== null) {
+        if (efEduHasData($row)) {
             $eduInsert->execute([
                 ':bid'    => $bid,
                 ':level'  => 'Graduate',
-                ':school' => trim($row['schoolName']),
                 ':course' => efNull($row['course'] ?? ''),
                 ':ygrad'  => efYearOrNull($row['yearGraduated'] ?? ''),
                 ':ylast'  => efYearOrNull($row['yearLastAttended'] ?? ''),
                 ':grad'   => efYes($row['graduated'] ?? '') ? 'true' : 'false',
+                ':strand' => null,
             ]);
         }
     }
@@ -584,20 +644,21 @@ function employmentInsertResumeTables($pdo, $bid, $d)
         }
     }
 
-    // Work experiences.
+    // Work experiences: company, address (city), position, months, status.
     $workInsert = $pdo->prepare(
-        "INSERT INTO work_experiences (beneficiary_id, company_name, position, date_from, date_to, employment_status)
-         VALUES (:bid, :company, :position, :dfrom, :dto, :status)"
+        "INSERT INTO work_experiences (beneficiary_id, company_name, company_city_id, position, number_of_months, employment_status)
+         VALUES (:bid, :company, :cityid, :position, :months, :status)"
     );
+    $workStatusValid = ['Permanent', 'Contractual', 'Part-time', 'Probationary'];
     foreach (($d['workExperiences'] ?? []) as $row) {
         if (is_array($row) && (efNull($row['companyName'] ?? '') !== null || efNull($row['position'] ?? '') !== null)) {
             $workInsert->execute([
                 ':bid'      => $bid,
                 ':company'  => efNull($row['companyName'] ?? ''),
+                ':cityid'   => (isset($row['companyCityId']) && is_numeric($row['companyCityId'])) ? (int) $row['companyCityId'] : null,
                 ':position' => efNull($row['position'] ?? ''),
-                ':dfrom'    => efMonthToDate($row['from'] ?? ''),
-                ':dto'      => efMonthToDate($row['to'] ?? ''),
-                ':status'   => efNull($row['status'] ?? ''),
+                ':months'   => efIntOrNull($row['numberOfMonths'] ?? ''),
+                ':status'   => in_array($row['status'] ?? '', $workStatusValid, true) ? $row['status'] : null,
             ]);
         }
     }
@@ -725,7 +786,7 @@ function employmentGetApplicant($id)
 function employmentBuildApplicant($bid)
 {
     $stmt = db()->prepare(
-        "SELECT b.*, bgy.barangay_name, c.city_name, p.province_name, r.region_name,
+        "SELECT b.*, bgy.barangay_name, c.city_name, c.city_id, p.province_name, p.province_id, r.region_name,
                 bs.beneficiary_service_id
          FROM beneficiaries b
          JOIN beneficiary_services bs ON bs.beneficiary_id = b.beneficiary_id AND bs.service_id = :sid
@@ -752,7 +813,14 @@ function employmentBuildApplicant($bid)
     $trainings    = employmentFetchAll("SELECT * FROM trainings WHERE beneficiary_id = :id ORDER BY training_id", $bid);
     $eligibilities = employmentFetchAll("SELECT * FROM eligibilities WHERE beneficiary_id = :id ORDER BY eligibility_id", $bid);
     $licenses     = employmentFetchAll("SELECT * FROM licenses WHERE beneficiary_id = :id ORDER BY license_id", $bid);
-    $workExp      = employmentFetchAll("SELECT * FROM work_experiences WHERE beneficiary_id = :id ORDER BY experience_id", $bid);
+    $workExp      = employmentFetchAll(
+        "SELECT w.*, (c.city_name || ', ' || p.province_name) AS company_city_name
+         FROM work_experiences w
+         LEFT JOIN cities c    ON c.city_id     = w.company_city_id
+         LEFT JOIN provinces p ON p.province_id = c.province_id
+         WHERE w.beneficiary_id = :id ORDER BY w.experience_id",
+        $bid
+    );
     $jobPrefs     = employmentFetchAll("SELECT * FROM job_preferences WHERE beneficiary_id = :id ORDER BY preference_id", $bid);
     $languages    = employmentFetchAll("SELECT * FROM languages WHERE beneficiary_id = :id ORDER BY language_id", $bid);
     $skills       = employmentFetchAll("SELECT skill_name FROM skills WHERE beneficiary_id = :id ORDER BY skill_id", $bid);
@@ -804,7 +872,7 @@ function employmentBuildApplicant($bid)
     $elem = $eduBlank; $sec = $eduBlank + ['type' => '', 'seniorHighStrand' => '']; $tert = $eduBlank; $grad = [];
     foreach ($educations as $e) {
         $obj = [
-            'schoolName'       => $e['school_name'] ?? '',
+            'schoolName'       => '', // no longer stored; filled in the Resume Builder only
             'schoolCity'       => '',
             'schoolProvince'   => '',
             'course'           => $e['course'] ?? '',
@@ -834,6 +902,15 @@ function employmentBuildApplicant($bid)
     }
     if ($otherSkillsCustom) $otherSkillsChecks[] = 'OTHERS';
 
+    // Split the stored self_employment_type back into the dropdown + "Others" text.
+    $selfPredefined = ['Fisherman/Fisherfolk', 'Vendor/Retailer', 'Home-based worker', 'Transport', 'Domestic Worker', 'Freelancer', 'Artisan/Craft Worker'];
+    $selfTypeRaw = $ef['self_employment_type'] ?? '';
+    $selfEmploymentType = ''; $selfEmploymentOther = '';
+    if ($selfTypeRaw !== '' && $selfTypeRaw !== null) {
+        if (in_array($selfTypeRaw, $selfPredefined, true)) { $selfEmploymentType = $selfTypeRaw; }
+        else { $selfEmploymentType = 'Others'; $selfEmploymentOther = $selfTypeRaw; }
+    }
+
     // ── fullFormData (mirrors ApplicantFormData; unmapped fields default empty) ──
     $full = [
         'surname' => $b['last_name'], 'firstName' => $b['first_name'], 'middleName' => $b['middle_name'] ?? '', 'suffix' => $b['suffix'] ?? '',
@@ -841,13 +918,18 @@ function employmentBuildApplicant($bid)
         'height' => isset($ef['height_cm']) && $ef['height_cm'] !== null ? (string) $ef['height_cm'] : '',
         'houseNo' => $b['street_address'] ?? '',
         'barangay' => $b['barangay_name'] ?? '', 'barangayId' => $b['barangay_id'] !== null ? (int) $b['barangay_id'] : null,
-        'municipality' => $b['city_name'] ?? '', 'province' => $b['province_name'] ?? '',
+        'municipality' => $b['city_name'] ?? '', 'cityId' => isset($b['city_id']) && $b['city_id'] !== null ? (int) $b['city_id'] : null,
+        'province' => $b['province_name'] ?? '', 'provinceId' => isset($b['province_id']) && $b['province_id'] !== null ? (int) $b['province_id'] : null,
         'hasDisability' => $hasDisability, 'disabilityOther' => $disabilityOther,
         'tin' => $ef['tin'] ?? '', 'contactNumber' => $b['contact_no'] ?? '', 'email' => $b['email'] ?? '',
         'isOFW' => !empty($ef['is_ofw']) ? 'Yes' : 'No', 'ofwCountry' => $ef['ofw_country'] ?? '',
         'isFormerOFW' => !empty($ef['is_former_ofw']) ? 'Yes' : 'No', 'formerOFWCountry' => $ef['former_ofw_country'] ?? '',
         'formerOFWReturnDate' => $ef['former_ofw_return_date'] ?? '',
         'is4PsBeneficiary' => !empty($b['is_4ps_beneficiary']) ? 'Yes' : 'No', 'householdIdNo' => $ef['household_id_no'] ?? '',
+        'employmentStatus' => $ef['employment_status'] ?? '', 'employmentType' => $ef['employment_type'] ?? '',
+        'selfEmploymentType' => $selfEmploymentType, 'selfEmploymentOther' => $selfEmploymentOther,
+        'unemploymentReason' => $ef['unemployment_reason'] ?? '', 'unemploymentReasonOther' => $ef['other_reason'] ?? '',
+        'monthsLookingForWork' => isset($ef['months_looking_for_work']) && $ef['months_looking_for_work'] !== null ? (string) $ef['months_looking_for_work'] : '',
         'jobPrefEmploymentType' => !empty($jobPrefs) && !empty($jobPrefs[0]['employment_type'])
             ? array_values(array_filter(array_map('trim', explode(',', $jobPrefs[0]['employment_type']))))
             : [],
@@ -859,7 +941,14 @@ function employmentBuildApplicant($bid)
         'trainings' => array_map(fn($t) => ['course' => $t['course'], 'hoursOfTraining' => $t['hours_of_training'] !== null ? (string) $t['hours_of_training'] : '', 'institution' => $t['institution'] ?? '', 'skillsAcquired' => $t['skills_acquired'] ?? '', 'certificateReceived' => $t['certificate_received'] ? 'Yes' : 'No'], $trainings),
         'eligibilities' => array_map(fn($e) => ['eligibility' => $e['eligibility_name'], 'dateTaken' => $e['date_taken'] ?? ''], $eligibilities),
         'professionalLicenses' => array_map(fn($l) => ['license' => $l['license_name'], 'validUntil' => $l['valid_until'] ?? ''], $licenses),
-        'workExperiences' => array_map(fn($w) => ['companyName' => $w['company_name'] ?? '', 'position' => $w['position'] ?? '', 'from' => $w['date_from'] ? substr($w['date_from'], 0, 7) : '', 'to' => $w['date_to'] ? substr($w['date_to'], 0, 7) : '', 'status' => $w['employment_status'] ?? ''], $workExp),
+        'workExperiences' => array_map(fn($w) => [
+            'companyName' => $w['company_name'] ?? '',
+            'companyCity' => $w['company_city_name'] ?? '',
+            'companyCityId' => isset($w['company_city_id']) && $w['company_city_id'] !== null ? (int) $w['company_city_id'] : null,
+            'position' => $w['position'] ?? '',
+            'numberOfMonths' => isset($w['number_of_months']) && $w['number_of_months'] !== null ? (string) $w['number_of_months'] : '',
+            'status' => $w['employment_status'] ?? '',
+        ], $workExp),
         'otherSkills' => $otherSkillsChecks, 'otherSkillsSpecify' => $otherSkillsCustom ?: [''],
         // Referred program (stored on the EF profile).
         'referredProgram' => $ef['referred_program'] ?? '', 'referredProgramOther' => $ef['other_referred_program'] ?? '',
@@ -880,13 +969,19 @@ function employmentBuildApplicant($bid)
     if (!empty($b['birth_date'])) {
         $age = (int) (new DateTime())->diff(new DateTime($b['birth_date']))->y;
     }
-    // Prefer detailed resume info (course/level from the educations table);
-    // fall back to the derived educational_attainment so the column isn't blank
-    // when the applicant only selected a graduation level (no school name typed).
+    // Prefer the tertiary course; otherwise use the derived educational_attainment.
     $education = $tert['course'] ? $tert['course'] . ' (Tertiary)'
-        : ($sec['schoolName'] && $sec['graduated'] === 'Yes' ? 'Senior High School Graduate'
-        : ($elem['schoolName'] && $elem['graduated'] === 'Yes' ? 'Elementary Graduate'
-        : ($b['educational_attainment'] ?? '')));
+        : ($b['educational_attainment'] ?? '');
+
+    // All languages with their abilities, e.g. "ENGLISH (Read, Write), FILIPINO (Speak)".
+    $languageSummary = implode(', ', array_map(function ($l) {
+        $abil = [];
+        if (!empty($l['can_read'])) $abil[] = 'Read';
+        if (!empty($l['can_write'])) $abil[] = 'Write';
+        if (!empty($l['can_speak'])) $abil[] = 'Speak';
+        if (!empty($l['can_understand'])) $abil[] = 'Understand';
+        return $l['language'] . ($abil ? ' (' . implode(', ', $abil) . ')' : '');
+    }, $languages));
 
     return [
         'id' => (int) $b['beneficiary_id'],
@@ -896,7 +991,7 @@ function employmentBuildApplicant($bid)
         'education' => $education,
         'skills' => implode(', ', $skillNames),
         'trainingCourses' => implode(', ', array_filter(array_map(fn($t) => trim($t['course'] ?? ''), $trainings))),
-        'employmentStatus' => 'Unemployed',
+        'employmentStatus' => $ef['employment_status'] ?? 'Unemployed',
         'contactNumber' => $b['contact_no'] ?? '',
         'email' => $b['email'] ?? '',
         'address' => implode(', ', array_filter([$b['barangay_name'] ?? '', $b['city_name'] ?? '', $b['province_name'] ?? ''])),
@@ -906,7 +1001,7 @@ function employmentBuildApplicant($bid)
         'isFormerOFW' => !empty($ef['is_former_ofw']),
         'is4PsBeneficiary' => !empty($b['is_4ps_beneficiary']),
         'jobPreference' => $jobPrefs[0]['occupation'] ?? '',
-        'language' => $languages[0]['language'] ?? '',
+        'language' => $languageSummary,
         'fullFormData' => $full,
     ];
 }
@@ -1115,6 +1210,8 @@ function efBuildEmployer($row)
         'province'          => $row['province_name'] ?? '',
         'region'            => $row['region_name'] ?? '',
         'barangayId'        => $row['barangay_id'] !== null ? (int) $row['barangay_id'] : null,
+        'cityId'            => isset($row['city_id']) && $row['city_id'] !== null ? (int) $row['city_id'] : null,
+        'provinceId'        => isset($row['province_id']) && $row['province_id'] !== null ? (int) $row['province_id'] : null,
         'jobOpenings'       => [['jobName' => '', 'slots' => '']],
         'status'            => $row['status'],
         'dateRegistered'    => $row['date_registered'],
@@ -1129,7 +1226,7 @@ function efListEmployers()
 {
     $stmt = db()->prepare(
         "SELECT e.*, i.industry_name,
-                bgy.barangay_name, c.city_name, p.province_name, r.region_name
+                bgy.barangay_name, c.city_name, c.city_id, p.province_name, p.province_id, r.region_name
          FROM employers e
          LEFT JOIN industries i   ON i.industry_id   = e.industry_id
          LEFT JOIN barangays  bgy ON bgy.barangay_id = e.barangay_id
