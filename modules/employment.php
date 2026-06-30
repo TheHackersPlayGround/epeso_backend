@@ -87,6 +87,15 @@ function handle($action, $id, $method)
         case 'updatePlacementStatus':
             requirePermission('employment', 'Editor');
             return efUpdatePlacementStatus($id);
+        case 'listDeleted':
+            requirePermission('employment', 'Viewer');
+            return efListDeleted();
+        case 'restoreRecord':
+            requirePermission('employment', 'Editor');
+            return efRestoreRecord();
+        case 'purgeRecord':
+            requirePermission('employment', 'Editor');
+            return efPurgeRecord();
         default:
             error("Unknown employment action: {$action}", 404);
     }
@@ -159,7 +168,7 @@ function efHeightCm($v)
 function efEduHasData($row)
 {
     if (!is_array($row)) return false;
-    foreach (['graduated', 'yearGraduated', 'levelReached', 'yearLastAttended', 'course', 'strand', 'seniorHighStrand'] as $k) {
+    foreach (['graduated', 'yearGraduated', 'levelReached', 'yearLastAttended', 'course', 'strand', 'seniorHighStrand', 'type'] as $k) {
         if (efNull($row[$k] ?? '') !== null) return true;
     }
     return false;
@@ -389,7 +398,7 @@ function employmentInsertDisabilities($pdo, $bid, $d)
     $list = is_array($d['hasDisability'] ?? null) ? $d['hasDisability'] : [];
     if (!$list) return;
 
-    $standard = ['Visual', 'Speech', 'Hearing', 'Physical'];
+    $standard = ['Visual', 'Speech', 'Hearing', 'Physical', 'Mental'];
     $other    = efNull($d['disabilityOther'] ?? '');
     $stmt = $pdo->prepare(
         "INSERT INTO disabilities (beneficiary_id, disability_name)
@@ -566,8 +575,8 @@ function employmentInsertResumeTables($pdo, $bid, $d)
     // Educations: the three fixed levels + any graduate studies. School name is
     // not collected at intake, so a level is saved when it has any other data.
     $eduInsert = $pdo->prepare(
-        "INSERT INTO educations (beneficiary_id, education_level, course, year_graduated, year_last_attended, graduated, strand)
-         VALUES (:bid, :level, :course, :ygrad, :ylast, :grad, :strand)"
+        "INSERT INTO educations (beneficiary_id, education_level, course, year_graduated, year_last_attended, graduated, strand, level_reached, school_type)
+         VALUES (:bid, :level, :course, :ygrad, :ylast, :grad, :strand, :lvl, :stype)"
     );
     $levels = [
         ['Elementary', $d['elementary'] ?? null],
@@ -584,6 +593,8 @@ function employmentInsertResumeTables($pdo, $bid, $d)
                 ':ylast'  => efYearOrNull($row['yearLastAttended'] ?? ''),
                 ':grad'   => efYes($row['graduated'] ?? '') ? 'true' : 'false',
                 ':strand' => $levelName === 'Secondary' ? efNull($row['seniorHighStrand'] ?? '') : null,
+                ':lvl'    => efNull($row['levelReached'] ?? ''),
+                ':stype'  => $levelName === 'Secondary' ? efNull($row['type'] ?? '') : null,
             ]);
         }
     }
@@ -597,6 +608,8 @@ function employmentInsertResumeTables($pdo, $bid, $d)
                 ':ylast'  => efYearOrNull($row['yearLastAttended'] ?? ''),
                 ':grad'   => efYes($row['graduated'] ?? '') ? 'true' : 'false',
                 ':strand' => null,
+                ':lvl'    => efNull($row['levelReached'] ?? ''),
+                ':stype'  => null,
             ]);
         }
     }
@@ -614,7 +627,7 @@ function employmentInsertResumeTables($pdo, $bid, $d)
                 ':hours'  => efIntOrNull($row['hoursOfTraining'] ?? ''),
                 ':inst'   => efNull($row['institution'] ?? ''),
                 ':skills' => efNull($row['skillsAcquired'] ?? ''),
-                ':cert'   => efYes($row['certificateReceived'] ?? '') ? 'true' : 'false',
+                ':cert'   => efNull($row['certificateReceived'] ?? ''),
             ]);
         }
     }
@@ -666,20 +679,26 @@ function employmentInsertResumeTables($pdo, $bid, $d)
         }
     }
 
-    // Job preferences.
+    // Job preferences. The location is stored in one column plus a location_type
+    // ('Local' / 'Overseas') so the local-vs-overseas distinction is preserved.
     $jpInsert = $pdo->prepare(
-        "INSERT INTO job_preferences (beneficiary_id, occupation, employment_type, preferred_location)
-         VALUES (:bid, :occ, :type, :loc)"
+        "INSERT INTO job_preferences (beneficiary_id, occupation, employment_type, preferred_location, location_type)
+         VALUES (:bid, :occ, :type, :loc, :loctype)"
     );
     $jpType = is_array($d['jobPrefEmploymentType'] ?? null) ? implode(', ', $d['jobPrefEmploymentType']) : '';
     foreach (($d['jobPreferences'] ?? []) as $row) {
         if (is_array($row) && efNull($row['occupation'] ?? '') !== null) {
-            $loc = efNull($row['localCity'] ?? '') ?? efNull($row['overseasCountry'] ?? '');
+            $local    = efNull($row['localCity'] ?? '');
+            $overseas = efNull($row['overseasCountry'] ?? '');
+            // localCity takes priority when both are somehow present.
+            $loc     = $local ?? $overseas;
+            $locType = $local !== null ? 'Local' : ($overseas !== null ? 'Overseas' : null);
             $jpInsert->execute([
-                ':bid'  => $bid,
-                ':occ'  => trim($row['occupation']),
-                ':type' => efNull($jpType),
-                ':loc'  => $loc,
+                ':bid'     => $bid,
+                ':occ'     => trim($row['occupation']),
+                ':type'    => efNull($jpType),
+                ':loc'     => $loc,
+                ':loctype' => $locType,
             ]);
         }
     }
@@ -730,7 +749,7 @@ function employmentListApplicants()
         "SELECT b.beneficiary_id
          FROM beneficiaries b
          JOIN beneficiary_services bs ON bs.beneficiary_id = b.beneficiary_id
-         WHERE bs.service_id = :sid
+         WHERE bs.service_id = :sid AND b.deleted_at IS NULL
          GROUP BY b.beneficiary_id
          ORDER BY b.beneficiary_id DESC"
     );
@@ -797,7 +816,7 @@ function employmentBuildApplicant($bid)
          LEFT JOIN cities    c   ON c.city_id       = bgy.city_id
          LEFT JOIN provinces p   ON p.province_id   = c.province_id
          LEFT JOIN regions   r   ON r.region_id     = p.region_id
-         WHERE b.beneficiary_id = :bid
+         WHERE b.beneficiary_id = :bid AND b.deleted_at IS NULL
          LIMIT 1"
     );
     $stmt->execute([':sid' => efServiceId(), ':bid' => $bid]);
@@ -830,7 +849,7 @@ function employmentBuildApplicant($bid)
     $disabilities = employmentFetchAll("SELECT disability_name FROM disabilities WHERE beneficiary_id = :id ORDER BY disability_id", $bid);
 
     // ── Rebuild disabilities (standard checkboxes vs "Other" free text) ──
-    $standardDis = ['Visual', 'Speech', 'Hearing', 'Physical'];
+    $standardDis = ['Visual', 'Speech', 'Hearing', 'Physical', 'Mental'];
     $hasDisability = []; $disabilityOther = '';
     foreach ($disabilities as $row) {
         $name = $row['disability_name'];
@@ -881,11 +900,11 @@ function employmentBuildApplicant($bid)
             'course'           => $e['course'] ?? '',
             'graduated'        => $e['graduated'] ? 'Yes' : 'No',
             'yearGraduated'    => $e['year_graduated'] !== null ? (string) $e['year_graduated'] : '',
-            'levelReached'     => '',
+            'levelReached'     => $e['level_reached'] ?? '',
             'yearLastAttended' => $e['year_last_attended'] !== null ? (string) $e['year_last_attended'] : '',
         ];
         if ($e['education_level'] === 'Elementary') $elem = $obj;
-        elseif ($e['education_level'] === 'Secondary') $sec = $obj + ['type' => '', 'seniorHighStrand' => $e['strand'] ?? ''];
+        elseif ($e['education_level'] === 'Secondary') $sec = $obj + ['type' => $e['school_type'] ?? '', 'seniorHighStrand' => $e['strand'] ?? ''];
         elseif ($e['education_level'] === 'Tertiary') $tert = $obj;
         elseif ($e['education_level'] === 'Graduate') $grad[] = $obj;
     }
@@ -936,12 +955,18 @@ function employmentBuildApplicant($bid)
         'jobPrefEmploymentType' => !empty($jobPrefs) && !empty($jobPrefs[0]['employment_type'])
             ? array_values(array_filter(array_map('trim', explode(',', $jobPrefs[0]['employment_type']))))
             : [],
-        'jobPrefWorkLocation' => [],
-        'jobPreferences' => array_map(fn($j) => ['occupation' => $j['occupation'] ?? '', 'localCity' => $j['preferred_location'] ?? '', 'overseasCountry' => ''], $jobPrefs),
+        'jobPrefWorkLocation' => array_values(array_unique(array_filter(array_map(fn($j) => $j['location_type'] ?? null, $jobPrefs)))),
+        'jobPreferences' => array_map(fn($j) => [
+            'occupation'      => $j['occupation'] ?? '',
+            // Route the single stored location to the right field by its type.
+            // Legacy rows (no location_type) default to localCity, as before.
+            'localCity'       => ($j['location_type'] ?? '') === 'Overseas' ? '' : ($j['preferred_location'] ?? ''),
+            'overseasCountry' => ($j['location_type'] ?? '') === 'Overseas' ? ($j['preferred_location'] ?? '') : '',
+        ], $jobPrefs),
         'languages' => array_map(fn($l) => ['language' => $l['language'], 'read' => (bool) $l['can_read'], 'write' => (bool) $l['can_write'], 'speak' => (bool) $l['can_speak'], 'understand' => (bool) $l['can_understand']], $languages),
         'currentlyInSchool' => !empty($ef['currently_in_school']) ? 'Yes' : 'No',
         'elementary' => $elem, 'secondary' => $sec, 'tertiary' => $tert, 'graduateStudies' => $grad,
-        'trainings' => array_map(fn($t) => ['course' => $t['course'], 'hoursOfTraining' => $t['hours_of_training'] !== null ? (string) $t['hours_of_training'] : '', 'institution' => $t['institution'] ?? '', 'skillsAcquired' => $t['skills_acquired'] ?? '', 'certificateReceived' => $t['certificate_received'] ? 'Yes' : 'No'], $trainings),
+        'trainings' => array_map(fn($t) => ['course' => $t['course'], 'hoursOfTraining' => $t['hours_of_training'] !== null ? (string) $t['hours_of_training'] : '', 'institution' => $t['institution'] ?? '', 'skillsAcquired' => $t['skills_acquired'] ?? '', 'certificateReceived' => $t['certificate_received'] ?? ''], $trainings),
         'eligibilities' => array_map(fn($e) => ['eligibility' => $e['eligibility_name'], 'dateTaken' => $e['date_taken'] ?? ''], $eligibilities),
         'professionalLicenses' => array_map(fn($l) => ['license' => $l['license_name'], 'validUntil' => $l['valid_until'] ?? ''], $licenses),
         'workExperiences' => array_map(fn($w) => [
@@ -966,8 +991,9 @@ function employmentBuildApplicant($bid)
     ];
 
     // ── Summary fields for the table/filters ──
-    $mi = (!empty($b['middle_name'])) ? ' ' . substr($b['middle_name'], 0, 1) . '.' : '';
-    $name = $b['last_name'] . ', ' . $b['first_name'] . $mi;
+    $mi  = (!empty($b['middle_name'])) ? ' ' . substr($b['middle_name'], 0, 1) . '.' : '';
+    $suf = (!empty($b['suffix'])) ? ' ' . $b['suffix'] : '';
+    $name = $b['last_name'] . ', ' . $b['first_name'] . $mi . $suf;
     $age = 0;
     if (!empty($b['birth_date'])) {
         $age = (int) (new DateTime())->diff(new DateTime($b['birth_date']))->y;
@@ -1027,7 +1053,7 @@ function efApplicantReferralState($bsId)
 
     $rf = db()->prepare(
         "SELECT 1 FROM employment_facilitation_referrals
-         WHERE beneficiary_service_id = :id AND status IN ('Pending', 'Interviewed') LIMIT 1"
+         WHERE beneficiary_service_id = :id AND status IN ('Pending', 'Interviewed') AND deleted_at IS NULL LIMIT 1"
     );
     $rf->execute([':id' => (int) $bsId]);
     if ($rf->fetchColumn()) return 'Referred';
@@ -1118,29 +1144,62 @@ function employmentUpdateApplicant($id)
 // ─── Delete ─────────────────────────────────────────────────────────────────
 
 // POST /api/employment/deleteApplicant/{id}
+// Soft delete: the applicant is flagged (deleted_at/deleted_by) and disappears
+// from every list, but the beneficiary spine stays intact so it can be restored
+// from the recycle bin. Permanent removal happens via purgeRecord.
 function employmentDeleteApplicant($id)
 {
-    requireLogin();
+    $uid = requireLogin();
     if (!is_numeric($id)) {
         error('Invalid applicant id.', 422);
     }
     $bid = (int) $id;
 
+    // Must be an EF applicant that is not already in the recycle bin.
     $bs = db()->prepare(
-        "SELECT beneficiary_service_id FROM beneficiary_services WHERE beneficiary_id = :bid AND service_id = :sid LIMIT 1"
+        "SELECT bs.beneficiary_service_id
+         FROM beneficiary_services bs
+         JOIN beneficiaries b ON b.beneficiary_id = bs.beneficiary_id
+         WHERE bs.beneficiary_id = :bid AND bs.service_id = :sid AND b.deleted_at IS NULL
+         LIMIT 1"
     );
     $bs->execute([':bid' => $bid, ':sid' => efServiceId()]);
     $bsId = $bs->fetchColumn();
     if ($bsId === false) {
         error('Applicant not found.', 404);
     }
-    $bsId = (int) $bsId;
 
+    // Cannot delete an applicant with a live engagement — same lock the system
+    // already uses to prevent re-referral. Resolve the referral/placement first.
+    $state = efApplicantReferralState((int) $bsId);
+    if ($state === 'Hired')    error('This applicant cannot be deleted because they are currently placed in a job. Update the placement status first.', 409);
+    if ($state === 'Referred') error('This applicant cannot be deleted because they have an active referral. Resolve the referral first.', 409);
+
+    try {
+        db()->prepare("UPDATE beneficiaries SET deleted_at = now(), deleted_by = :uid WHERE beneficiary_id = :id")
+            ->execute([':uid' => $uid, ':id' => $bid]);
+    } catch (Throwable $e) {
+        error('Failed to delete applicant. Please try again.', 500);
+    }
+
+    json(['status' => 'ok', 'message' => 'Applicant moved to recycle bin.']);
+}
+
+// Permanently remove an applicant and the entire beneficiary spine (uploaded
+// files, resume sub-tables, service enrollment). Used by the recycle bin's
+// permanent-delete action; not reachable except for an already soft-deleted row.
+function employmentHardDeleteApplicant($bid)
+{
     $pdo = db();
     try {
         $pdo->beginTransaction();
 
-        $pdo->prepare("DELETE FROM employment_facilitation_profiles WHERE beneficiary_service_id = :id")->execute([':id' => $bsId]);
+        $bsStmt = $pdo->prepare("SELECT beneficiary_service_id FROM beneficiary_services WHERE beneficiary_id = :id AND service_id = :sid LIMIT 1");
+        $bsStmt->execute([':id' => $bid, ':sid' => efServiceId()]);
+        $bsId = $bsStmt->fetchColumn();
+        if ($bsId !== false) {
+            $pdo->prepare("DELETE FROM employment_facilitation_profiles WHERE beneficiary_service_id = :id")->execute([':id' => (int) $bsId]);
+        }
         employmentUnlinkDocs($pdo, $bid); // unlink all document files first
         foreach (['educations', 'trainings', 'eligibilities', 'licenses', 'work_experiences', 'job_preferences', 'languages', 'skills', 'beneficiary_classifications', 'disabilities', 'documents'] as $t) {
             $pdo->prepare("DELETE FROM {$t} WHERE beneficiary_id = :id")->execute([':id' => $bid]);
@@ -1151,10 +1210,8 @@ function employmentDeleteApplicant($id)
         $pdo->commit();
     } catch (Throwable $e) {
         if ($pdo->inTransaction()) $pdo->rollBack();
-        error('Failed to delete applicant. Please try again.', 500);
+        error('Failed to permanently delete applicant. Please try again.', 500);
     }
-
-    json(['status' => 'ok', 'message' => 'Applicant deleted.']);
 }
 
 // ═══════════════════════════════════════════════════════════════════════════════
@@ -1262,6 +1319,7 @@ function efListEmployers()
          LEFT JOIN cities     c   ON c.city_id        = bgy.city_id
          LEFT JOIN provinces  p   ON p.province_id    = c.province_id
          LEFT JOIN regions    r   ON r.region_id      = p.region_id
+         WHERE e.deleted_at IS NULL
          ORDER BY e.employer_id DESC"
     );
     $stmt->execute();
@@ -1275,6 +1333,7 @@ function efListEmployers()
 function efValidateEmployer($d)
 {
     if (efNull($d['companyName']      ?? '') === null) return 'Company name is required.';
+    if (efNull($d['tinNumber']        ?? '') === null) return 'TIN number is required.';
     if (efNull($d['contactPersonName'] ?? '') === null) return 'Contact person name is required.';
     if (efNull($d['contactNumber']    ?? '') === null) return 'Contact number is required.';
     if (efNull($d['dateRegistered']   ?? '') === null) return 'Date registered is required.';
@@ -1366,10 +1425,10 @@ function efUpdateEmployer($id)
     json(['status' => 'ok', 'message' => 'Employer updated.']);
 }
 
-// POST /api/employment/deleteEmployer/{id}
+// POST /api/employment/deleteEmployer/{id}  — soft delete (moves to recycle bin)
 function efDeleteEmployer($id)
 {
-    requireLogin();
+    $uid = requireLogin();
     if (!is_numeric($id)) error('Invalid employer id.', 422);
 
     $check = db()->prepare("SELECT COUNT(*) FROM vacancies WHERE employer_id = :id");
@@ -1379,12 +1438,24 @@ function efDeleteEmployer($id)
     }
 
     try {
-        db()->prepare("DELETE FROM employers WHERE employer_id = :id")->execute([':id' => (int) $id]);
+        $stmt = db()->prepare("UPDATE employers SET deleted_at = now(), deleted_by = :uid WHERE employer_id = :id AND deleted_at IS NULL");
+        $stmt->execute([':uid' => $uid, ':id' => (int) $id]);
     } catch (Throwable $e) {
         error('Failed to delete employer. Please try again.', 500);
     }
+    if ($stmt->rowCount() === 0) error('Employer not found.', 404);
 
-    json(['status' => 'ok', 'message' => 'Employer deleted.']);
+    json(['status' => 'ok', 'message' => 'Employer moved to recycle bin.']);
+}
+
+// Permanently remove an employer row. Used by the recycle bin's permanent-delete.
+function employmentHardDeleteEmployer($id)
+{
+    try {
+        db()->prepare("DELETE FROM employers WHERE employer_id = :id")->execute([':id' => (int) $id]);
+    } catch (Throwable $e) {
+        error('Failed to permanently delete employer. Please try again.', 500);
+    }
 }
 
 // ═══════════════════════════════════════════════════════════════════════════════
@@ -1605,7 +1676,7 @@ function efGetApplicantHistory($id)
          JOIN vacancies v ON v.vacancy_id = r.vacancy_id
          JOIN employers e ON e.employer_id = v.employer_id
          LEFT JOIN employment_facilitation_placements p ON p.referral_id = r.referral_id
-         WHERE r.beneficiary_service_id = :bsid
+         WHERE r.beneficiary_service_id = :bsid AND r.deleted_at IS NULL
          ORDER BY r.referral_id ASC"
     );
     $stmt->execute([':bsid' => $bsId]);
@@ -1648,7 +1719,7 @@ function efListReferrals()
          JOIN beneficiaries b         ON b.beneficiary_id          = bs.beneficiary_id
          JOIN vacancies v             ON v.vacancy_id              = r.vacancy_id
          JOIN employers e             ON e.employer_id             = v.employer_id
-         WHERE r.status != 'Hired'
+         WHERE r.status != 'Hired' AND r.deleted_at IS NULL AND b.deleted_at IS NULL
          ORDER BY r.referral_id DESC"
     );
     $stmt->execute();
@@ -1776,23 +1847,34 @@ function efUpdateReferralStatus($id)
     json(['status' => 'ok', 'message' => 'Applicant hired and placement created.', 'data' => ['placementId' => $placementId]]);
 }
 
-// POST /api/employment/deleteReferral/{id}
+// POST /api/employment/deleteReferral/{id}  — soft delete (moves to recycle bin)
 function efDeleteReferral($id)
 {
+    $uid = requireLogin();
     if (!is_numeric($id)) error('Invalid referral id.', 422);
 
-    $check = db()->prepare("SELECT 1 FROM employment_facilitation_referrals WHERE referral_id = :id");
+    $check = db()->prepare("SELECT 1 FROM employment_facilitation_referrals WHERE referral_id = :id AND deleted_at IS NULL");
     $check->execute([':id' => (int) $id]);
     if (!$check->fetchColumn()) error('Referral not found.', 404);
 
     try {
-        db()->prepare("DELETE FROM employment_facilitation_referrals WHERE referral_id = :id")
-            ->execute([':id' => (int) $id]);
+        db()->prepare("UPDATE employment_facilitation_referrals SET deleted_at = now(), deleted_by = :uid WHERE referral_id = :id")
+            ->execute([':uid' => $uid, ':id' => (int) $id]);
     } catch (Throwable $e) {
         error('Failed to delete referral. Please try again.', 500);
     }
 
-    json(['status' => 'ok', 'message' => 'Referral removed.']);
+    json(['status' => 'ok', 'message' => 'Referral moved to recycle bin.']);
+}
+
+// Permanently remove a referral row. Used by the recycle bin's permanent-delete.
+function employmentHardDeleteReferral($id)
+{
+    try {
+        db()->prepare("DELETE FROM employment_facilitation_referrals WHERE referral_id = :id")->execute([':id' => (int) $id]);
+    } catch (Throwable $e) {
+        error('Failed to permanently delete referral. Please try again.', 500);
+    }
 }
 
 // ═══════════════════════════════════════════════════════════════════════════════
@@ -1836,6 +1918,7 @@ function efListPlacements()
          JOIN beneficiaries b         ON b.beneficiary_id          = bs.beneficiary_id
          LEFT JOIN vacancies v        ON v.vacancy_id              = p.vacancy_id
          LEFT JOIN employers e        ON e.employer_id             = p.employer_id
+         WHERE b.deleted_at IS NULL
          ORDER BY p.placement_id DESC"
     );
     $stmt->execute();
@@ -1889,4 +1972,144 @@ function efUpdatePlacementStatus($id)
     }
 
     json(['status' => 'ok', 'message' => "Placement status updated to {$status}."]);
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// RECYCLE BIN  (soft-deleted EF records: applicants, employers, referrals)
+// ═══════════════════════════════════════════════════════════════════════════════
+
+// recordType -> [table, primary-key column]. The single source of truth for the
+// restore/purge actions so they cannot touch a table they shouldn't.
+function efRecycleMap()
+{
+    return [
+        'applicant' => ['beneficiaries', 'beneficiary_id'],
+        'employer'  => ['employers', 'employer_id'],
+        'referral'  => ['employment_facilitation_referrals', 'referral_id'],
+    ];
+}
+
+// Read + validate { recordType, id } from the request body. Returns [type, id].
+function efRecycleTarget()
+{
+    $d    = body();
+    $type = $d['recordType'] ?? '';
+    $id   = isset($d['id']) && is_numeric($d['id']) ? (int) $d['id'] : null;
+    if (!isset(efRecycleMap()[$type])) error('Invalid record type.', 422);
+    if (!$id) error('Invalid record id.', 422);
+    return [$type, $id];
+}
+
+// GET /api/employment/listDeleted
+// Every soft-deleted EF record in the shape the recycle bin UI expects:
+//   { recordType, id, name, module, description, deletedBy, deletedAt }
+function efListDeleted()
+{
+    $items = [];
+
+    // Applicants (soft-deleted beneficiaries enrolled in EF).
+    $appl = db()->prepare(
+        "SELECT b.beneficiary_id AS id,
+                CONCAT(b.last_name, ', ', b.first_name,
+                       CASE WHEN b.middle_name IS NOT NULL THEN ' ' || LEFT(b.middle_name, 1) || '.' ELSE '' END) AS name,
+                b.deleted_at, u.username AS deleted_by
+         FROM beneficiaries b
+         JOIN beneficiary_services bs ON bs.beneficiary_id = b.beneficiary_id AND bs.service_id = :sid
+         LEFT JOIN users u ON u.user_id = b.deleted_by
+         WHERE b.deleted_at IS NOT NULL"
+    );
+    $appl->execute([':sid' => efServiceId()]);
+    foreach ($appl->fetchAll(PDO::FETCH_ASSOC) as $r) {
+        $items[] = [
+            'recordType'  => 'applicant',
+            'id'          => (int) $r['id'],
+            'name'        => $r['name'],
+            'module'      => 'Applicants',
+            'description' => 'Employment Facilitation applicant record',
+            'deletedBy'   => $r['deleted_by'] ?? '',
+            'deletedAt'   => $r['deleted_at'],
+        ];
+    }
+
+    // Employers.
+    $emp = db()->prepare(
+        "SELECT e.employer_id AS id, e.company_name AS name, e.deleted_at, u.username AS deleted_by
+         FROM employers e
+         LEFT JOIN users u ON u.user_id = e.deleted_by
+         WHERE e.deleted_at IS NOT NULL"
+    );
+    $emp->execute();
+    foreach ($emp->fetchAll(PDO::FETCH_ASSOC) as $r) {
+        $items[] = [
+            'recordType'  => 'employer',
+            'id'          => (int) $r['id'],
+            'name'        => $r['name'],
+            'module'      => 'Employers',
+            'description' => 'Employer profile',
+            'deletedBy'   => $r['deleted_by'] ?? '',
+            'deletedAt'   => $r['deleted_at'],
+        ];
+    }
+
+    // Referrals.
+    $ref = db()->prepare(
+        "SELECT r.referral_id AS id, r.deleted_at, u.username AS deleted_by,
+                CONCAT(b.last_name, ', ', b.first_name) AS applicant_name,
+                v.job_title, e.company_name
+         FROM employment_facilitation_referrals r
+         JOIN beneficiary_services bs ON bs.beneficiary_service_id = r.beneficiary_service_id
+         JOIN beneficiaries b ON b.beneficiary_id = bs.beneficiary_id
+         JOIN vacancies v ON v.vacancy_id = r.vacancy_id
+         JOIN employers e ON e.employer_id = v.employer_id
+         LEFT JOIN users u ON u.user_id = r.deleted_by
+         WHERE r.deleted_at IS NOT NULL"
+    );
+    $ref->execute();
+    foreach ($ref->fetchAll(PDO::FETCH_ASSOC) as $r) {
+        $items[] = [
+            'recordType'  => 'referral',
+            'id'          => (int) $r['id'],
+            'name'        => $r['applicant_name'],
+            'module'      => 'Referrals',
+            'description' => 'Referral to ' . $r['company_name'] . ' — ' . $r['job_title'],
+            'deletedBy'   => $r['deleted_by'] ?? '',
+            'deletedAt'   => $r['deleted_at'],
+        ];
+    }
+
+    // Newest deletions first, across all record types.
+    usort($items, fn($a, $b) => strcmp((string) $b['deletedAt'], (string) $a['deletedAt']));
+
+    json(['status' => 'ok', 'data' => $items]);
+}
+
+// POST /api/employment/restoreRecord  { recordType, id }  — undo a soft delete.
+function efRestoreRecord()
+{
+    [$type, $id] = efRecycleTarget();
+    [$table, $pk] = efRecycleMap()[$type];
+
+    $stmt = db()->prepare("UPDATE {$table} SET deleted_at = NULL, deleted_by = NULL WHERE {$pk} = :id AND deleted_at IS NOT NULL");
+    $stmt->execute([':id' => $id]);
+    if ($stmt->rowCount() === 0) error('Record not found in recycle bin.', 404);
+
+    json(['status' => 'ok', 'message' => 'Record restored.']);
+}
+
+// POST /api/employment/purgeRecord  { recordType, id }  — permanent delete.
+// Only acts on records already in the recycle bin (deleted_at IS NOT NULL).
+function efPurgeRecord()
+{
+    [$type, $id] = efRecycleTarget();
+    [$table, $pk] = efRecycleMap()[$type];
+
+    $chk = db()->prepare("SELECT 1 FROM {$table} WHERE {$pk} = :id AND deleted_at IS NOT NULL");
+    $chk->execute([':id' => $id]);
+    if (!$chk->fetchColumn()) error('Record not found in recycle bin.', 404);
+
+    if ($type === 'applicant')    employmentHardDeleteApplicant($id);
+    elseif ($type === 'employer') employmentHardDeleteEmployer($id);
+    else                          employmentHardDeleteReferral($id);
+
+    json(['status' => 'ok', 'message' => 'Record permanently deleted.']);
 }
