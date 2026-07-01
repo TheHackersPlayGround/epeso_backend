@@ -18,6 +18,7 @@ function handle($action, $id, $method)
         case 'listActivityParticipants': requirePermission('cdsp','Viewer'); return cdspListActivityParticipants($id);
         case 'addParticipant':           requirePermission('cdsp','Editor'); return cdspAddParticipant();
         case 'removeParticipant':        requirePermission('cdsp','Editor'); return cdspRemoveParticipant();
+        case 'updateAttendance':         requirePermission('cdsp','Editor'); return cdspUpdateAttendance();
         case 'listProfiles':             requirePermission('cdsp','Viewer'); return cdspListProfiles();
         case 'getProfile':               requirePermission('cdsp','Viewer'); return cdspGetProfile($id);
         case 'createProfile':            requirePermission('cdsp','Editor'); return cdspCreateProfile();
@@ -232,7 +233,8 @@ function cdspUpdateActivityStatus($id) {
     $valid  = ['Planned', 'Ongoing', 'Completed'];
     $status = in_array($d['status'] ?? '', $valid, true) ? $d['status'] : null;
     if (!$status) error('Valid status required.', 422);
-    db()->prepare("UPDATE cdsp_activities SET status=:s,updated_at=now() WHERE activity_id=:id")->execute([':s'=>$status,':id'=>(int)$id]);
+    $completedAt = $status === 'Completed' ? ',completed_at=now()' : '';
+    db()->prepare("UPDATE cdsp_activities SET status=:s,updated_at=now(){$completedAt} WHERE activity_id=:id")->execute([':s'=>$status,':id'=>(int)$id]);
     json(['status' => 'ok', 'message' => 'Status updated.']);
 }
 
@@ -269,7 +271,7 @@ function cdspListActivityParticipants($activityId) {
             $cls = trim($cls, '{}');
             $cls = $cls === '' ? [] : array_map(function($v) { return trim($v, '"'); }, str_getcsv($cls));
         } else { $cls = []; }
-        return ['id'=>(int)$r['beneficiary_id'],'beneficiaryServiceId'=>(int)$r['beneficiary_service_id'],'lastName'=>$r['last_name'],'firstName'=>$r['first_name'],'middleName'=>$r['middle_name']??'','contactNumber'=>$r['contact_no']??'','serviceAvailed'=>$r['service_availed'],'classification'=>$cls,'status'=>$r['bs_status'],'attended'=>(bool)$r['attended']];
+        return ['id'=>(int)$r['beneficiary_id'],'beneficiaryServiceId'=>(int)$r['beneficiary_service_id'],'lastName'=>$r['last_name'],'firstName'=>$r['first_name'],'middleName'=>$r['middle_name']??'','contactNumber'=>$r['contact_no']??'','serviceAvailed'=>$r['service_availed'],'classification'=>$cls,'status'=>$r['bs_status'],'attended'=>$r['attended'] === null ? null : (bool)$r['attended']];
     }, $s->fetchAll());
     json(['status' => 'ok', 'data' => $out]);
 }
@@ -279,7 +281,7 @@ function cdspAddParticipant() {
     $actId = cdspIntOrNull($d['activityId'] ?? '');
     $bsId  = cdspIntOrNull($d['beneficiaryServiceId'] ?? '');
     if (!$actId || !$bsId) error('activityId and beneficiaryServiceId required.', 422);
-    db()->prepare("INSERT INTO cdsp_activity_participants(activity_id,beneficiary_service_id) VALUES(:a,:b) ON CONFLICT DO NOTHING")->execute([':a'=>$actId,':b'=>$bsId]);
+    db()->prepare("INSERT INTO cdsp_activity_participants(activity_id,beneficiary_service_id,date_assigned) VALUES(:a,:b,now()) ON CONFLICT DO NOTHING")->execute([':a'=>$actId,':b'=>$bsId]);
     json(['status' => 'ok', 'message' => 'Participant added.']);
 }
 
@@ -290,6 +292,17 @@ function cdspRemoveParticipant() {
     if (!$actId || !$bsId) error('activityId and beneficiaryServiceId required.', 422);
     db()->prepare("DELETE FROM cdsp_activity_participants WHERE activity_id=:a AND beneficiary_service_id=:b")->execute([':a'=>$actId,':b'=>$bsId]);
     json(['status' => 'ok', 'message' => 'Participant removed.']);
+}
+
+function cdspUpdateAttendance() {
+    $d      = body();
+    $actId  = cdspIntOrNull($d['activityId'] ?? '');
+    $bsId   = cdspIntOrNull($d['beneficiaryServiceId'] ?? '');
+    if (!$actId || !$bsId) error('activityId and beneficiaryServiceId required.', 422);
+    if (!isset($d['attended']) || !is_bool($d['attended'])) error('attended must be true or false.', 422);
+    db()->prepare("UPDATE cdsp_activity_participants SET attended=:att WHERE activity_id=:a AND beneficiary_service_id=:b")
+        ->execute([':att'=>$d['attended'] ? 'true' : 'false',':a'=>$actId,':b'=>$bsId]);
+    json(['status' => 'ok', 'message' => 'Attendance updated.']);
 }
 
 // ─── Profiles ─────────────────────────────────────────────────────────────────
@@ -349,7 +362,8 @@ function cdspBuildProfile($bid) {
     $classifications = $clsS->fetchAll(PDO::FETCH_COLUMN);
 
     $partS = db()->prepare(
-        "SELECT cap.activity_id, ca.activity_title, ca.status AS activity_status, ca.activity_date
+        "SELECT cap.activity_id, ca.activity_title, ca.status AS activity_status, ca.activity_date,
+                cap.date_assigned, ca.completed_at
          FROM cdsp_activity_participants cap
          JOIN cdsp_activities ca ON ca.activity_id = cap.activity_id
          WHERE cap.beneficiary_service_id = :bsid
@@ -363,8 +377,8 @@ function cdspBuildProfile($bid) {
         $history[] = [
             'activityId'    => (int)$p['activity_id'],
             'activityTitle' => $p['activity_title'],
-            'assignedDate'  => $p['activity_date'] ?? '',
-            'completedDate' => ($p['activity_status'] === 'Completed') ? ($p['activity_date'] ?? '') : null,
+            'assignedDate'  => $p['date_assigned'] ?? $p['activity_date'] ?? '',
+            'completedDate' => ($p['activity_status'] === 'Completed') ? ($p['completed_at'] ?? $p['activity_date'] ?? '') : null,
         ];
     }
 
