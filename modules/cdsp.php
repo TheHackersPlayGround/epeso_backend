@@ -24,6 +24,9 @@ function handle($action, $id, $method)
         case 'createProfile':            requirePermission('cdsp','Editor'); return cdspCreateProfile();
         case 'updateProfile':            requirePermission('cdsp','Editor'); return cdspUpdateProfile($id);
         case 'deleteProfile':            requirePermission('cdsp','Editor'); return cdspDeleteProfile($id);
+        case 'listDeleted':              requirePermission('cdsp','Viewer'); return cdspListDeleted();
+        case 'restoreRecord':            requirePermission('cdsp','Editor'); return cdspRestoreRecord();
+        case 'purgeRecord':              requirePermission('cdsp','Editor'); return cdspPurgeRecord();
         default: error("Unknown CDSP action: {$action}", 404);
     }
 }
@@ -506,19 +509,27 @@ function cdspCreateProfile() {
     $sex = in_array($d['sex'] ?? '', ['Male','Female'], true) ? $d['sex'] : null;
     if (!$sex) error('Sex is required.', 422);
 
+    // Birthdate, Civil Status, and Barangay are required by the underlying
+    // beneficiaries table (NOT NULL columns) — validated here so a bad
+    // request 422s cleanly instead of failing as a raw DB constraint
+    // violation (birth_date/civil_status/barangay_id are all NOT NULL).
+    $birth = cdspDate($d['birthdate'] ?? '');
+    if (!$birth) error('Birthdate is required.', 422);
+
     $validCivil = ['Single','Married','Widowed','Separated','Divorced'];
     $civil = in_array($d['civilStatus'] ?? '', $validCivil, true) ? $d['civilStatus'] : null;
+    if (!$civil) error('Civil Status is required.', 422);
 
-    // barangayId is optional — 0 or missing becomes NULL (barangay can be added later)
     $bgyId = (!empty($d['barangayId']) && is_numeric($d['barangayId']) && (int)$d['barangayId'] > 0)
              ? (int)$d['barangayId'] : null;
+    if (!$bgyId) error('Barangay is required.', 422);
 
     $pdo = db();
     try {
         $pdo->beginTransaction();
 
         $s = $pdo->prepare("INSERT INTO beneficiaries(first_name,middle_name,last_name,sex,birth_date,civil_status,street_address,barangay_id,contact_no,email,status,educational_attainment) VALUES(:fn,:mn,:ln,:sex,:bdate,:civil,:street,:bgy,:contact,:email,'Active',:educ) RETURNING beneficiary_id");
-        $s->execute([':fn'=>trim($d['firstName']),':mn'=>cdspNullStr($d['middleName']??''),':ln'=>trim($d['lastName']),':sex'=>$sex,':bdate'=>cdspDate($d['birthdate']??''),':civil'=>$civil,':street'=>cdspNullStr($d['streetPurok']??''),':bgy'=>$bgyId,':contact'=>cdspNullStr($d['contactNumber']??''),':email'=>cdspNullStr($d['email']??''),':educ'=>cdspMapEducation($d['highestEducation']??'')]);
+        $s->execute([':fn'=>trim($d['firstName']),':mn'=>cdspNullStr($d['middleName']??''),':ln'=>trim($d['lastName']),':sex'=>$sex,':bdate'=>$birth,':civil'=>$civil,':street'=>cdspNullStr($d['streetPurok']??''),':bgy'=>$bgyId,':contact'=>cdspNullStr($d['contactNumber']??''),':email'=>cdspNullStr($d['email']??''),':educ'=>cdspMapEducation($d['highestEducation']??'')]);
         $bid = (int)$s->fetchColumn();
 
         $s2 = $pdo->prepare("INSERT INTO beneficiary_services(beneficiary_id,service_id,status,date_applied,received_by) VALUES(:bid,:sid,'Active',:date,:rby) RETURNING beneficiary_service_id");
@@ -559,16 +570,29 @@ function cdspUpdateProfile($id) {
     if (!$bsId) error('CDSP profile not found.', 404);
     $bsId = (int)$bsId;
 
-    $sex        = in_array($d['sex'] ?? '', ['Male','Female'], true) ? $d['sex'] : null;
+    $sex = in_array($d['sex'] ?? '', ['Male','Female'], true) ? $d['sex'] : null;
+    if (!$sex) error('Sex is required.', 422);
+
+    // Birthdate, Civil Status, and Barangay are required by the underlying
+    // beneficiaries table (NOT NULL columns) — validated here so a bad
+    // request 422s cleanly instead of failing as a raw DB constraint violation.
+    $birth = cdspDate($d['birthdate'] ?? '');
+    if (!$birth) error('Birthdate is required.', 422);
+
     $validCivil = ['Single','Married','Widowed','Separated','Divorced'];
-    $civil      = in_array($d['civilStatus'] ?? '', $validCivil, true) ? $d['civilStatus'] : null;
+    $civil = in_array($d['civilStatus'] ?? '', $validCivil, true) ? $d['civilStatus'] : null;
+    if (!$civil) error('Civil Status is required.', 422);
+
+    if (empty($d['barangayId']) || !is_numeric($d['barangayId']) || (int)$d['barangayId'] <= 0) {
+        error('Barangay is required.', 422);
+    }
 
     $pdo = db();
     try {
         $pdo->beginTransaction();
 
         $sets   = "first_name=:fn,middle_name=:mn,last_name=:ln,sex=:sex,birth_date=:bdate,civil_status=:civil,street_address=:street,contact_no=:contact,email=:email,educational_attainment=:educ,updated_at=now()";
-        $params = [':fn'=>trim($d['firstName']),':mn'=>cdspNullStr($d['middleName']??''),':ln'=>trim($d['lastName']),':sex'=>$sex,':bdate'=>cdspDate($d['birthdate']??''),':civil'=>$civil,':street'=>cdspNullStr($d['streetPurok']??''),':contact'=>cdspNullStr($d['contactNumber']??''),':email'=>cdspNullStr($d['email']??''),':educ'=>cdspMapEducation($d['highestEducation']??''),':bid'=>$bid];
+        $params = [':fn'=>trim($d['firstName']),':mn'=>cdspNullStr($d['middleName']??''),':ln'=>trim($d['lastName']),':sex'=>$sex,':bdate'=>$birth,':civil'=>$civil,':street'=>cdspNullStr($d['streetPurok']??''),':contact'=>cdspNullStr($d['contactNumber']??''),':email'=>cdspNullStr($d['email']??''),':educ'=>cdspMapEducation($d['highestEducation']??''),':bid'=>$bid];
         if (!empty($d['barangayId']) && is_numeric($d['barangayId'])) {
             $sets .= ',barangay_id=:bgy';
             $params[':bgy'] = (int)$d['barangayId'];
@@ -607,7 +631,133 @@ function cdspUpdateProfile($id) {
 
 function cdspDeleteProfile($id) {
     if (!is_numeric($id)) error('Invalid id.', 422);
+    $bid = (int) $id;
     $uid = requireLogin();
-    db()->prepare("UPDATE beneficiaries SET deleted_at=now(),deleted_by=:uid WHERE beneficiary_id=:id")->execute([':uid'=>$uid,':id'=>(int)$id]);
-    json(['status'=>'ok','message'=>'Profile deleted.']);
+
+    // Cannot delete an applicant with a live (not yet completed) activity
+    // assignment — same lock spirit as EF/GIP. Remove them from the activity first.
+    $chk = db()->prepare(
+        "SELECT 1 FROM cdsp_activity_participants cap
+         JOIN cdsp_activities ca ON ca.activity_id = cap.activity_id
+         JOIN beneficiary_services bs ON bs.beneficiary_service_id = cap.beneficiary_service_id
+         WHERE bs.beneficiary_id = :bid AND ca.status IN ('Planned','Ongoing')
+         LIMIT 1"
+    );
+    $chk->execute([':bid' => $bid]);
+    if ($chk->fetchColumn()) {
+        error('This applicant cannot be deleted because they have an active activity assignment. Remove them from the activity first.', 409);
+    }
+
+    db()->prepare("UPDATE beneficiaries SET deleted_at=now(),deleted_by=:uid WHERE beneficiary_id=:id")->execute([':uid'=>$uid,':id'=>$bid]);
+    json(['status'=>'ok','message'=>'Applicant moved to recycle bin.']);
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// RECYCLE BIN  (soft-deleted CDSP applicants) — mirrors employment.php/gip.php's
+// pattern so these records surface in the same Security > Activity Logs >
+// Recycle Bin screen alongside EF's and GIP's records.
+// ═══════════════════════════════════════════════════════════════════════════════
+
+// recordType -> [table, primary-key column]. Only one type for CDSP today.
+function cdspRecycleMap() {
+    return [
+        'cdspApplicant' => ['beneficiaries', 'beneficiary_id'],
+    ];
+}
+
+// Read + validate { recordType, id } from the request body. Returns [type, id].
+function cdspRecycleTarget() {
+    $d    = body();
+    $type = $d['recordType'] ?? '';
+    $id   = isset($d['id']) && is_numeric($d['id']) ? (int) $d['id'] : null;
+    if (!isset(cdspRecycleMap()[$type])) error('Invalid record type.', 422);
+    if (!$id) error('Invalid record id.', 422);
+    return [$type, $id];
+}
+
+// GET /api/cdsp/listDeleted
+function cdspListDeleted() {
+    $s = db()->prepare(
+        "SELECT b.beneficiary_id AS id,
+                CONCAT(b.last_name, ', ', b.first_name,
+                       CASE WHEN b.middle_name IS NOT NULL THEN ' ' || LEFT(b.middle_name, 1) || '.' ELSE '' END) AS name,
+                b.deleted_at, u.username AS deleted_by
+         FROM beneficiaries b
+         JOIN beneficiary_services bs ON bs.beneficiary_id = b.beneficiary_id
+         JOIN services sv ON sv.service_id = bs.service_id AND sv.parent_service_id = :pid
+         LEFT JOIN users u ON u.user_id = b.deleted_by
+         WHERE b.deleted_at IS NOT NULL"
+    );
+    $s->execute([':pid' => cdspParentServiceId()]);
+    $items = array_map(function ($r) {
+        return [
+            'recordType'  => 'cdspApplicant',
+            'id'          => (int) $r['id'],
+            'name'        => $r['name'],
+            'module'      => 'CDSP Applicants',
+            'description' => 'Career Development and Services Program applicant record',
+            'deletedBy'   => $r['deleted_by'] ?? '',
+            'deletedAt'   => $r['deleted_at'],
+        ];
+    }, $s->fetchAll());
+    json(['status' => 'ok', 'data' => $items]);
+}
+
+// POST /api/cdsp/restoreRecord  { recordType, id }  — undo a soft delete.
+function cdspRestoreRecord() {
+    [$type, $id] = cdspRecycleTarget();
+    [$table, $pk] = cdspRecycleMap()[$type];
+
+    $stmt = db()->prepare("UPDATE {$table} SET deleted_at = NULL, deleted_by = NULL WHERE {$pk} = :id AND deleted_at IS NOT NULL");
+    $stmt->execute([':id' => $id]);
+    if ($stmt->rowCount() === 0) error('Record not found in recycle bin.', 404);
+
+    json(['status' => 'ok', 'message' => 'Record restored.']);
+}
+
+// POST /api/cdsp/purgeRecord  { recordType, id }  — permanent delete.
+// Only acts on records already in the recycle bin (deleted_at IS NOT NULL).
+function cdspPurgeRecord() {
+    [$type, $id] = cdspRecycleTarget();
+    [$table, $pk] = cdspRecycleMap()[$type];
+
+    $chk = db()->prepare("SELECT 1 FROM {$table} WHERE {$pk} = :id AND deleted_at IS NOT NULL");
+    $chk->execute([':id' => $id]);
+    if (!$chk->fetchColumn()) error('Record not found in recycle bin.', 404);
+
+    cdspHardDeleteApplicant($id);
+    json(['status' => 'ok', 'message' => 'Record permanently deleted.']);
+}
+
+// Permanently remove a CDSP applicant and its CDSP-specific data (profile row,
+// activity participations, classifications, service enrollment). Used by the
+// recycle bin's permanent-delete action; not reachable except for an
+// already soft-deleted row. Mirrors employmentHardDeleteApplicant/gipHardDeleteApplicant.
+function cdspHardDeleteApplicant($bid) {
+    $pdo = db();
+    try {
+        $pdo->beginTransaction();
+
+        // CDSP applicants enroll via a sub-service (e.g. Career Coaching), not the
+        // parent CDSP service id directly, so match through services.parent_service_id.
+        $bsStmt = $pdo->prepare(
+            "SELECT bs.beneficiary_service_id FROM beneficiary_services bs
+             JOIN services sv ON sv.service_id = bs.service_id AND sv.parent_service_id = :pid
+             WHERE bs.beneficiary_id = :id"
+        );
+        $bsStmt->execute([':id' => $bid, ':pid' => cdspParentServiceId()]);
+        foreach ($bsStmt->fetchAll(PDO::FETCH_COLUMN) as $bsId) {
+            $pdo->prepare("DELETE FROM cdsp_activity_participants WHERE beneficiary_service_id = :id")->execute([':id' => (int) $bsId]);
+            $pdo->prepare("DELETE FROM cdsp_profiles WHERE beneficiary_service_id = :id")->execute([':id' => (int) $bsId]);
+        }
+
+        $pdo->prepare("DELETE FROM beneficiary_classifications WHERE beneficiary_id = :id")->execute([':id' => $bid]);
+        $pdo->prepare("DELETE FROM beneficiary_services WHERE beneficiary_id = :id")->execute([':id' => $bid]);
+        $pdo->prepare("DELETE FROM beneficiaries WHERE beneficiary_id = :id")->execute([':id' => $bid]);
+
+        $pdo->commit();
+    } catch (Throwable $e) {
+        if ($pdo->inTransaction()) $pdo->rollBack();
+        error('Failed to permanently delete: ' . $e->getMessage(), 500);
+    }
 }
