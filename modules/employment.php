@@ -87,6 +87,12 @@ function handle($action, $id, $method)
         case 'updatePlacementStatus':
             requirePermission('employment', 'Editor');
             return efUpdatePlacementStatus($id);
+        case 'listPromotions':
+            requirePermission('employment', 'Viewer');
+            return efListPromotions($id);
+        case 'createPromotion':
+            requirePermission('employment', 'Editor');
+            return efCreatePromotion($id);
         case 'listDeleted':
             requirePermission('employment', 'Viewer');
             return efListDeleted();
@@ -163,12 +169,11 @@ function efHeightCm($v)
     return ($n > 0 && $n < 1000) ? $n : null;
 }
 
-// True when an education level has any data worth saving. (School name is no
-// longer collected, so we look at the graduation status and the year/level/course.)
+// True when an education level has any data worth saving.
 function efEduHasData($row)
 {
     if (!is_array($row)) return false;
-    foreach (['graduated', 'yearGraduated', 'levelReached', 'yearLastAttended', 'course', 'strand', 'seniorHighStrand', 'type'] as $k) {
+    foreach (['schoolName', 'graduated', 'yearGraduated', 'levelReached', 'yearLastAttended', 'course', 'strand', 'seniorHighStrand', 'type'] as $k) {
         if (efNull($row[$k] ?? '') !== null) return true;
     }
     return false;
@@ -572,11 +577,11 @@ function employmentUnlinkDocs($pdo, $bid)
 // Insert all resume sub-tables for a beneficiary from the form payload.
 function employmentInsertResumeTables($pdo, $bid, $d)
 {
-    // Educations: the three fixed levels + any graduate studies. School name is
-    // not collected at intake, so a level is saved when it has any other data.
+    // Educations: the three fixed levels + any graduate studies. A level is saved
+    // when it has any data (including a school name).
     $eduInsert = $pdo->prepare(
-        "INSERT INTO educations (beneficiary_id, education_level, course, year_graduated, year_last_attended, graduated, strand, level_reached, school_type)
-         VALUES (:bid, :level, :course, :ygrad, :ylast, :grad, :strand, :lvl, :stype)"
+        "INSERT INTO educations (beneficiary_id, education_level, school_name, course, year_graduated, year_last_attended, graduated, strand, level_reached, school_type)
+         VALUES (:bid, :level, :school, :course, :ygrad, :ylast, :grad, :strand, :lvl, :stype)"
     );
     $levels = [
         ['Elementary', $d['elementary'] ?? null],
@@ -588,6 +593,7 @@ function employmentInsertResumeTables($pdo, $bid, $d)
             $eduInsert->execute([
                 ':bid'    => $bid,
                 ':level'  => $levelName,
+                ':school' => efNull($row['schoolName'] ?? ''),
                 ':course' => efNull($row['course'] ?? ''),
                 ':ygrad'  => efYearOrNull($row['yearGraduated'] ?? ''),
                 ':ylast'  => efYearOrNull($row['yearLastAttended'] ?? ''),
@@ -603,6 +609,7 @@ function employmentInsertResumeTables($pdo, $bid, $d)
             $eduInsert->execute([
                 ':bid'    => $bid,
                 ':level'  => 'Graduate',
+                ':school' => efNull($row['schoolName'] ?? ''),
                 ':course' => efNull($row['course'] ?? ''),
                 ':ygrad'  => efYearOrNull($row['yearGraduated'] ?? ''),
                 ':ylast'  => efYearOrNull($row['yearLastAttended'] ?? ''),
@@ -894,7 +901,7 @@ function employmentBuildApplicant($bid)
     $elem = $eduBlank; $sec = $eduBlank + ['type' => '', 'seniorHighStrand' => '']; $tert = $eduBlank; $grad = [];
     foreach ($educations as $e) {
         $obj = [
-            'schoolName'       => '', // no longer stored; filled in the Resume Builder only
+            'schoolName'       => $e['school_name'] ?? '',
             'schoolCity'       => '',
             'schoolProvince'   => '',
             'course'           => $e['course'] ?? '',
@@ -1469,9 +1476,33 @@ function efJobType($jobType)
     return in_array($jobType, $valid, true) ? $jobType : 'Contract';
 }
 
+// Format numeric salary bounds into a display string, e.g. "₱35,000 - ₱40,000".
+// Returns '' when both bounds are null (callers fall back to any legacy text).
+function efFormatSalary($min, $max)
+{
+    $peso = function ($n) {
+        $f = (float) $n;
+        return '₱' . ($f == floor($f) ? number_format($f) : number_format($f, 2));
+    };
+    if ($min === null && $max === null) return '';
+    if ($min !== null && $max !== null) return $peso($min) . ' - ' . $peso($max);
+    return $peso($min ?? $max);
+}
+
+// Coerce an incoming salary bound to a numeric value or null (tolerates ₱/commas).
+function efSalaryNum($v)
+{
+    if ($v === null || $v === '') return null;
+    if (is_numeric($v)) return $v + 0;
+    $clean = preg_replace('/[^0-9.]/', '', (string) $v);
+    return $clean === '' ? null : $clean + 0;
+}
+
 // Build the frontend Vacancy object from a DB row (with joined employer/industry).
 function efBuildVacancy($row)
 {
+    $min = $row['salary_min'] ?? null;
+    $max = $row['salary_max'] ?? null;
     return [
         'id'             => (int) $row['vacancy_id'],
         'jobTitle'       => $row['job_title'],
@@ -1480,7 +1511,10 @@ function efBuildVacancy($row)
         'vacanciesCount' => (int) $row['vacancy_count'],
         'industry'       => $row['industry_name'] ?? '',
         'jobType'        => $row['job_type'],
-        'salaryRange'    => $row['salary_range'] ?? '',
+        'salaryMin'      => $min !== null ? (float) $min : null,
+        'salaryMax'      => $max !== null ? (float) $max : null,
+        // Display string derived from the atomic bounds (source of truth).
+        'salaryRange'    => efFormatSalary($min, $max),
         'description'    => $row['description'] ?? '',
         'requirements'   => $row['requirements'] ?? '',
         'status'         => $row['status'],
@@ -1527,12 +1561,20 @@ function efCreateVacancy()
     $emp->execute([':id' => (int) $d['employerId']]);
     if (!$emp->fetchColumn()) error('Employer not found.', 404);
 
+    $salMin = efSalaryNum($d['salaryMin'] ?? null);
+    $salMax = efSalaryNum($d['salaryMax'] ?? null);
+    if ($salMin !== null && $salMax !== null && $salMin > $salMax) {
+        error('Minimum salary cannot exceed maximum salary.', 422);
+    }
+
     try {
         $stmt = db()->prepare(
             "INSERT INTO vacancies
-                (employer_id, job_title, vacancy_count, job_type, salary_range, description, requirements, status)
+                (employer_id, job_title, vacancy_count, job_type,
+                 salary_min, salary_max, description, requirements, status)
              VALUES
-                (:eid, :title, :cnt, :jtype, :salary, :desc, :req, 'Open')
+                (:eid, :title, :cnt, :jtype,
+                 :smin, :smax, :desc, :req, 'Open')
              RETURNING vacancy_id"
         );
         $stmt->execute([
@@ -1540,7 +1582,8 @@ function efCreateVacancy()
             ':title'  => trim($d['jobTitle']),
             ':cnt'    => is_numeric($d['vacanciesCount'] ?? 1) ? (int) $d['vacanciesCount'] : 1,
             ':jtype'  => efJobType($d['jobType'] ?? 'Full-time'),
-            ':salary' => efNull($d['salaryRange'] ?? ''),
+            ':smin'   => $salMin,
+            ':smax'   => $salMax,
             ':desc'   => trim($d['description'] ?? ''),
             ':req'    => trim($d['requirements'] ?? ''),
         ]);
@@ -1564,11 +1607,17 @@ function efUpdateVacancy($id)
     $emp->execute([':id' => (int) $d['employerId']]);
     if (!$emp->fetchColumn()) error('Employer not found.', 404);
 
+    $salMin = efSalaryNum($d['salaryMin'] ?? null);
+    $salMax = efSalaryNum($d['salaryMax'] ?? null);
+    if ($salMin !== null && $salMax !== null && $salMin > $salMax) {
+        error('Minimum salary cannot exceed maximum salary.', 422);
+    }
+
     try {
         $stmt = db()->prepare(
             "UPDATE vacancies SET
                 employer_id = :eid, job_title = :title, vacancy_count = :cnt,
-                job_type = :jtype, salary_range = :salary,
+                job_type = :jtype, salary_min = :smin, salary_max = :smax,
                 description = :desc, requirements = :req, updated_at = now()
              WHERE vacancy_id = :vid"
         );
@@ -1577,7 +1626,8 @@ function efUpdateVacancy($id)
             ':title'  => trim($d['jobTitle']),
             ':cnt'    => is_numeric($d['vacanciesCount'] ?? 1) ? (int) $d['vacanciesCount'] : 1,
             ':jtype'  => efJobType($d['jobType'] ?? 'Full-time'),
-            ':salary' => efNull($d['salaryRange'] ?? ''),
+            ':smin'   => $salMin,
+            ':smax'   => $salMax,
             ':desc'   => trim($d['description'] ?? ''),
             ':req'    => trim($d['requirements'] ?? ''),
             ':vid'    => (int) $id,
@@ -1784,7 +1834,7 @@ function efUpdateReferralStatus($id)
 
     $ref = db()->prepare(
         "SELECT r.referral_id, r.beneficiary_service_id, r.vacancy_id,
-                v.job_title, v.job_type, v.salary_range, v.employer_id,
+                v.job_title, v.job_type, v.employer_id,
                 e.company_name
          FROM employment_facilitation_referrals r
          JOIN vacancies v ON v.vacancy_id   = r.vacancy_id
@@ -1895,7 +1945,8 @@ function efBuildPlacement($row)
         'employmentType' => $row['vacancy_job_type'] ?? '',
         'referralId'     => $row['referral_id'] !== null ? (int) $row['referral_id'] : null,
         'vacancyId'      => $row['vacancy_id']   !== null ? (int) $row['vacancy_id']  : null,
-        'salaryRange'    => $row['vacancy_salary_range'] ?? '',
+        // Display string derived from the vacancy's atomic bounds (source of truth).
+        'salaryRange'    => efFormatSalary($row['vacancy_salary_min'] ?? null, $row['vacancy_salary_max'] ?? null),
     ];
 }
 
@@ -1911,7 +1962,8 @@ function efListPlacements()
                             ELSE '' END) AS applicant_name,
                 v.job_title AS vacancy_job_title,
                 v.job_type  AS vacancy_job_type,
-                v.salary_range AS vacancy_salary_range,
+                v.salary_min AS vacancy_salary_min,
+                v.salary_max AS vacancy_salary_max,
                 e.company_name
          FROM employment_facilitation_placements p
          JOIN beneficiary_services bs ON bs.beneficiary_service_id = p.beneficiary_service_id
@@ -1972,6 +2024,86 @@ function efUpdatePlacementStatus($id)
     }
 
     json(['status' => 'ok', 'message' => "Placement status updated to {$status}."]);
+}
+
+// GET /api/employment/listPromotions/{placementId}
+// Promotion history for one placement, newest first. A placement can have many
+// promotions (Cook -> Head Cook -> Manager) within the same job.
+function efListPromotions($id)
+{
+    if (!is_numeric($id)) error('Invalid placement id.', 422);
+
+    $stmt = db()->prepare(
+        "SELECT promotion_id, promotion_date, new_job_title,
+                new_salary_min, new_salary_max, remarks, created_at
+         FROM placement_promotions
+         WHERE placement_id = :pid
+         ORDER BY promotion_date DESC, promotion_id DESC"
+    );
+    $stmt->execute([':pid' => (int) $id]);
+
+    $out = array_map(function ($row) {
+        $min = $row['new_salary_min'] ?? null;
+        $max = $row['new_salary_max'] ?? null;
+        return [
+            'id'             => (int) $row['promotion_id'],
+            'promotionDate'  => $row['promotion_date'],
+            'newJobTitle'    => $row['new_job_title'],
+            'newSalaryMin'   => $min !== null ? (float) $min : null,
+            'newSalaryMax'   => $max !== null ? (float) $max : null,
+            'newSalaryRange' => efFormatSalary($min, $max),
+            'remarks'        => $row['remarks'] ?? '',
+            'createdAt'      => $row['created_at'],
+        ];
+    }, $stmt->fetchAll(PDO::FETCH_ASSOC));
+
+    json(['status' => 'ok', 'data' => $out]);
+}
+
+// POST /api/employment/createPromotion/{placementId}
+//   { promotionDate, newJobTitle, newSalaryMin?, newSalaryMax?, remarks? }
+// Records one promotion event against a placement. Does not alter the placement
+// row or its status -- promotions are append-only history.
+function efCreatePromotion($id)
+{
+    if (!is_numeric($id)) error('Invalid placement id.', 422);
+    $uid = requireLogin();
+    $d = body();
+
+    if (efNull($d['promotionDate'] ?? '') === null) error('Promotion date is required.', 422);
+    if (efNull($d['newJobTitle'] ?? '') === null)   error('New job title is required.', 422);
+
+    $salMin = efSalaryNum($d['newSalaryMin'] ?? null);
+    $salMax = efSalaryNum($d['newSalaryMax'] ?? null);
+    if ($salMin !== null && $salMax !== null && $salMin > $salMax) {
+        error('Minimum salary cannot exceed maximum salary.', 422);
+    }
+
+    // The placement must exist before we can attach a promotion to it.
+    $exists = db()->prepare("SELECT 1 FROM employment_facilitation_placements WHERE placement_id = :pid");
+    $exists->execute([':pid' => (int) $id]);
+    if (!$exists->fetchColumn()) error('Placement not found.', 404);
+
+    try {
+        db()->prepare(
+            "INSERT INTO placement_promotions
+                (placement_id, promotion_date, new_job_title,
+                 new_salary_min, new_salary_max, remarks, created_by)
+             VALUES (:pid, :date, :title, :smin, :smax, :remarks, :uid)"
+        )->execute([
+            ':pid'     => (int) $id,
+            ':date'    => $d['promotionDate'],
+            ':title'   => trim($d['newJobTitle']),
+            ':smin'    => $salMin,
+            ':smax'    => $salMax,
+            ':remarks' => efNull($d['remarks'] ?? ''),
+            ':uid'     => $uid,
+        ]);
+    } catch (Throwable $e) {
+        error('Failed to record promotion. Please try again.', 500);
+    }
+
+    json(['status' => 'ok', 'message' => 'Promotion recorded.']);
 }
 
 // ═══════════════════════════════════════════════════════════════════════════════
