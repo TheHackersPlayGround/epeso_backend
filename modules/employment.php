@@ -75,6 +75,9 @@ function handle($action, $id, $method)
         case 'updateReferralStatus':
             requirePermission('employment', 'Editor');
             return efUpdateReferralStatus($id);
+        case 'checkDuplicateReferral':
+            requirePermission('employment', 'Viewer');
+            return efCheckDuplicateReferral();
         case 'deleteReferral':
             requirePermission('employment', 'Editor');
             return efDeleteReferral($id);
@@ -87,6 +90,9 @@ function handle($action, $id, $method)
         case 'updatePlacementStatus':
             requirePermission('employment', 'Editor');
             return efUpdatePlacementStatus($id);
+        case 'monthlyReport':
+            requirePermission('employment', 'Viewer');
+            return efMonthlyReport();
         case 'listPromotions':
             requirePermission('employment', 'Viewer');
             return efListPromotions($id);
@@ -1498,17 +1504,30 @@ function efSalaryNum($v)
     return $clean === '' ? null : $clean + 0;
 }
 
-// Build the frontend Vacancy object from a DB row (with joined employer/industry).
+// Build the frontend Vacancy object from a DB row (with joined employer/industry
+// and an active_placements count). Availability is DERIVED, not stored:
+//   remaining        = slots_total - active placements  (never drifts; reopens
+//                      automatically when a placement ends)
+//   effective status = Closed when manually closed OR full; else Open
+// `manualStatus` is the officer's open/close intent (what the toggle flips).
 function efBuildVacancy($row)
 {
     $min = $row['salary_min'] ?? null;
     $max = $row['salary_max'] ?? null;
+
+    $slotsTotal = (int) ($row['slots_total'] ?? 0);
+    $active    = isset($row['active_placements']) ? (int) $row['active_placements'] : 0;
+    $remaining = max(0, $slotsTotal - $active);
+    $manual    = $row['status'];
+    $effective = ($manual === 'Closed' || $remaining === 0) ? 'Closed' : 'Open';
+
     return [
         'id'             => (int) $row['vacancy_id'],
         'jobTitle'       => $row['job_title'],
         'employer'       => $row['company_name'] ?? '',
         'employerId'     => (int) $row['employer_id'],
-        'vacanciesCount' => (int) $row['vacancy_count'],
+        'vacanciesCount' => $remaining,   // remaining openings (derived)
+        'slotsTotal'     => $slotsTotal,  // original openings solicited
         'industry'       => $row['industry_name'] ?? '',
         'jobType'        => $row['job_type'],
         'salaryMin'      => $min !== null ? (float) $min : null,
@@ -1517,7 +1536,8 @@ function efBuildVacancy($row)
         'salaryRange'    => efFormatSalary($min, $max),
         'description'    => $row['description'] ?? '',
         'requirements'   => $row['requirements'] ?? '',
-        'status'         => $row['status'],
+        'status'         => $effective,   // effective (display/filter/referral)
+        'manualStatus'   => $manual,      // officer intent (drives the toggle)
     ];
 }
 
@@ -1527,7 +1547,9 @@ function efBuildVacancy($row)
 function efListVacancies()
 {
     $stmt = db()->prepare(
-        "SELECT v.*, e.company_name, i.industry_name
+        "SELECT v.*, e.company_name, i.industry_name,
+                (SELECT COUNT(*) FROM employment_facilitation_placements p
+                 WHERE p.vacancy_id = v.vacancy_id AND p.status = 'Active') AS active_placements
          FROM vacancies v
          JOIN employers e    ON e.employer_id  = v.employer_id
          LEFT JOIN industries i ON i.industry_id = e.industry_id
@@ -1569,8 +1591,9 @@ function efCreateVacancy()
 
     try {
         $stmt = db()->prepare(
+            // slots_total = original openings (source of truth). Remaining is derived.
             "INSERT INTO vacancies
-                (employer_id, job_title, vacancy_count, job_type,
+                (employer_id, job_title, slots_total, job_type,
                  salary_min, salary_max, description, requirements, status)
              VALUES
                 (:eid, :title, :cnt, :jtype,
@@ -1616,7 +1639,7 @@ function efUpdateVacancy($id)
     try {
         $stmt = db()->prepare(
             "UPDATE vacancies SET
-                employer_id = :eid, job_title = :title, vacancy_count = :cnt,
+                employer_id = :eid, job_title = :title, slots_total = :cnt,
                 job_type = :jtype, salary_min = :smin, salary_max = :smax,
                 description = :desc, requirements = :req, updated_at = now()
              WHERE vacancy_id = :vid"
@@ -1777,6 +1800,67 @@ function efListReferrals()
     json(['status' => 'ok', 'data' => $out]);
 }
 
+// GET /api/employment/checkDuplicateReferral?applicantId=X&vacancyId=Y
+// Warn-guard for the referral flow: has this applicant already been referred to OR
+// placed at the SAME employer for the SAME position (job title) before? Returns
+// the most recent match so the UI can confirm before creating a duplicate referral.
+function efCheckDuplicateReferral()
+{
+    $applicantId = isset($_GET['applicantId']) && is_numeric($_GET['applicantId']) ? (int) $_GET['applicantId'] : null;
+    $vacancyId   = isset($_GET['vacancyId'])   && is_numeric($_GET['vacancyId'])   ? (int) $_GET['vacancyId']   : null;
+    if (!$applicantId || !$vacancyId) error('applicantId and vacancyId are required.', 422);
+
+    // Target employer + position for the vacancy being referred to.
+    $vStmt = db()->prepare(
+        "SELECT v.employer_id, v.job_title, e.company_name
+         FROM vacancies v JOIN employers e ON e.employer_id = v.employer_id
+         WHERE v.vacancy_id = :vid"
+    );
+    $vStmt->execute([':vid' => $vacancyId]);
+    $vac = $vStmt->fetch(PDO::FETCH_ASSOC);
+    $bsId = efGetBsId($applicantId);
+    if (!$vac || !$bsId) { json(['status' => 'ok', 'data' => ['hasDuplicate' => false]]); }
+
+    $params = [':bsid' => $bsId, ':eid' => $vac['employer_id'], ':title' => $vac['job_title']];
+
+    // Most recent prior referral to the same employer + position.
+    $rStmt = db()->prepare(
+        "SELECT r.date_referred AS d, r.status::text AS outcome
+         FROM employment_facilitation_referrals r JOIN vacancies v ON v.vacancy_id = r.vacancy_id
+         WHERE r.beneficiary_service_id = :bsid AND r.deleted_at IS NULL
+           AND v.employer_id = :eid AND v.job_title = :title
+         ORDER BY r.date_referred DESC LIMIT 1"
+    );
+    $rStmt->execute($params);
+    $ref = $rStmt->fetch(PDO::FETCH_ASSOC);
+
+    // Most recent prior placement at the same employer + position.
+    $pStmt = db()->prepare(
+        "SELECT p.date_hired AS d, p.status::text AS outcome
+         FROM employment_facilitation_placements p JOIN vacancies v ON v.vacancy_id = p.vacancy_id
+         WHERE p.beneficiary_service_id = :bsid
+           AND v.employer_id = :eid AND v.job_title = :title
+         ORDER BY p.date_hired DESC LIMIT 1"
+    );
+    $pStmt->execute($params);
+    $pl = $pStmt->fetch(PDO::FETCH_ASSOC);
+
+    // Pick the most recent of the two.
+    $best = null; $kind = null;
+    if ($ref)                                     { $best = $ref; $kind = 'referral'; }
+    if ($pl && (!$best || $pl['d'] > $best['d'])) { $best = $pl; $kind = 'placement'; }
+    if (!$best) { json(['status' => 'ok', 'data' => ['hasDuplicate' => false]]); }
+
+    json(['status' => 'ok', 'data' => [
+        'hasDuplicate' => true,
+        'employer'     => $vac['company_name'],
+        'position'     => $vac['job_title'],
+        'date'         => $best['d'],
+        'kind'         => $kind,       // 'referral' | 'placement'
+        'outcome'      => $best['outcome'],
+    ]]);
+}
+
 // POST /api/employment/createReferral  { applicantId, vacancyId }
 function efCreateReferral()
 {
@@ -1790,10 +1874,17 @@ function efCreateReferral()
     $bsId = efGetBsId($applicantId);
     if (!$bsId) error('Applicant is not enrolled in Employment Facilitation.', 404);
 
-    // Verify vacancy exists and is open
-    $vac = db()->prepare("SELECT vacancy_id FROM vacancies WHERE vacancy_id = :id AND status = 'Open'");
+    // Verify the vacancy is available: manually Open AND has a free slot
+    // (remaining = slots_total - active placements, derived — never a stale count).
+    $vac = db()->prepare(
+        "SELECT vacancy_id FROM vacancies v
+         WHERE v.vacancy_id = :id AND v.status = 'Open'
+           AND v.slots_total >
+               (SELECT COUNT(*) FROM employment_facilitation_placements p
+                WHERE p.vacancy_id = v.vacancy_id AND p.status = 'Active')"
+    );
     $vac->execute([':id' => $vacancyId]);
-    if (!$vac->fetchColumn()) error('Vacancy not found or is closed.', 404);
+    if (!$vac->fetchColumn()) error('Vacancy is not available (closed or all slots filled).', 409);
 
     // Global lock: an applicant who is already hired (active placement) or already
     // has a live referral cannot be referred again — to any employer — until released
@@ -1879,14 +1970,9 @@ function efUpdateReferralStatus($id)
         ]);
         $placementId = (int) $ins->fetchColumn();
 
-        // Decrement vacancy count; auto-close when it hits 0
-        $pdo->prepare(
-            "UPDATE vacancies SET
-                vacancy_count = GREATEST(0, vacancy_count - 1),
-                status = CASE WHEN GREATEST(0, vacancy_count - 1) = 0 THEN 'Closed' ELSE status END,
-                updated_at = now()
-             WHERE vacancy_id = :vid"
-        )->execute([':vid' => (int) $referral['vacancy_id']]);
+        // No vacancy_count decrement: remaining openings are DERIVED from active
+        // placements (slots_total - active). A vacancy fills up and reopens (when
+        // a placement ends) automatically, with no stored counter to drift.
 
         $pdo->commit();
     } catch (Throwable $e) {
@@ -2104,6 +2190,241 @@ function efCreatePromotion($id)
     }
 
     json(['status' => 'ok', 'message' => 'Promotion recorded.']);
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// PESO MONTHLY REPORT  (LMI / SPRS: registered, referred, placed + summary)
+// ═══════════════════════════════════════════════════════════════════════════════
+
+// "Employed (Wage Employed)" / "Unemployed (Resigned)" — matches the PESO forms.
+function efFormatEmploymentStatus($status, $type, $reason)
+{
+    if ($status === 'Employed')   return $type   ? "Employed ({$type})"   : 'Employed';
+    if ($status === 'Unemployed') return $reason ? "Unemployed ({$reason})" : 'Unemployed';
+    return $status ?? '';
+}
+
+// Total months of work experience -> "3 years 6 months".
+function efFormatExperience($months)
+{
+    $months = (int) $months;
+    if ($months <= 0) return '';
+    $y = intdiv($months, 12);
+    $mo = $months % 12;
+    $parts = [];
+    if ($y)  $parts[] = $y . ' year'  . ($y  > 1 ? 's' : '');
+    if ($mo) $parts[] = $mo . ' month' . ($mo > 1 ? 's' : '');
+    return implode(' ', $parts);
+}
+
+// Applicant full name in PESO order: FIRST MIDDLE LAST SUFFIX.
+function efReportNameExpr($alias = 'b')
+{
+    return "TRIM(REGEXP_REPLACE(CONCAT_WS(' ', {$alias}.first_name, {$alias}.middle_name, {$alias}.last_name, {$alias}.suffix), '\\s+', ' ', 'g'))";
+}
+
+// Count vacancies solicited (sum of ORIGINAL slots) posted within [from, to].
+function efReportVacancyCount($from, $to)
+{
+    $stmt = db()->prepare(
+        "SELECT COALESCE(SUM(slots_total), 0) FROM vacancies
+         WHERE created_at::date BETWEEN :from AND :to"
+    );
+    $stmt->execute([':from' => $from, ':to' => $to]);
+    return (int) $stmt->fetchColumn();
+}
+
+// Count for one pipeline table over [from, to] (used for the prior-period comparison).
+function efReportCount($sql, $from, $to)
+{
+    $stmt = db()->prepare($sql);
+    $stmt->execute([':sid' => efServiceId(), ':from' => $from, ':to' => $to]);
+    return (int) $stmt->fetchColumn();
+}
+
+// GET /api/employment/monthlyReport?from=YYYY-MM-DD&to=YYYY-MM-DD
+//   (or ?year=YYYY&month=M for a single month — backward compatible)
+// PESO LMI/SPRS report data over a date range: registered / referred / placed
+// lists + summary counts (sex-disaggregated) and a prior-period comparison
+// (the same span shifted back one year). Supports Monthly / Annual / Custom.
+function efMonthlyReport()
+{
+    // Resolve the reporting window. Explicit from/to wins; otherwise fall back to
+    // year+month (a single calendar month).
+    $from = isset($_GET['from']) ? trim($_GET['from']) : '';
+    $to   = isset($_GET['to'])   ? trim($_GET['to'])   : '';
+    if ($from === '' || $to === '') {
+        $y = isset($_GET['year'])  && is_numeric($_GET['year'])  ? (int) $_GET['year']  : (int) date('Y');
+        $m = isset($_GET['month']) && is_numeric($_GET['month']) ? (int) $_GET['month'] : (int) date('n');
+        if ($m < 1 || $m > 12) error('Invalid month.', 422);
+        $from = sprintf('%04d-%02d-01', $y, $m);
+        $to   = date('Y-m-t', strtotime($from)); // last day of that month
+    }
+    $fromTs = strtotime($from);
+    $toTs   = strtotime($to);
+    if ($fromTs === false || $toTs === false) error('Invalid date range.', 422);
+    $from = date('Y-m-d', $fromTs);
+    $to   = date('Y-m-d', $toTs);
+    if ($from > $to) error('The From date must be on or before the To date.', 422);
+
+    // Prior period = same span shifted back one year.
+    $pfrom = date('Y-m-d', strtotime($from . ' -1 year'));
+    $pto   = date('Y-m-d', strtotime($to   . ' -1 year'));
+    $curYear  = (int) date('Y', $fromTs);
+    $prevYear = $curYear - 1;
+
+    $sid  = efServiceId();
+    $name = efReportNameExpr('b');
+
+    // ── Applicants Registered (EF enrollment date in range) ──
+    $regStmt = db()->prepare(
+        "SELECT {$name} AS name, b.sex, b.birth_date,
+                EXTRACT(YEAR FROM age(b.birth_date))::int AS age,
+                b.civil_status, b.educational_attainment,
+                ef.employment_status, ef.employment_type, ef.unemployment_reason,
+                jp.occupation,
+                COALESCE(we.total_months, 0) AS total_months
+         FROM beneficiary_services bs
+         JOIN beneficiaries b ON b.beneficiary_id = bs.beneficiary_id
+         LEFT JOIN employment_facilitation_profiles ef ON ef.beneficiary_service_id = bs.beneficiary_service_id
+         LEFT JOIN LATERAL (SELECT occupation FROM job_preferences jp
+                            WHERE jp.beneficiary_id = b.beneficiary_id ORDER BY preference_id LIMIT 1) jp ON true
+         LEFT JOIN LATERAL (SELECT COALESCE(SUM(number_of_months), 0) AS total_months FROM work_experiences w
+                            WHERE w.beneficiary_id = b.beneficiary_id) we ON true
+         WHERE bs.service_id = :sid AND b.deleted_at IS NULL
+           AND bs.date_applied BETWEEN :from AND :to
+         ORDER BY bs.date_applied, b.last_name, b.first_name"
+    );
+    $regStmt->execute([':sid' => $sid, ':from' => $from, ':to' => $to]);
+    $registered = array_map(function ($r) {
+        return [
+            'name'                 => $r['name'],
+            'occupation'           => $r['occupation'] ?? '',
+            'sex'                  => $r['sex'] ?? '',
+            'birthdate'            => $r['birth_date'],
+            'age'                  => $r['age'] !== null ? (int) $r['age'] : null,
+            'civilStatus'          => $r['civil_status'] ?? '',
+            'educationalAttainment'=> $r['educational_attainment'] ?? '',
+            'yearsWorkExperience'  => efFormatExperience($r['total_months']),
+            'employmentStatus'     => efFormatEmploymentStatus($r['employment_status'] ?? null, $r['employment_type'] ?? null, $r['unemployment_reason'] ?? null),
+        ];
+    }, $regStmt->fetchAll(PDO::FETCH_ASSOC));
+
+    // ── Applicants Referred — DISTINCT persons in the period (one row per
+    //    applicant, even if referred to several vacancies), matching the "No. of
+    //    Applicants Referred" definition and keeping it consistent with Registered.
+    $refStmt = db()->prepare(
+        "SELECT {$name} AS name, b.sex, MAX(jp.occupation) AS occupation
+         FROM employment_facilitation_referrals r
+         JOIN beneficiary_services bs ON bs.beneficiary_service_id = r.beneficiary_service_id
+         JOIN beneficiaries b ON b.beneficiary_id = bs.beneficiary_id
+         LEFT JOIN LATERAL (SELECT occupation FROM job_preferences jp
+                            WHERE jp.beneficiary_id = b.beneficiary_id ORDER BY preference_id LIMIT 1) jp ON true
+         WHERE r.deleted_at IS NULL AND b.deleted_at IS NULL
+           AND r.date_referred BETWEEN :from AND :to
+         GROUP BY b.beneficiary_id
+         ORDER BY b.last_name, b.first_name"
+    );
+    $refStmt->execute([':from' => $from, ':to' => $to]);
+    $referred = array_map(fn($r) => [
+        'name'       => $r['name'],
+        'occupation' => $r['occupation'] ?? '',
+        'sex'        => $r['sex'] ?? '',
+    ], $refStmt->fetchAll(PDO::FETCH_ASSOC));
+
+    // ── Applicants Placed — DISTINCT persons in the period (one row per applicant;
+    //    if placed more than once, show the most recent job title).
+    $plStmt = db()->prepare(
+        "SELECT {$name} AS name, b.sex,
+                (array_agg(v.job_title ORDER BY p.date_hired DESC))[1] AS placed_as
+         FROM employment_facilitation_placements p
+         JOIN beneficiary_services bs ON bs.beneficiary_service_id = p.beneficiary_service_id
+         JOIN beneficiaries b ON b.beneficiary_id = bs.beneficiary_id
+         LEFT JOIN vacancies v ON v.vacancy_id = p.vacancy_id
+         WHERE b.deleted_at IS NULL
+           AND p.date_hired BETWEEN :from AND :to
+         GROUP BY b.beneficiary_id
+         ORDER BY b.last_name, b.first_name"
+    );
+    $plStmt->execute([':from' => $from, ':to' => $to]);
+    $placed = array_map(fn($r) => [
+        'name'     => $r['name'],
+        'placedAs' => $r['placed_as'] ?? '',
+        'sex'      => $r['sex'] ?? '',
+    ], $plStmt->fetchAll(PDO::FETCH_ASSOC));
+
+    // ── Sex disaggregation (case-insensitive; enum is Male/Female) ──
+    $bySex = function ($rows) {
+        $male = 0; $female = 0;
+        foreach ($rows as $r) {
+            $s = strtolower($r['sex'] ?? '');
+            if ($s === 'male') $male++;
+            elseif ($s === 'female') $female++;
+        }
+        return ['male' => $male, 'female' => $female];
+    };
+
+    $vacancies    = efReportVacancyCount($from, $to);
+    $regCount     = count($registered);
+    $refCount     = count($referred);
+    $plCount      = count($placed);
+    $placementRate = $refCount > 0 ? $plCount / $refCount : 0;
+
+    // ── Prior-period comparison (same span, one year earlier; counts only) ──
+    // Counts are DISTINCT persons (consistent with the current-period lists above).
+    $regSql = "SELECT COUNT(DISTINCT bs.beneficiary_id) FROM beneficiary_services bs JOIN beneficiaries b ON b.beneficiary_id = bs.beneficiary_id
+               WHERE bs.service_id = :sid AND b.deleted_at IS NULL
+                 AND bs.date_applied BETWEEN :from AND :to";
+    $refSql = "SELECT COUNT(DISTINCT bs.beneficiary_id) FROM employment_facilitation_referrals r JOIN beneficiary_services bs ON bs.beneficiary_service_id = r.beneficiary_service_id
+               JOIN beneficiaries b ON b.beneficiary_id = bs.beneficiary_id
+               WHERE r.deleted_at IS NULL AND b.deleted_at IS NULL AND bs.service_id = :sid
+                 AND r.date_referred BETWEEN :from AND :to";
+    $plSql  = "SELECT COUNT(DISTINCT bs.beneficiary_id) FROM employment_facilitation_placements p JOIN beneficiary_services bs ON bs.beneficiary_service_id = p.beneficiary_service_id
+               JOIN beneficiaries b ON b.beneficiary_id = bs.beneficiary_id
+               WHERE b.deleted_at IS NULL AND bs.service_id = :sid
+                 AND p.date_hired BETWEEN :from AND :to";
+
+    $prevRef = efReportCount($refSql, $pfrom, $pto);
+    $prevPl  = efReportCount($plSql, $pfrom, $pto);
+    $comparison = [
+        'currentYear' => $curYear,
+        'previousYear' => $prevYear,
+        'current'  => [
+            'vacancies'  => $vacancies,
+            'registered' => $regCount,
+            'referred'   => $refCount,
+            'placed'     => $plCount,
+            'placementRate' => $placementRate,
+        ],
+        'previous' => [
+            'vacancies'  => efReportVacancyCount($pfrom, $pto),
+            'registered' => efReportCount($regSql, $pfrom, $pto),
+            'referred'   => $prevRef,
+            'placed'     => $prevPl,
+            'placementRate' => $prevRef > 0 ? $prevPl / $prevRef : 0,
+        ],
+    ];
+
+    json(['status' => 'ok', 'data' => [
+        'from'  => $from,
+        'to'    => $to,
+        'summary' => [
+            'vacanciesSolicited'  => $vacancies,
+            'applicantsRegistered'=> $regCount,
+            'applicantsReferred'  => $refCount,
+            'applicantsPlaced'    => $plCount,
+            'placementRate'       => $placementRate,
+            'local'               => $vacancies, // all vacancies treated as Local
+            'overseas'            => 0,
+            'registeredBySex'     => $bySex($registered),
+            'referredBySex'       => $bySex($referred),
+            'placedBySex'         => $bySex($placed),
+        ],
+        'comparison' => $comparison,
+        'registered' => $registered,
+        'referred'   => $referred,
+        'placed'     => $placed,
+    ]]);
 }
 
 // ═══════════════════════════════════════════════════════════════════════════════
