@@ -51,7 +51,6 @@ function cdspYearOrNull($v) {
 // Map frontend education labels to educational_attainment enum.
 function cdspMapEducation($v) {
     $map = [
-        'No Formal Education'         => 'No Formal Education',
         'Elementary Level'            => 'Elementary Undergraduate',
         'Elementary Graduate'         => 'Elementary Graduate',
         'High School Level'           => 'Junior High School Undergraduate',
@@ -60,15 +59,37 @@ function cdspMapEducation($v) {
         'Senior High School Graduate' => 'Senior High School Graduate',
         'Vocational / Technical'      => 'Vocational Graduate',
         'College Level'               => 'College Undergraduate',
-        'College Level (2nd Year)'    => 'College Undergraduate',
-        'College Level (3rd Year)'    => 'College Undergraduate',
-        'College Level (4th Year)'    => 'College Undergraduate',
         'College Graduate'            => 'College Graduate',
         "Master's Level"              => "Master's Degree",
         "Master's Graduate"           => "Master's Degree",
-        'Doctoral'                    => 'Doctorate Degree',
+        'Doctoral Level'              => 'Doctorate Degree',
+        'Doctoral Graduate'           => 'Doctorate Degree',
     ];
     return isset($map[$v]) ? $map[$v] : null;
+}
+
+// Inverse of cdspMapEducation() — the DB stores educational_attainment_enum
+// values, but the frontend's dropdown/conditional-field logic (eduFieldFlags
+// in CDSPProfileForm.tsx) is keyed on the original form labels. "Master's
+// Degree" and "Doctorate Degree" each collapse two form labels (Level vs
+// Graduate) into one enum value, so $hasYearGraduated disambiguates on read,
+// mirroring gipReverseMapEducation() in gip.php.
+function cdspReverseMapEducation($enumValue, $hasYearGraduated) {
+    $map = [
+        'Elementary Undergraduate'         => 'Elementary Level',
+        'Elementary Graduate'              => 'Elementary Graduate',
+        'Junior High School Undergraduate' => 'High School Level',
+        'Junior High School Graduate'      => 'High School Graduate',
+        'Senior High School Undergraduate' => 'Senior High School Level',
+        'Senior High School Graduate'      => 'Senior High School Graduate',
+        'Vocational Graduate'              => 'Vocational / Technical',
+        'College Undergraduate'            => 'College Level',
+        'College Graduate'                 => 'College Graduate',
+    ];
+    if (isset($map[$enumValue])) return $map[$enumValue];
+    if ($enumValue === "Master's Degree") return $hasYearGraduated ? "Master's Graduate" : "Master's Level";
+    if ($enumValue === 'Doctorate Degree') return $hasYearGraduated ? 'Doctoral Graduate' : 'Doctoral Level';
+    return '';
 }
 
 // Strip parenthetical suffixes so values match DB enum.
@@ -100,6 +121,91 @@ function cdspServiceIdByName($name) {
     $s->execute([':n' => $name, ':p' => cdspParentServiceId()]);
     $id = $s->fetchColumn();
     return $id !== false ? (int)$id : null;
+}
+
+function cdspUploadBaseUrl() {
+    $host = $_SERVER['HTTP_HOST'] ?? 'localhost';
+    return 'http://' . $host . '/epeso_backend/';
+}
+
+function cdspFormatBytes($bytes) {
+    $bytes = (int) $bytes;
+    if ($bytes <= 0) return '0 Bytes';
+    $units = ['Bytes', 'KB', 'MB', 'GB'];
+    $i = min((int) floor(log($bytes, 1024)), count($units) - 1);
+    return round($bytes / pow(1024, $i), 2) . ' ' . $units[$i];
+}
+
+// ─── Documents (applicant) ────────────────────────────────────────────────────
+//   - attachedDocuments entries WITH a base64 dataUrl  → new uploads (saved to disk + inserted)
+//   - entries WITHOUT a dataUrl (existing files)        → kept by their document_id
+//   - existing docs no longer in the list                → deleted (file unlinked)
+// Mirrors gipSyncDocuments/spesSyncDocuments — the frontend's CDSPApplicant
+// type calls this field "attachedDocuments", not "savedDocuments".
+
+function cdspSyncDocuments($pdo, $bid, $bsId, $uid, $d) {
+    $docs = is_array($d['attachedDocuments'] ?? null) ? $d['attachedDocuments'] : [];
+
+    $keep = [];
+    foreach ($docs as $doc) {
+        $isNew = isset($doc['dataUrl']) && is_string($doc['dataUrl']) && strpos($doc['dataUrl'], 'data:') === 0;
+        if (!$isNew && isset($doc['id']) && ctype_digit((string) $doc['id'])) {
+            $keep[] = (int) $doc['id'];
+        }
+    }
+
+    $sel = $pdo->prepare("SELECT document_id, file_path FROM documents WHERE beneficiary_id=:bid AND document_source='CDSP'");
+    $sel->execute([':bid' => $bid]);
+    foreach ($sel->fetchAll() as $row) {
+        if (!in_array((int) $row['document_id'], $keep, true)) {
+            $abs = __DIR__ . '/../' . $row['file_path'];
+            if (is_file($abs)) @unlink($abs);
+            $pdo->prepare("DELETE FROM documents WHERE document_id=:id")->execute([':id' => (int) $row['document_id']]);
+        }
+    }
+
+    $ins = $pdo->prepare(
+        "INSERT INTO documents(beneficiary_id,beneficiary_service_id,document_source,document_type,title,file_name,file_path,file_size,mime_type,uploaded_by)
+         VALUES(:bid,:bsid,'CDSP',:dtype,:title,:fname,:fpath,:size,:mime,:uid)"
+    );
+    foreach ($docs as $doc) {
+        $dataUrl = $doc['dataUrl'] ?? '';
+        if (!is_string($dataUrl) || !preg_match('#^data:([^;]+);base64,(.+)$#s', $dataUrl, $m)) continue;
+        $binary = base64_decode($m[2], true);
+        if ($binary === false) continue;
+
+        $origName = (string) ($doc['fileName'] ?? $doc['name'] ?? 'file');
+        $ext      = pathinfo($origName, PATHINFO_EXTENSION) ?: 'bin';
+        $stored   = 'cdsp_' . $bid . '_doc_' . time() . '_' . mt_rand(1000, 9999) . '.' . $ext;
+        if (file_put_contents(__DIR__ . '/../uploads/' . $stored, $binary) === false) continue;
+
+        $dtype  = cdspNullStr($doc['documentType'] ?? '');
+        $custom = cdspNullStr($doc['customName'] ?? $doc['name'] ?? '');
+        $ins->execute([
+            ':bid' => $bid, ':bsid' => $bsId, ':dtype' => $dtype,
+            ':title' => $custom ?? ($dtype ?? $origName),
+            ':fname' => $origName, ':fpath' => 'uploads/' . $stored,
+            ':size' => strlen($binary), ':mime' => $m[1], ':uid' => $uid,
+        ]);
+    }
+}
+
+function cdspFetchSavedDocuments($bid) {
+    $s = db()->prepare(
+        "SELECT document_id, document_type, title, file_name, file_path, file_size
+         FROM documents WHERE beneficiary_id=:bid AND document_source='CDSP' ORDER BY document_id"
+    );
+    $s->execute([':bid' => $bid]);
+    return array_map(function ($r) {
+        return [
+            'id'           => (string) $r['document_id'],
+            'documentType' => $r['document_type'] ?? '',
+            'customName'   => $r['title'] ?? '',
+            'fileName'     => $r['file_name'],
+            'fileSize'     => cdspFormatBytes($r['file_size'] ?? 0),
+            'url'          => cdspUploadBaseUrl() . $r['file_path'],
+        ];
+    }, $s->fetchAll());
 }
 
 // ─── Sub-services ─────────────────────────────────────────────────────────────
@@ -469,7 +575,7 @@ function cdspBuildProfile($bid) {
         'region'                  => $b['region_name'] ?? '',
         'classification'          => array_values($classifications),
         'classificationOther'     => '',
-        'highestEducation'        => $b['educational_attainment'] ?? '',
+        'highestEducation'        => cdspReverseMapEducation($b['educational_attainment'] ?? '', !empty($cp['year_graduated'])),
         'course'                  => $cp['course_program'] ?? '',
         'strand'                  => $cp['strand'] ?? '',
         'yearLevel'               => $cp['year_level'] ?? '',
@@ -480,17 +586,17 @@ function cdspBuildProfile($bid) {
         'assignedActivity'        => $currentAct ? $currentAct['activity_title'] : '',
         'assignedActivityId'      => $currentAct ? (int)$currentAct['activity_id'] : null,
         'assignmentHistory'       => $history,
-        'dateApplicationReceived' => $cp['date_received'] ?? ($b['date_applied'] ?? ''),
+        'dateApplicationReceived' => $b['date_applied'] ?? '',
         'receivedBy'              => $b['received_by'] ?? '',
         'remarks'                 => $cp['remarks'] ?? '',
         'status'                  => $frontendStatus,
-        'attachedDocuments'       => [],
+        'attachedDocuments'       => cdspFetchSavedDocuments($bid),
         // Legacy compat fields
         'schoolName'=>'','employerName'=>'','employmentType'=>'','monthlyIncome'=>'',
         'careerGoal'=>'','coachingType'=>'','careerAssessmentResult'=>'',
         'targetJob'=>'','industriesOfInterest'=>[],'preEmploymentRequirements'=>[],
         'school'=>'','courseProgram'=>$cp['course_program']??'',
-        'yearLevel'=>'','expectedGraduation'=>'',
+        'expectedGraduation'=>'',
         'applicantSignature'=>'','dateSignature'=>'','counselorName'=>'',
     ];
 }
@@ -544,8 +650,10 @@ function cdspCreateProfile() {
             if (in_array($norm, $validCls, true)) $ins->execute([':bid'=>$bid,':cls'=>$norm]);
         }
 
-        $pdo->prepare("INSERT INTO cdsp_profiles(beneficiary_service_id,course_program,strand,year_level,year_graduated,employment_status,current_occupation,date_received,remarks,status) VALUES(:bsid,:course,:strand,:ylvl,:yr,:empst,:occ,:drec,:rmk,'Active')")
-            ->execute([':bsid'=>$bsId,':course'=>cdspNullStr($d['course']??''),':strand'=>cdspNullStr($d['strand']??''),':ylvl'=>cdspNullStr($d['yearLevel']??''),':yr'=>cdspYearOrNull($d['yearGraduated']??''),':empst'=>cdspNullStr($d['employmentStatus']??''),':occ'=>cdspNullStr($d['currentOccupation']??''),':drec'=>cdspDate($d['dateApplicationReceived']??''),':rmk'=>cdspNullStr($d['remarks']??'')]);
+        $pdo->prepare("INSERT INTO cdsp_profiles(beneficiary_service_id,course_program,strand,year_level,year_graduated,employment_status,current_occupation,remarks,status) VALUES(:bsid,:course,:strand,:ylvl,:yr,:empst,:occ,:rmk,'Active')")
+            ->execute([':bsid'=>$bsId,':course'=>cdspNullStr($d['course']??''),':strand'=>cdspNullStr($d['strand']??''),':ylvl'=>cdspNullStr($d['yearLevel']??''),':yr'=>cdspYearOrNull($d['yearGraduated']??''),':empst'=>cdspNullStr($d['employmentStatus']??''),':occ'=>cdspNullStr($d['currentOccupation']??''),':rmk'=>cdspNullStr($d['remarks']??'')]);
+
+        cdspSyncDocuments($pdo, $bid, $bsId, $uid, $d);
 
         $pdo->commit();
     } catch (Throwable $e) {
@@ -557,6 +665,7 @@ function cdspCreateProfile() {
 
 function cdspUpdateProfile($id) {
     if (!is_numeric($id)) error('Invalid id.', 422);
+    $uid = requireLogin();
     $d   = body();
     $bid = (int)$id;
     if (cdspNullStr($d['firstName'] ?? '') === null) error('First name is required.', 422);
@@ -599,8 +708,8 @@ function cdspUpdateProfile($id) {
         }
         $pdo->prepare("UPDATE beneficiaries SET {$sets} WHERE beneficiary_id=:bid")->execute($params);
 
-        $pdo->prepare("UPDATE beneficiary_services SET received_by=:rby WHERE beneficiary_service_id=:bsid")
-            ->execute([':rby'=>cdspNullStr($d['receivedBy']??''),':bsid'=>$bsId]);
+        $pdo->prepare("UPDATE beneficiary_services SET received_by=:rby,date_applied=:date WHERE beneficiary_service_id=:bsid")
+            ->execute([':rby'=>cdspNullStr($d['receivedBy']??''),':date'=>cdspDate($d['dateApplicationReceived']??'')??date('Y-m-d'),':bsid'=>$bsId]);
 
         $pdo->prepare("DELETE FROM beneficiary_classifications WHERE beneficiary_id=:bid")->execute([':bid'=>$bid]);
         $validCls = cdspValidClassifications();
@@ -614,12 +723,14 @@ function cdspUpdateProfile($id) {
         $ex = db()->prepare("SELECT 1 FROM cdsp_profiles WHERE beneficiary_service_id=:id");
         $ex->execute([':id'=>$bsId]);
         if ($ex->fetchColumn()) {
-            $pdo->prepare("UPDATE cdsp_profiles SET course_program=:course,strand=:strand,year_level=:ylvl,year_graduated=:yr,employment_status=:empst,current_occupation=:occ,date_received=:drec,remarks=:rmk,updated_at=now() WHERE beneficiary_service_id=:bsid")
-                ->execute([':course'=>cdspNullStr($d['course']??''),':strand'=>cdspNullStr($d['strand']??''),':ylvl'=>cdspNullStr($d['yearLevel']??''),':yr'=>cdspYearOrNull($d['yearGraduated']??''),':empst'=>cdspNullStr($d['employmentStatus']??''),':occ'=>cdspNullStr($d['currentOccupation']??''),':drec'=>cdspDate($d['dateApplicationReceived']??''),':rmk'=>cdspNullStr($d['remarks']??''),':bsid'=>$bsId]);
+            $pdo->prepare("UPDATE cdsp_profiles SET course_program=:course,strand=:strand,year_level=:ylvl,year_graduated=:yr,employment_status=:empst,current_occupation=:occ,remarks=:rmk,updated_at=now() WHERE beneficiary_service_id=:bsid")
+                ->execute([':course'=>cdspNullStr($d['course']??''),':strand'=>cdspNullStr($d['strand']??''),':ylvl'=>cdspNullStr($d['yearLevel']??''),':yr'=>cdspYearOrNull($d['yearGraduated']??''),':empst'=>cdspNullStr($d['employmentStatus']??''),':occ'=>cdspNullStr($d['currentOccupation']??''),':rmk'=>cdspNullStr($d['remarks']??''),':bsid'=>$bsId]);
         } else {
-            $pdo->prepare("INSERT INTO cdsp_profiles(beneficiary_service_id,course_program,strand,year_level,year_graduated,employment_status,current_occupation,date_received,remarks,status) VALUES(:bsid,:course,:strand,:ylvl,:yr,:empst,:occ,:drec,:rmk,'Active')")
-                ->execute([':bsid'=>$bsId,':course'=>cdspNullStr($d['course']??''),':strand'=>cdspNullStr($d['strand']??''),':ylvl'=>cdspNullStr($d['yearLevel']??''),':yr'=>cdspYearOrNull($d['yearGraduated']??''),':empst'=>cdspNullStr($d['employmentStatus']??''),':occ'=>cdspNullStr($d['currentOccupation']??''),':drec'=>cdspDate($d['dateApplicationReceived']??''),':rmk'=>cdspNullStr($d['remarks']??'')]);
+            $pdo->prepare("INSERT INTO cdsp_profiles(beneficiary_service_id,course_program,strand,year_level,year_graduated,employment_status,current_occupation,remarks,status) VALUES(:bsid,:course,:strand,:ylvl,:yr,:empst,:occ,:rmk,'Active')")
+                ->execute([':bsid'=>$bsId,':course'=>cdspNullStr($d['course']??''),':strand'=>cdspNullStr($d['strand']??''),':ylvl'=>cdspNullStr($d['yearLevel']??''),':yr'=>cdspYearOrNull($d['yearGraduated']??''),':empst'=>cdspNullStr($d['employmentStatus']??''),':occ'=>cdspNullStr($d['currentOccupation']??''),':rmk'=>cdspNullStr($d['remarks']??'')]);
         }
+
+        cdspSyncDocuments($pdo, $bid, $bsId, $uid, $d);
 
         $pdo->commit();
     } catch (Throwable $e) {
@@ -751,6 +862,13 @@ function cdspHardDeleteApplicant($bid) {
             $pdo->prepare("DELETE FROM cdsp_profiles WHERE beneficiary_service_id = :id")->execute([':id' => (int) $bsId]);
         }
 
+        $docs = $pdo->prepare("SELECT file_path FROM documents WHERE beneficiary_id = :id AND document_source = 'CDSP'");
+        $docs->execute([':id' => $bid]);
+        foreach ($docs->fetchAll(PDO::FETCH_COLUMN) as $path) {
+            $abs = __DIR__ . '/../' . $path;
+            if (is_file($abs)) @unlink($abs);
+        }
+        $pdo->prepare("DELETE FROM documents WHERE beneficiary_id = :id AND document_source = 'CDSP'")->execute([':id' => $bid]);
         $pdo->prepare("DELETE FROM beneficiary_classifications WHERE beneficiary_id = :id")->execute([':id' => $bid]);
         $pdo->prepare("DELETE FROM beneficiary_services WHERE beneficiary_id = :id")->execute([':id' => $bid]);
         $pdo->prepare("DELETE FROM beneficiaries WHERE beneficiary_id = :id")->execute([':id' => $bid]);

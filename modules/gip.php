@@ -544,8 +544,8 @@ function gipUpdateProfile($id) {
         $pdo->prepare("UPDATE beneficiaries SET first_name=:fn,middle_name=:mn,last_name=:ln,sex=:sex,birth_date=:bdate,civil_status=:civil,street_address=:street,barangay_id=:bgy,contact_no=:contact,email=:email,educational_attainment=:educ,updated_at=now() WHERE beneficiary_id=:bid")
             ->execute([':fn'=>trim($d['firstName']),':mn'=>gipNullStr($d['middleName']??''),':ln'=>trim($d['lastName']),':sex'=>$sex,':bdate'=>$birth,':civil'=>$civil,':street'=>gipNullStr($d['streetPurok']??''),':bgy'=>$bgyId,':contact'=>gipNullStr($d['contactNumber']??''),':email'=>gipNullStr($d['email']??''),':educ'=>gipMapEducation($d['highestEducation']??''),':bid'=>$bid]);
 
-        $pdo->prepare("UPDATE beneficiary_services SET received_by=:rby WHERE beneficiary_service_id=:bsid")
-            ->execute([':rby'=>gipNullStr($d['receivedBy']??''),':bsid'=>$bsId]);
+        $pdo->prepare("UPDATE beneficiary_services SET received_by=:rby,date_applied=:date WHERE beneficiary_service_id=:bsid")
+            ->execute([':rby'=>gipNullStr($d['receivedBy']??''),':date'=>gipDate($d['dateApplicationReceived']??'')??date('Y-m-d'),':bsid'=>$bsId]);
 
         $pdo->prepare("DELETE FROM beneficiary_classifications WHERE beneficiary_id=:bid")->execute([':bid'=>$bid]);
         $validCls = gipValidClassifications();
@@ -658,10 +658,12 @@ function gipUnassignBatch() {
     $r = $row->fetch();
     if (!$r || !$r['gip_profile_id']) error('GIP profile not found.', 404);
 
-    // Preserve the completion record: once the batch is Completed, unassigning
-    // would erase the only place this internship's history lives.
-    if ($r['batch_status'] === 'Completed') {
-        error('This batch is already completed — unassigning would erase its completion record.', 409);
+    // gip_profiles.batch_id is the only place an assignment is recorded (no
+    // separate history table) — once the batch has moved past Planned
+    // (Ongoing or Completed), unassigning would silently erase the only
+    // record that this applicant was ever part of it.
+    if ($r['batch_status'] !== 'Planned') {
+        error('This batch is no longer Planned — unassigning would erase the only record of this assignment.', 409);
     }
 
     db()->prepare("UPDATE gip_profiles SET batch_id=NULL, status='Inactive', batch_assigned_at=NULL, updated_at=now() WHERE gip_profile_id=:gid")
@@ -675,7 +677,9 @@ function gipUnassignBatch() {
 //   - existing docs no longer in the list             → deleted (file unlinked)
 
 function gipSyncDocuments($pdo, $bid, $bsId, $uid, $d) {
-    $docs = is_array($d['savedDocuments'] ?? null) ? $d['savedDocuments'] : [];
+    // The frontend's GIPApplicant type calls this field "attachedDocuments"
+    // (not "savedDocuments" — that name only applies to EF's ApplicantFormData).
+    $docs = is_array($d['attachedDocuments'] ?? null) ? $d['attachedDocuments'] : [];
 
     $keep = [];
     foreach ($docs as $doc) {
