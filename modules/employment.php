@@ -1776,7 +1776,14 @@ function efGetApplicantHistory($id)
     ]]);
 }
 
-// GET /api/employment/listReferrals  — excludes Hired (those become placements)
+// GET /api/employment/listReferrals — a working list of unresolved referral
+// attempts only. Excludes Hired referrals (those become placements), and also
+// excludes any OTHER referral (Pending/Interviewed/Not Hired) belonging to an
+// applicant who already has a placement on record — once someone's hired
+// (through whichever referral got them there), every earlier attempt for
+// them is resolved history, not something still needing action. The full
+// referral->placement timeline, including these, remains visible via
+// getApplicantHistory.
 function efListReferrals()
 {
     $stmt = db()->prepare(
@@ -1793,6 +1800,10 @@ function efListReferrals()
          JOIN vacancies v             ON v.vacancy_id              = r.vacancy_id
          JOIN employers e             ON e.employer_id             = v.employer_id
          WHERE r.status != 'Hired' AND r.deleted_at IS NULL AND b.deleted_at IS NULL
+           AND NOT EXISTS (
+               SELECT 1 FROM employment_facilitation_placements p
+               WHERE p.beneficiary_service_id = r.beneficiary_service_id
+           )
          ORDER BY r.referral_id DESC"
     );
     $stmt->execute();
@@ -2021,18 +2032,23 @@ function employmentHardDeleteReferral($id)
 function efBuildPlacement($row)
 {
     return [
-        'id'             => (int) $row['placement_id'],
-        'applicantId'    => (int) $row['beneficiary_id'],
-        'applicantName'  => $row['applicant_name'],
-        'jobTitle'       => $row['vacancy_job_title'] ?? '',
-        'employer'       => $row['company_name'] ?? '',
-        'dateHired'      => $row['date_hired'],
-        'status'         => $row['status'],
-        'employmentType' => $row['vacancy_job_type'] ?? '',
-        'referralId'     => $row['referral_id'] !== null ? (int) $row['referral_id'] : null,
-        'vacancyId'      => $row['vacancy_id']   !== null ? (int) $row['vacancy_id']  : null,
+        'id'              => (int) $row['placement_id'],
+        'applicantId'     => (int) $row['beneficiary_id'],
+        'applicantName'   => $row['applicant_name'],
+        'jobTitle'        => $row['vacancy_job_title'] ?? '',
+        // Current title is derived from the latest promotion (if any), never
+        // stored on the placement itself — a second mutable copy of the same
+        // fact would drift the moment a promotion is recorded through any
+        // path that forgets to update it.
+        'currentJobTitle' => $row['latest_promotion_title'] ?? $row['vacancy_job_title'] ?? '',
+        'employer'        => $row['company_name'] ?? '',
+        'dateHired'       => $row['date_hired'],
+        'status'          => $row['status'],
+        'employmentType'  => $row['vacancy_job_type'] ?? '',
+        'referralId'      => $row['referral_id'] !== null ? (int) $row['referral_id'] : null,
+        'vacancyId'       => $row['vacancy_id']   !== null ? (int) $row['vacancy_id']  : null,
         // Display string derived from the vacancy's atomic bounds (source of truth).
-        'salaryRange'    => efFormatSalary($row['vacancy_salary_min'] ?? null, $row['vacancy_salary_max'] ?? null),
+        'salaryRange'     => efFormatSalary($row['vacancy_salary_min'] ?? null, $row['vacancy_salary_max'] ?? null),
     ];
 }
 
@@ -2050,12 +2066,18 @@ function efListPlacements()
                 v.job_type  AS vacancy_job_type,
                 v.salary_min AS vacancy_salary_min,
                 v.salary_max AS vacancy_salary_max,
-                e.company_name
+                e.company_name,
+                lp.new_job_title AS latest_promotion_title
          FROM employment_facilitation_placements p
          JOIN beneficiary_services bs ON bs.beneficiary_service_id = p.beneficiary_service_id
          JOIN beneficiaries b         ON b.beneficiary_id          = bs.beneficiary_id
          LEFT JOIN vacancies v        ON v.vacancy_id              = p.vacancy_id
          LEFT JOIN employers e        ON e.employer_id             = p.employer_id
+         LEFT JOIN (
+             SELECT DISTINCT ON (placement_id) placement_id, new_job_title
+             FROM placement_promotions
+             ORDER BY placement_id, promotion_date DESC, promotion_id DESC
+         ) lp ON lp.placement_id = p.placement_id
          WHERE b.deleted_at IS NULL
          ORDER BY p.placement_id DESC"
     );
