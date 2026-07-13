@@ -168,7 +168,6 @@ function gipFormatBatch($r) {
     return [
         'id'                 => (int) $r['batch_id'],
         'batchName'          => $r['batch_name'],
-        'batchCode'          => $r['batch_code'],
         'description'        => $r['description'] ?? '',
         'assignedOffice'     => $r['assigned_office'],
         'deploymentLocation' => $r['deployment_location'] ?? '',
@@ -188,9 +187,7 @@ function gipFormatBatch($r) {
 
 function gipValidateBatchInput($d) {
     $name = trim($d['batchName'] ?? '');
-    $code = trim($d['batchCode'] ?? '');
     if ($name === '') error('Batch name is required.', 422);
-    if ($code === '') error('Batch code is required.', 422);
     $office = trim($d['assignedOffice'] ?? '');
     $loc    = trim($d['deploymentLocation'] ?? '');
     $sup    = trim($d['supervisor'] ?? '');
@@ -206,7 +203,7 @@ function gipValidateBatchInput($d) {
     if ($end < $start) error('End date cannot be before start date.', 422);
     $funding = gipJoinFunding($d['fundingSource'] ?? '', $d['fundingSourceOther'] ?? '');
     if ($funding === '') error('Funding source is required.', 422);
-    return [$name, $code, $office, $loc, $sup, $slots, $start, $end, $funding];
+    return [$name, $office, $loc, $sup, $slots, $start, $end, $funding];
 }
 
 // Applies the side effects of a batch status transition: stamps/clears
@@ -231,11 +228,7 @@ function gipCascadeBatchStatus($pdo, $id, $prevStatus, $newStatus) {
 function gipCreateBatch() {
     $uid = requireLogin();
     $d = body();
-    [$name, $code, $office, $loc, $sup, $slots, $start, $end, $funding] = gipValidateBatchInput($d);
-
-    $chk = db()->prepare("SELECT 1 FROM gip_batches WHERE batch_code=:c");
-    $chk->execute([':c' => $code]);
-    if ($chk->fetchColumn()) error('Batch code "' . $code . '" is already in use.', 409);
+    [$name, $office, $loc, $sup, $slots, $start, $end, $funding] = gipValidateBatchInput($d);
 
     $valid  = ['Planned', 'Ongoing', 'Completed'];
     $status = in_array($d['status'] ?? '', $valid, true) ? $d['status'] : 'Planned';
@@ -243,10 +236,10 @@ function gipCreateBatch() {
 
     $pdo = db();
     $s = $pdo->prepare(
-        "INSERT INTO gip_batches(batch_name,batch_code,description,assigned_office,deployment_location,coordinator,supervisor,slot_count,funding_source,start_date,end_date,monthly_allowance,status,created_at,updated_at)
-         VALUES(:name,:code,:desc,:office,:loc,:coord,:sup,:slots,:funding,:start,:end,:allow,:status,now(),now()) RETURNING batch_id"
+        "INSERT INTO gip_batches(batch_name,description,assigned_office,deployment_location,coordinator,supervisor,slot_count,funding_source,start_date,end_date,monthly_allowance,status,created_at,updated_at)
+         VALUES(:name,:desc,:office,:loc,:coord,:sup,:slots,:funding,:start,:end,:allow,:status,now(),now()) RETURNING batch_id"
     );
-    $s->execute([':name'=>$name,':code'=>$code,':desc'=>gipNullStr($d['description']??''),':office'=>$office,':loc'=>$loc,':coord'=>gipNullStr($d['coordinator']??''),':sup'=>$sup,':slots'=>$slots,':funding'=>$funding,':start'=>$start,':end'=>$end,':allow'=>$allowance,':status'=>$status]);
+    $s->execute([':name'=>$name,':desc'=>gipNullStr($d['description']??''),':office'=>$office,':loc'=>$loc,':coord'=>gipNullStr($d['coordinator']??''),':sup'=>$sup,':slots'=>$slots,':funding'=>$funding,':start'=>$start,':end'=>$end,':allow'=>$allowance,':status'=>$status]);
     $id = (int) $s->fetchColumn();
 
     // A batch can only ever be created as Planned via the UI, but guard the
@@ -262,11 +255,7 @@ function gipUpdateBatch($id) {
     $id  = (int) $id;
     $uid = requireLogin();
     $d = body();
-    [$name, $code, $office, $loc, $sup, $slots, $start, $end, $funding] = gipValidateBatchInput($d);
-
-    $chk = db()->prepare("SELECT 1 FROM gip_batches WHERE batch_code=:c AND batch_id != :id");
-    $chk->execute([':c' => $code, ':id' => $id]);
-    if ($chk->fetchColumn()) error('Batch code "' . $code . '" is already in use.', 409);
+    [$name, $office, $loc, $sup, $slots, $start, $end, $funding] = gipValidateBatchInput($d);
 
     $valid  = ['Planned', 'Ongoing', 'Completed'];
     $status = in_array($d['status'] ?? '', $valid, true) ? $d['status'] : 'Planned';
@@ -281,8 +270,8 @@ function gipUpdateBatch($id) {
     try {
         $pdo->beginTransaction();
         $pdo->prepare(
-            "UPDATE gip_batches SET batch_name=:name,batch_code=:code,description=:desc,assigned_office=:office,deployment_location=:loc,coordinator=:coord,supervisor=:sup,slot_count=:slots,funding_source=:funding,start_date=:start,end_date=:end,monthly_allowance=:allow,status=:status,updated_at=now() WHERE batch_id=:id"
-        )->execute([':name'=>$name,':code'=>$code,':desc'=>gipNullStr($d['description']??''),':office'=>$office,':loc'=>$loc,':coord'=>gipNullStr($d['coordinator']??''),':sup'=>$sup,':slots'=>$slots,':funding'=>$funding,':start'=>$start,':end'=>$end,':allow'=>$allowance,':status'=>$status,':id'=>$id]);
+            "UPDATE gip_batches SET batch_name=:name,description=:desc,assigned_office=:office,deployment_location=:loc,coordinator=:coord,supervisor=:sup,slot_count=:slots,funding_source=:funding,start_date=:start,end_date=:end,monthly_allowance=:allow,status=:status,updated_at=now() WHERE batch_id=:id"
+        )->execute([':name'=>$name,':desc'=>gipNullStr($d['description']??''),':office'=>$office,':loc'=>$loc,':coord'=>gipNullStr($d['coordinator']??''),':sup'=>$sup,':slots'=>$slots,':funding'=>$funding,':start'=>$start,':end'=>$end,':allow'=>$allowance,':status'=>$status,':id'=>$id]);
 
         gipCascadeBatchStatus($pdo, $id, $prev, $status);
         $pdo->commit();

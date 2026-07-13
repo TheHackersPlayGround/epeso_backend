@@ -1,0 +1,76 @@
+-- Convert every timestamp with time zone column to timestamp without
+-- time zone, app-wide. The DB session timezone is Asia/Kuala_Lumpur (+08),
+-- matching what the app has always displayed, so the ::timestamp cast
+-- preserves the same wall-clock values as naive timestamps.
+BEGIN;
+
+ALTER TABLE activity_logs ALTER COLUMN created_at TYPE timestamp USING created_at::timestamp;
+ALTER TABLE admin_security_answers ALTER COLUMN created_at TYPE timestamp USING created_at::timestamp;
+ALTER TABLE admin_security_answers ALTER COLUMN updated_at TYPE timestamp USING updated_at::timestamp;
+ALTER TABLE beneficiary_services ALTER COLUMN created_at TYPE timestamp USING created_at::timestamp;
+ALTER TABLE beneficiary_services ALTER COLUMN updated_at TYPE timestamp USING updated_at::timestamp;
+ALTER TABLE cdsp_activities ALTER COLUMN created_at TYPE timestamp USING created_at::timestamp;
+ALTER TABLE cdsp_activities ALTER COLUMN updated_at TYPE timestamp USING updated_at::timestamp;
+ALTER TABLE cdsp_profiles ALTER COLUMN created_at TYPE timestamp USING created_at::timestamp;
+ALTER TABLE cdsp_profiles ALTER COLUMN updated_at TYPE timestamp USING updated_at::timestamp;
+ALTER TABLE clpep_intervention_beneficiaries ALTER COLUMN assigned_at TYPE timestamp USING assigned_at::timestamp;
+ALTER TABLE clpep_interventions ALTER COLUMN created_at TYPE timestamp USING created_at::timestamp;
+ALTER TABLE clpep_interventions ALTER COLUMN updated_at TYPE timestamp USING updated_at::timestamp;
+ALTER TABLE clpep_profiles ALTER COLUMN created_at TYPE timestamp USING created_at::timestamp;
+ALTER TABLE clpep_profiles ALTER COLUMN updated_at TYPE timestamp USING updated_at::timestamp;
+ALTER TABLE dilp_project_beneficiaries ALTER COLUMN assigned_at TYPE timestamp USING assigned_at::timestamp;
+ALTER TABLE dilp_projects ALTER COLUMN created_at TYPE timestamp USING created_at::timestamp;
+ALTER TABLE dilp_projects ALTER COLUMN updated_at TYPE timestamp USING updated_at::timestamp;
+ALTER TABLE disabilities ALTER COLUMN created_at TYPE timestamp USING created_at::timestamp;
+ALTER TABLE disabilities ALTER COLUMN updated_at TYPE timestamp USING updated_at::timestamp;
+ALTER TABLE documents ALTER COLUMN updated_at TYPE timestamp USING updated_at::timestamp;
+ALTER TABLE documents ALTER COLUMN uploaded_at TYPE timestamp USING uploaded_at::timestamp;
+ALTER TABLE employers ALTER COLUMN created_at TYPE timestamp USING created_at::timestamp;
+ALTER TABLE employers ALTER COLUMN updated_at TYPE timestamp USING updated_at::timestamp;
+ALTER TABLE employment_facilitation_placements ALTER COLUMN created_at TYPE timestamp USING created_at::timestamp;
+ALTER TABLE employment_facilitation_placements ALTER COLUMN updated_at TYPE timestamp USING updated_at::timestamp;
+ALTER TABLE employment_facilitation_referrals ALTER COLUMN created_at TYPE timestamp USING created_at::timestamp;
+ALTER TABLE employment_facilitation_referrals ALTER COLUMN updated_at TYPE timestamp USING updated_at::timestamp;
+ALTER TABLE folders ALTER COLUMN created_at TYPE timestamp USING created_at::timestamp;
+ALTER TABLE folders ALTER COLUMN updated_at TYPE timestamp USING updated_at::timestamp;
+ALTER TABLE gip_batches ALTER COLUMN created_at TYPE timestamp USING created_at::timestamp;
+ALTER TABLE gip_batches ALTER COLUMN updated_at TYPE timestamp USING updated_at::timestamp;
+ALTER TABLE gip_profiles ALTER COLUMN created_at TYPE timestamp USING created_at::timestamp;
+ALTER TABLE gip_profiles ALTER COLUMN updated_at TYPE timestamp USING updated_at::timestamp;
+ALTER TABLE industries ALTER COLUMN created_at TYPE timestamp USING created_at::timestamp;
+ALTER TABLE industries ALTER COLUMN updated_at TYPE timestamp USING updated_at::timestamp;
+ALTER TABLE ofw_profiles ALTER COLUMN created_at TYPE timestamp USING created_at::timestamp;
+ALTER TABLE ofw_profiles ALTER COLUMN updated_at TYPE timestamp USING updated_at::timestamp;
+ALTER TABLE ofw_request_types ALTER COLUMN created_at TYPE timestamp USING created_at::timestamp;
+ALTER TABLE ofw_request_types ALTER COLUMN updated_at TYPE timestamp USING updated_at::timestamp;
+ALTER TABLE permissions ALTER COLUMN created_at TYPE timestamp USING created_at::timestamp;
+ALTER TABLE placement_promotions ALTER COLUMN created_at TYPE timestamp USING created_at::timestamp;
+ALTER TABLE skills_training_activities ALTER COLUMN created_at TYPE timestamp USING created_at::timestamp;
+ALTER TABLE skills_training_activities ALTER COLUMN updated_at TYPE timestamp USING updated_at::timestamp;
+ALTER TABLE skills_training_batches ALTER COLUMN created_at TYPE timestamp USING created_at::timestamp;
+ALTER TABLE skills_training_batches ALTER COLUMN updated_at TYPE timestamp USING updated_at::timestamp;
+ALTER TABLE skills_training_profiles ALTER COLUMN created_at TYPE timestamp USING created_at::timestamp;
+ALTER TABLE skills_training_profiles ALTER COLUMN updated_at TYPE timestamp USING updated_at::timestamp;
+ALTER TABLE skills_training_purposes ALTER COLUMN created_at TYPE timestamp USING created_at::timestamp;
+ALTER TABLE skills_training_purposes ALTER COLUMN updated_at TYPE timestamp USING updated_at::timestamp;
+ALTER TABLE skills_training_qualifications ALTER COLUMN created_at TYPE timestamp USING created_at::timestamp;
+ALTER TABLE skills_training_qualifications ALTER COLUMN updated_at TYPE timestamp USING updated_at::timestamp;
+ALTER TABLE slp_profiles ALTER COLUMN created_at TYPE timestamp USING created_at::timestamp;
+ALTER TABLE slp_profiles ALTER COLUMN updated_at TYPE timestamp USING updated_at::timestamp;
+ALTER TABLE slp_project_beneficiaries ALTER COLUMN assigned_at TYPE timestamp USING assigned_at::timestamp;
+ALTER TABLE slp_projects ALTER COLUMN created_at TYPE timestamp USING created_at::timestamp;
+ALTER TABLE slp_projects ALTER COLUMN updated_at TYPE timestamp USING updated_at::timestamp;
+ALTER TABLE spes_batches ALTER COLUMN created_at TYPE timestamp USING created_at::timestamp;
+ALTER TABLE spes_batches ALTER COLUMN updated_at TYPE timestamp USING updated_at::timestamp;
+ALTER TABLE spes_profiles ALTER COLUMN created_at TYPE timestamp USING created_at::timestamp;
+ALTER TABLE spes_profiles ALTER COLUMN updated_at TYPE timestamp USING updated_at::timestamp;
+ALTER TABLE tupad_project_beneficiaries ALTER COLUMN assigned_at TYPE timestamp USING assigned_at::timestamp;
+ALTER TABLE tupad_projects ALTER COLUMN created_at TYPE timestamp USING created_at::timestamp;
+ALTER TABLE tupad_projects ALTER COLUMN updated_at TYPE timestamp USING updated_at::timestamp;
+ALTER TABLE users ALTER COLUMN created_at TYPE timestamp USING created_at::timestamp;
+ALTER TABLE users ALTER COLUMN last_login TYPE timestamp USING last_login::timestamp;
+ALTER TABLE users ALTER COLUMN updated_at TYPE timestamp USING updated_at::timestamp;
+ALTER TABLE vacancies ALTER COLUMN created_at TYPE timestamp USING created_at::timestamp;
+ALTER TABLE vacancies ALTER COLUMN updated_at TYPE timestamp USING updated_at::timestamp;
+
+COMMIT;

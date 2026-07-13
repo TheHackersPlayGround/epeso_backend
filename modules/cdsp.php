@@ -576,6 +576,7 @@ function cdspBuildProfile($bid) {
         'classification'          => array_values($classifications),
         'classificationOther'     => '',
         'highestEducation'        => cdspReverseMapEducation($b['educational_attainment'] ?? '', !empty($cp['year_graduated'])),
+        'schoolName'              => $cp['school_name'] ?? '',
         'course'                  => $cp['course_program'] ?? '',
         'strand'                  => $cp['strand'] ?? '',
         'yearLevel'               => $cp['year_level'] ?? '',
@@ -592,7 +593,7 @@ function cdspBuildProfile($bid) {
         'status'                  => $frontendStatus,
         'attachedDocuments'       => cdspFetchSavedDocuments($bid),
         // Legacy compat fields
-        'schoolName'=>'','employerName'=>'','employmentType'=>'','monthlyIncome'=>'',
+        'employerName'=>'','employmentType'=>'','monthlyIncome'=>'',
         'careerGoal'=>'','coachingType'=>'','careerAssessmentResult'=>'',
         'targetJob'=>'','industriesOfInterest'=>[],'preEmploymentRequirements'=>[],
         'school'=>'','courseProgram'=>$cp['course_program']??'',
@@ -650,8 +651,8 @@ function cdspCreateProfile() {
             if (in_array($norm, $validCls, true)) $ins->execute([':bid'=>$bid,':cls'=>$norm]);
         }
 
-        $pdo->prepare("INSERT INTO cdsp_profiles(beneficiary_service_id,course_program,strand,year_level,year_graduated,employment_status,current_occupation,remarks,status) VALUES(:bsid,:course,:strand,:ylvl,:yr,:empst,:occ,:rmk,'Active')")
-            ->execute([':bsid'=>$bsId,':course'=>cdspNullStr($d['course']??''),':strand'=>cdspNullStr($d['strand']??''),':ylvl'=>cdspNullStr($d['yearLevel']??''),':yr'=>cdspYearOrNull($d['yearGraduated']??''),':empst'=>cdspNullStr($d['employmentStatus']??''),':occ'=>cdspNullStr($d['currentOccupation']??''),':rmk'=>cdspNullStr($d['remarks']??'')]);
+        $pdo->prepare("INSERT INTO cdsp_profiles(beneficiary_service_id,school_name,course_program,strand,year_level,year_graduated,employment_status,current_occupation,remarks,status) VALUES(:bsid,:school,:course,:strand,:ylvl,:yr,:empst,:occ,:rmk,'Active')")
+            ->execute([':bsid'=>$bsId,':school'=>cdspNullStr($d['schoolName']??''),':course'=>cdspNullStr($d['course']??''),':strand'=>cdspNullStr($d['strand']??''),':ylvl'=>cdspNullStr($d['yearLevel']??''),':yr'=>cdspYearOrNull($d['yearGraduated']??''),':empst'=>cdspNullStr($d['employmentStatus']??''),':occ'=>cdspNullStr($d['currentOccupation']??''),':rmk'=>cdspNullStr($d['remarks']??'')]);
 
         cdspSyncDocuments($pdo, $bid, $bsId, $uid, $d);
 
@@ -723,11 +724,11 @@ function cdspUpdateProfile($id) {
         $ex = db()->prepare("SELECT 1 FROM cdsp_profiles WHERE beneficiary_service_id=:id");
         $ex->execute([':id'=>$bsId]);
         if ($ex->fetchColumn()) {
-            $pdo->prepare("UPDATE cdsp_profiles SET course_program=:course,strand=:strand,year_level=:ylvl,year_graduated=:yr,employment_status=:empst,current_occupation=:occ,remarks=:rmk,updated_at=now() WHERE beneficiary_service_id=:bsid")
-                ->execute([':course'=>cdspNullStr($d['course']??''),':strand'=>cdspNullStr($d['strand']??''),':ylvl'=>cdspNullStr($d['yearLevel']??''),':yr'=>cdspYearOrNull($d['yearGraduated']??''),':empst'=>cdspNullStr($d['employmentStatus']??''),':occ'=>cdspNullStr($d['currentOccupation']??''),':rmk'=>cdspNullStr($d['remarks']??''),':bsid'=>$bsId]);
+            $pdo->prepare("UPDATE cdsp_profiles SET school_name=:school,course_program=:course,strand=:strand,year_level=:ylvl,year_graduated=:yr,employment_status=:empst,current_occupation=:occ,remarks=:rmk,updated_at=now() WHERE beneficiary_service_id=:bsid")
+                ->execute([':school'=>cdspNullStr($d['schoolName']??''),':course'=>cdspNullStr($d['course']??''),':strand'=>cdspNullStr($d['strand']??''),':ylvl'=>cdspNullStr($d['yearLevel']??''),':yr'=>cdspYearOrNull($d['yearGraduated']??''),':empst'=>cdspNullStr($d['employmentStatus']??''),':occ'=>cdspNullStr($d['currentOccupation']??''),':rmk'=>cdspNullStr($d['remarks']??''),':bsid'=>$bsId]);
         } else {
-            $pdo->prepare("INSERT INTO cdsp_profiles(beneficiary_service_id,course_program,strand,year_level,year_graduated,employment_status,current_occupation,remarks,status) VALUES(:bsid,:course,:strand,:ylvl,:yr,:empst,:occ,:rmk,'Active')")
-                ->execute([':bsid'=>$bsId,':course'=>cdspNullStr($d['course']??''),':strand'=>cdspNullStr($d['strand']??''),':ylvl'=>cdspNullStr($d['yearLevel']??''),':yr'=>cdspYearOrNull($d['yearGraduated']??''),':empst'=>cdspNullStr($d['employmentStatus']??''),':occ'=>cdspNullStr($d['currentOccupation']??''),':rmk'=>cdspNullStr($d['remarks']??'')]);
+            $pdo->prepare("INSERT INTO cdsp_profiles(beneficiary_service_id,school_name,course_program,strand,year_level,year_graduated,employment_status,current_occupation,remarks,status) VALUES(:bsid,:school,:course,:strand,:ylvl,:yr,:empst,:occ,:rmk,'Active')")
+                ->execute([':bsid'=>$bsId,':school'=>cdspNullStr($d['schoolName']??''),':course'=>cdspNullStr($d['course']??''),':strand'=>cdspNullStr($d['strand']??''),':ylvl'=>cdspNullStr($d['yearLevel']??''),':yr'=>cdspYearOrNull($d['yearGraduated']??''),':empst'=>cdspNullStr($d['employmentStatus']??''),':occ'=>cdspNullStr($d['currentOccupation']??''),':rmk'=>cdspNullStr($d['remarks']??'')]);
         }
 
         cdspSyncDocuments($pdo, $bid, $bsId, $uid, $d);
@@ -806,7 +807,7 @@ function cdspListDeleted() {
             'id'          => (int) $r['id'],
             'name'        => $r['name'],
             'module'      => 'CDSP Applicants',
-            'description' => 'Career Development and Services Program applicant record',
+            'description' => 'Career Development Support Program applicant record',
             'deletedBy'   => $r['deleted_by'] ?? '',
             'deletedAt'   => $r['deleted_at'],
         ];

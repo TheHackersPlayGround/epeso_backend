@@ -55,6 +55,12 @@ function spesServiceId() {
     return (int)$sid;
 }
 
+function spesValidClassifications() {
+    return ['Student','Fresh Graduate','Employed','Underemployed','Unemployed',
+            'Out of School Youth','Person with Disability','Solo Parent',
+            'Women','Senior Citizen','Returning OFW','Other','Indigenous People'];
+}
+
 // spes_batches.funding_source is a single free-text column; the frontend
 // shows a fixed dropdown ending in an "Other" sentinel + a free-text field.
 // Split/join here so editing a batch round-trips correctly without a second
@@ -112,17 +118,13 @@ function spesFormatBatch($r) {
         'id'                   => (int) $r['batch_id'],
         'batchName'            => $r['batch_name'],
         'description'          => $r['description'] ?? '',
-        'applicationStartDate' => $r['application_start_date'],
-        'applicationEndDate'   => $r['application_end_date'],
         'programStartDate'     => $r['program_start_date'],
         'programEndDate'       => $r['program_end_date'],
         'availableSlots'       => (string) $r['available_slots'],
         'assignedCount'        => (int) $r['assigned_count'],
-        'targetBeneficiaries'  => $r['target_beneficiaries'] !== null ? (string) $r['target_beneficiaries'] : '',
         'employer'             => $r['employer_agency'],
         'deploymentLocation'   => $r['deployment_location'] ?? '',
         'coordinator'          => $r['coordinator'],
-        'supervisor'           => $r['supervisor'] ?? '',
         'fundingSource'        => $funding,
         'fundingSourceOther'   => $fundingOther,
         'status'               => $r['status'],
@@ -134,15 +136,10 @@ function spesValidateBatchInput($d) {
     $name = trim($d['batchName'] ?? '');
     if ($name === '') error('Batch name is required.', 422);
 
-    $appStart = spesDate($d['applicationStartDate'] ?? '');
-    $appEnd   = spesDate($d['applicationEndDate'] ?? '');
     $progStart = spesDate($d['programStartDate'] ?? '');
     $progEnd   = spesDate($d['programEndDate'] ?? '');
-    if (!$appStart)  error('Application Start Date is required.', 422);
-    if (!$appEnd)    error('Application End Date is required.', 422);
     if (!$progStart) error('Program Start Date is required.', 422);
     if (!$progEnd)   error('Program End Date is required.', 422);
-    if ($appEnd < $appStart)   error('Application End Date cannot be before Application Start Date.', 422);
     if ($progEnd < $progStart) error('Program End Date cannot be before Program Start Date.', 422);
 
     $slots = spesIntOrNull($d['availableSlots'] ?? '');
@@ -158,7 +155,7 @@ function spesValidateBatchInput($d) {
     $funding = spesJoinFunding($d['fundingSource'] ?? '', $d['fundingSourceOther'] ?? '');
     if ($funding === '') error('Funding source is required.', 422);
 
-    return [$name, $appStart, $appEnd, $progStart, $progEnd, $slots, $employer, $loc, $coord, $funding];
+    return [$name, $progStart, $progEnd, $slots, $employer, $loc, $coord, $funding];
 }
 
 // Applies the side effects of a batch status transition: stamps/clears
@@ -182,27 +179,25 @@ function spesCascadeBatchStatus($pdo, $id, $prevStatus, $newStatus) {
 function spesCreateBatch() {
     $uid = requireLogin();
     $d = body();
-    [$name, $appStart, $appEnd, $progStart, $progEnd, $slots, $employer, $loc, $coord, $funding] = spesValidateBatchInput($d);
+    [$name, $progStart, $progEnd, $slots, $employer, $loc, $coord, $funding] = spesValidateBatchInput($d);
 
-    $valid  = ['Open', 'Closed', 'Ongoing', 'Completed'];
-    $status = in_array($d['status'] ?? '', $valid, true) ? $d['status'] : 'Open';
-    $target = spesIntOrNull($d['targetBeneficiaries'] ?? '');
-    $sup    = spesNullStr($d['supervisor'] ?? '');
+    $valid  = ['Planned', 'Ongoing', 'Completed'];
+    $status = in_array($d['status'] ?? '', $valid, true) ? $d['status'] : 'Planned';
 
     $pdo = db();
     $s = $pdo->prepare(
-        "INSERT INTO spes_batches(batch_name,description,application_start_date,application_end_date,program_start_date,program_end_date,available_slots,target_beneficiaries,employer_agency,deployment_location,coordinator,supervisor,funding_source,status,created_at,updated_at)
-         VALUES(:name,:desc,:astart,:aend,:pstart,:pend,:slots,:target,:employer,:loc,:coord,:sup,:funding,:status,now(),now()) RETURNING batch_id"
+        "INSERT INTO spes_batches(batch_name,description,program_start_date,program_end_date,available_slots,employer_agency,deployment_location,coordinator,funding_source,status,created_at,updated_at)
+         VALUES(:name,:desc,:pstart,:pend,:slots,:employer,:loc,:coord,:funding,:status,now(),now()) RETURNING batch_id"
     );
     $s->execute([
         ':name' => $name, ':desc' => spesNullStr($d['description'] ?? ''),
-        ':astart' => $appStart, ':aend' => $appEnd, ':pstart' => $progStart, ':pend' => $progEnd,
-        ':slots' => $slots, ':target' => $target, ':employer' => $employer, ':loc' => $loc,
-        ':coord' => $coord, ':sup' => $sup, ':funding' => $funding, ':status' => $status,
+        ':pstart' => $progStart, ':pend' => $progEnd,
+        ':slots' => $slots, ':employer' => $employer, ':loc' => $loc,
+        ':coord' => $coord, ':funding' => $funding, ':status' => $status,
     ]);
     $id = (int) $s->fetchColumn();
 
-    // A batch can only ever be created as Open via the UI, but guard the
+    // A batch can only ever be created as Planned via the UI, but guard the
     // (API-only) edge case of creating one already Completed.
     spesCascadeBatchStatus($pdo, $id, null, $status);
 
@@ -215,12 +210,10 @@ function spesUpdateBatch($id) {
     $id  = (int) $id;
     $uid = requireLogin();
     $d = body();
-    [$name, $appStart, $appEnd, $progStart, $progEnd, $slots, $employer, $loc, $coord, $funding] = spesValidateBatchInput($d);
+    [$name, $progStart, $progEnd, $slots, $employer, $loc, $coord, $funding] = spesValidateBatchInput($d);
 
-    $valid  = ['Open', 'Closed', 'Ongoing', 'Completed'];
-    $status = in_array($d['status'] ?? '', $valid, true) ? $d['status'] : 'Open';
-    $target = spesIntOrNull($d['targetBeneficiaries'] ?? '');
-    $sup    = spesNullStr($d['supervisor'] ?? '');
+    $valid  = ['Planned', 'Ongoing', 'Completed'];
+    $status = in_array($d['status'] ?? '', $valid, true) ? $d['status'] : 'Planned';
 
     $pdo = db();
     $curS = $pdo->prepare("SELECT status FROM spes_batches WHERE batch_id=:id");
@@ -231,12 +224,12 @@ function spesUpdateBatch($id) {
     try {
         $pdo->beginTransaction();
         $pdo->prepare(
-            "UPDATE spes_batches SET batch_name=:name,description=:desc,application_start_date=:astart,application_end_date=:aend,program_start_date=:pstart,program_end_date=:pend,available_slots=:slots,target_beneficiaries=:target,employer_agency=:employer,deployment_location=:loc,coordinator=:coord,supervisor=:sup,funding_source=:funding,status=:status,updated_at=now() WHERE batch_id=:id"
+            "UPDATE spes_batches SET batch_name=:name,description=:desc,program_start_date=:pstart,program_end_date=:pend,available_slots=:slots,employer_agency=:employer,deployment_location=:loc,coordinator=:coord,funding_source=:funding,status=:status,updated_at=now() WHERE batch_id=:id"
         )->execute([
             ':name' => $name, ':desc' => spesNullStr($d['description'] ?? ''),
-            ':astart' => $appStart, ':aend' => $appEnd, ':pstart' => $progStart, ':pend' => $progEnd,
-            ':slots' => $slots, ':target' => $target, ':employer' => $employer, ':loc' => $loc,
-            ':coord' => $coord, ':sup' => $sup, ':funding' => $funding, ':status' => $status, ':id' => $id,
+            ':pstart' => $progStart, ':pend' => $progEnd,
+            ':slots' => $slots, ':employer' => $employer, ':loc' => $loc,
+            ':coord' => $coord, ':funding' => $funding, ':status' => $status, ':id' => $id,
         ]);
 
         spesCascadeBatchStatus($pdo, $id, $prev, $status);
@@ -254,7 +247,7 @@ function spesUpdateBatchStatus($id) {
     if (!is_numeric($id)) error('Invalid batch id.', 422);
     $id = (int) $id;
     $d  = body();
-    $valid  = ['Open', 'Closed', 'Ongoing', 'Completed'];
+    $valid  = ['Planned', 'Ongoing', 'Completed'];
     $status = in_array($d['status'] ?? '', $valid, true) ? $d['status'] : null;
     if (!$status) error('Valid status required.', 422);
 
@@ -351,6 +344,10 @@ function spesBuildProfile($bid) {
     $spS->execute([':id' => $bsId]);
     $sp = $spS->fetch() ?: [];
 
+    $clsS = db()->prepare("SELECT classification FROM beneficiary_classifications WHERE beneficiary_id=:id");
+    $clsS->execute([':id' => $bid]);
+    $classifications = $clsS->fetchAll(PDO::FETCH_COLUMN);
+
     // spes_profiles.batch_id is a single direct FK (no assignment-history
     // table), so we can only ever surface a 0-or-1-entry "history" from the
     // live link — same constraint as GIP.
@@ -394,6 +391,7 @@ function spesBuildProfile($bid) {
         'cityMunicipality'        => $b['city_name'] ?? '',
         'province'                => $b['province_name'] ?? '',
         'region'                  => $b['region_name'] ?? '',
+        'classification'          => array_values($classifications),
         'schoolName'              => $sp['school_name'] ?? '',
         'schoolType'              => $sp['school_type'] ?? '',
         'gradeYearLevel'          => $sp['grade_year_level'] ?? '',
@@ -458,6 +456,13 @@ function spesCreateProfile() {
                 ':rmk'=>spesNullStr($d['remarks']??''),
             ]);
 
+        $validCls = spesValidClassifications();
+        $rawCls   = is_array($d['classification'] ?? null) ? $d['classification'] : [];
+        $ins = $pdo->prepare("INSERT INTO beneficiary_classifications(beneficiary_id,classification) VALUES(:bid,:cls) ON CONFLICT DO NOTHING");
+        foreach ($rawCls as $c) {
+            if (in_array($c, $validCls, true)) $ins->execute([':bid'=>$bid,':cls'=>$c]);
+        }
+
         spesSyncDocuments($pdo, $bid, $bsId, $uid, $d);
 
         $pdo->commit();
@@ -505,6 +510,14 @@ function spesUpdateProfile($id) {
         } else {
             $pdo->prepare("INSERT INTO spes_profiles(beneficiary_service_id,school_name,school_type,grade_year_level,course,annual_family_income,dependent_count,remarks,status) VALUES(:bsid,:school,:stype,:glvl,:course,:income,:deps,:rmk,'Inactive')")
                 ->execute($params);
+        }
+
+        $pdo->prepare("DELETE FROM beneficiary_classifications WHERE beneficiary_id=:bid")->execute([':bid'=>$bid]);
+        $validCls = spesValidClassifications();
+        $rawCls   = is_array($d['classification'] ?? null) ? $d['classification'] : [];
+        $ins = $pdo->prepare("INSERT INTO beneficiary_classifications(beneficiary_id,classification) VALUES(:bid,:cls)");
+        foreach ($rawCls as $c) {
+            if (in_array($c, $validCls, true)) $ins->execute([':bid'=>$bid,':cls'=>$c]);
         }
 
         spesSyncDocuments($pdo, $bid, $bsId, $uid, $d);
@@ -567,7 +580,7 @@ function spesAssignBatch() {
     $batchS->execute([':id' => $batchId]);
     $batch = $batchS->fetch();
     if (!$batch) error('Batch not found.', 404);
-    if ($batch['status'] !== 'Open') error('Only Open batches can be assigned.', 409);
+    if ($batch['status'] !== 'Planned') error('Only Planned batches can be assigned.', 409);
 
     $cntS = db()->prepare("SELECT COUNT(*) FROM spes_profiles WHERE batch_id=:id AND spes_profile_id != :spid");
     $cntS->execute([':id' => $batchId, ':spid' => $spId]);
@@ -600,11 +613,11 @@ function spesUnassignBatch() {
     if (!$r || !$r['spes_profile_id']) error('SPES profile not found.', 404);
 
     // spes_profiles.batch_id is the only place an assignment is recorded (no
-    // separate history table) — once the batch has moved past Open (Closed,
-    // Ongoing, or Completed), unassigning would silently erase the only
+    // separate history table) — once the batch has moved past Planned
+    // (Ongoing or Completed), unassigning would silently erase the only
     // record that this applicant was ever part of it.
-    if ($r['batch_status'] !== 'Open') {
-        error('This batch is no longer Open — unassigning would erase the only record of this assignment.', 409);
+    if ($r['batch_status'] !== 'Planned') {
+        error('This batch is no longer Planned — unassigning would erase the only record of this assignment.', 409);
     }
 
     db()->prepare("UPDATE spes_profiles SET batch_id=NULL, status='Inactive', batch_assigned_at=NULL, updated_at=now() WHERE spes_profile_id=:spid")
@@ -848,6 +861,7 @@ function spesHardDeleteApplicant($bid) {
             if (is_file($abs)) @unlink($abs);
         }
         $pdo->prepare("DELETE FROM documents WHERE beneficiary_id = :id AND document_source = 'SPES'")->execute([':id' => $bid]);
+        $pdo->prepare("DELETE FROM beneficiary_classifications WHERE beneficiary_id = :id")->execute([':id' => $bid]);
         $pdo->prepare("DELETE FROM beneficiary_services WHERE beneficiary_id = :id")->execute([':id' => $bid]);
         $pdo->prepare("DELETE FROM beneficiaries WHERE beneficiary_id = :id")->execute([':id' => $bid]);
 

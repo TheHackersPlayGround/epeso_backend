@@ -5,7 +5,7 @@
 
 INSERT INTO services (service_code, service_name, is_active, created_at, updated_at) VALUES
   ('EF',     'Employment Facilitation',                        true, now(), now()),
-  ('CDSP',   'Career Development and Services Program',         true, now(), now()),
+  ('CDSP',   'Career Development Support Program',              true, now(), now()),
   ('GIP',    'Government Internship Program',                   true, now(), now()),
   ('SPES',   'Special Program for Employment of Students',      true, now(), now()),
   ('SLP',    'Sustainable Livelihood Program',                 true, now(), now()),
