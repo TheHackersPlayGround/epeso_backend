@@ -216,7 +216,10 @@ function cdspListServices() {
     $out = array_map(function($r) {
         return ['id' => (int)$r['service_id'], 'code' => $r['service_code'], 'name' => $r['service_name']];
     }, $s->fetchAll());
-    json(['status' => 'ok', 'data' => $out]);
+    $p = db()->prepare("SELECT service_code, service_name FROM services WHERE service_id=:id");
+    $p->execute([':id' => cdspParentServiceId()]);
+    $parent = $p->fetch();
+    json(['status' => 'ok', 'data' => $out, 'program' => ['code' => $parent['service_code'], 'name' => $parent['service_name']]]);
 }
 
 function cdspCreateService() {
