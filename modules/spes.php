@@ -344,9 +344,14 @@ function spesBuildProfile($bid) {
     $spS->execute([':id' => $bsId]);
     $sp = $spS->fetch() ?: [];
 
-    $clsS = db()->prepare("SELECT classification FROM beneficiary_classifications WHERE beneficiary_id=:id");
+    $clsS = db()->prepare("SELECT classification, classification_other FROM beneficiary_classifications WHERE beneficiary_id=:id");
     $clsS->execute([':id' => $bid]);
-    $classifications = $clsS->fetchAll(PDO::FETCH_COLUMN);
+    $clsRows = $clsS->fetchAll();
+    $classifications = array_column($clsRows, 'classification');
+    $classificationOther = '';
+    foreach ($clsRows as $row) {
+        if ($row['classification'] === 'Other') { $classificationOther = $row['classification_other'] ?? ''; break; }
+    }
 
     // spes_profiles.batch_id is a single direct FK (no assignment-history
     // table), so we can only ever surface a 0-or-1-entry "history" from the
@@ -392,6 +397,7 @@ function spesBuildProfile($bid) {
         'province'                => $b['province_name'] ?? '',
         'region'                  => $b['region_name'] ?? '',
         'classification'          => array_values($classifications),
+        'classificationOther'     => $classificationOther,
         'schoolName'              => $sp['school_name'] ?? '',
         'schoolType'              => $sp['school_type'] ?? '',
         'gradeYearLevel'          => $sp['grade_year_level'] ?? '',
@@ -458,9 +464,12 @@ function spesCreateProfile() {
 
         $validCls = spesValidClassifications();
         $rawCls   = is_array($d['classification'] ?? null) ? $d['classification'] : [];
-        $ins = $pdo->prepare("INSERT INTO beneficiary_classifications(beneficiary_id,classification) VALUES(:bid,:cls) ON CONFLICT DO NOTHING");
+        $ins = $pdo->prepare("INSERT INTO beneficiary_classifications(beneficiary_id,classification,classification_other) VALUES(:bid,:cls,:clsOther) ON CONFLICT DO NOTHING");
         foreach ($rawCls as $c) {
-            if (in_array($c, $validCls, true)) $ins->execute([':bid'=>$bid,':cls'=>$c]);
+            if (in_array($c, $validCls, true)) {
+                $clsOther = $c === 'Other' ? spesNullStr($d['classificationOther'] ?? '') : null;
+                $ins->execute([':bid'=>$bid,':cls'=>$c,':clsOther'=>$clsOther]);
+            }
         }
 
         spesSyncDocuments($pdo, $bid, $bsId, $uid, $d);
@@ -515,9 +524,12 @@ function spesUpdateProfile($id) {
         $pdo->prepare("DELETE FROM beneficiary_classifications WHERE beneficiary_id=:bid")->execute([':bid'=>$bid]);
         $validCls = spesValidClassifications();
         $rawCls   = is_array($d['classification'] ?? null) ? $d['classification'] : [];
-        $ins = $pdo->prepare("INSERT INTO beneficiary_classifications(beneficiary_id,classification) VALUES(:bid,:cls)");
+        $ins = $pdo->prepare("INSERT INTO beneficiary_classifications(beneficiary_id,classification,classification_other) VALUES(:bid,:cls,:clsOther)");
         foreach ($rawCls as $c) {
-            if (in_array($c, $validCls, true)) $ins->execute([':bid'=>$bid,':cls'=>$c]);
+            if (in_array($c, $validCls, true)) {
+                $clsOther = $c === 'Other' ? spesNullStr($d['classificationOther'] ?? '') : null;
+                $ins->execute([':bid'=>$bid,':cls'=>$c,':clsOther'=>$clsOther]);
+            }
         }
 
         spesSyncDocuments($pdo, $bid, $bsId, $uid, $d);
@@ -575,6 +587,20 @@ function spesAssignBatch() {
     $spId = $spS->fetchColumn();
     if (!$spId) error('SPES profile not found.', 404);
     $spId = (int) $spId;
+
+    // Same rule as unassign: once the applicant's current batch has moved past
+    // Planned, there's no history table to fall back on — batch_id is the only
+    // record that assignment ever happened, so reassigning would erase it.
+    $curS = db()->prepare(
+        "SELECT spb.status FROM spes_profiles sp
+         LEFT JOIN spes_batches spb ON spb.batch_id = sp.batch_id
+         WHERE sp.spes_profile_id = :spid AND sp.batch_id IS NOT NULL"
+    );
+    $curS->execute([':spid' => $spId]);
+    $curBatchStatus = $curS->fetchColumn();
+    if ($curBatchStatus !== false && $curBatchStatus !== 'Planned') {
+        error('This applicant is already assigned to a batch that is no longer Planned — reassigning would erase the only record of that assignment.', 409);
+    }
 
     $batchS = db()->prepare("SELECT status, available_slots FROM spes_batches WHERE batch_id=:id");
     $batchS->execute([':id' => $batchId]);

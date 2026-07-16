@@ -519,9 +519,14 @@ function cdspBuildProfile($bid) {
     $cpS->execute([':id' => $bsId]);
     $cp = $cpS->fetch() ?: [];
 
-    $clsS = db()->prepare("SELECT classification FROM beneficiary_classifications WHERE beneficiary_id=:id");
+    $clsS = db()->prepare("SELECT classification, classification_other FROM beneficiary_classifications WHERE beneficiary_id=:id");
     $clsS->execute([':id' => $bid]);
-    $classifications = $clsS->fetchAll(PDO::FETCH_COLUMN);
+    $clsRows = $clsS->fetchAll();
+    $classifications = array_column($clsRows, 'classification');
+    $classificationOther = '';
+    foreach ($clsRows as $row) {
+        if ($row['classification'] === 'Other') { $classificationOther = $row['classification_other'] ?? ''; break; }
+    }
 
     $partS = db()->prepare(
         "SELECT cap.activity_id, ca.activity_title, ca.status AS activity_status, ca.activity_date,
@@ -577,7 +582,7 @@ function cdspBuildProfile($bid) {
         'province'                => $b['province_name'] ?? '',
         'region'                  => $b['region_name'] ?? '',
         'classification'          => array_values($classifications),
-        'classificationOther'     => '',
+        'classificationOther'     => $classificationOther,
         'highestEducation'        => cdspReverseMapEducation($b['educational_attainment'] ?? '', !empty($cp['year_graduated'])),
         'schoolName'              => $cp['school_name'] ?? '',
         'course'                  => $cp['course_program'] ?? '',
@@ -648,10 +653,13 @@ function cdspCreateProfile() {
 
         $validCls = cdspValidClassifications();
         $rawCls   = is_array($d['classification'] ?? null) ? $d['classification'] : [];
-        $ins = $pdo->prepare("INSERT INTO beneficiary_classifications(beneficiary_id,classification) VALUES(:bid,:cls) ON CONFLICT DO NOTHING");
+        $ins = $pdo->prepare("INSERT INTO beneficiary_classifications(beneficiary_id,classification,classification_other) VALUES(:bid,:cls,:clsOther) ON CONFLICT DO NOTHING");
         foreach ($rawCls as $c) {
             $norm = cdspNormalizeClassification($c);
-            if (in_array($norm, $validCls, true)) $ins->execute([':bid'=>$bid,':cls'=>$norm]);
+            if (in_array($norm, $validCls, true)) {
+                $clsOther = $norm === 'Other' ? cdspNullStr($d['classificationOther'] ?? '') : null;
+                $ins->execute([':bid'=>$bid,':cls'=>$norm,':clsOther'=>$clsOther]);
+            }
         }
 
         $pdo->prepare("INSERT INTO cdsp_profiles(beneficiary_service_id,school_name,course_program,strand,year_level,year_graduated,employment_status,current_occupation,remarks,status) VALUES(:bsid,:school,:course,:strand,:ylvl,:yr,:empst,:occ,:rmk,'Active')")
@@ -718,10 +726,13 @@ function cdspUpdateProfile($id) {
         $pdo->prepare("DELETE FROM beneficiary_classifications WHERE beneficiary_id=:bid")->execute([':bid'=>$bid]);
         $validCls = cdspValidClassifications();
         $rawCls   = is_array($d['classification'] ?? null) ? $d['classification'] : [];
-        $ins = $pdo->prepare("INSERT INTO beneficiary_classifications(beneficiary_id,classification) VALUES(:bid,:cls)");
+        $ins = $pdo->prepare("INSERT INTO beneficiary_classifications(beneficiary_id,classification,classification_other) VALUES(:bid,:cls,:clsOther)");
         foreach ($rawCls as $c) {
             $norm = cdspNormalizeClassification($c);
-            if (in_array($norm, $validCls, true)) $ins->execute([':bid'=>$bid,':cls'=>$norm]);
+            if (in_array($norm, $validCls, true)) {
+                $clsOther = $norm === 'Other' ? cdspNullStr($d['classificationOther'] ?? '') : null;
+                $ins->execute([':bid'=>$bid,':cls'=>$norm,':clsOther'=>$clsOther]);
+            }
         }
 
         $ex = db()->prepare("SELECT 1 FROM cdsp_profiles WHERE beneficiary_service_id=:id");

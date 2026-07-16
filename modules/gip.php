@@ -385,9 +385,14 @@ function gipBuildProfile($bid) {
     $gpS->execute([':id' => $bsId]);
     $gp = $gpS->fetch() ?: [];
 
-    $clsS = db()->prepare("SELECT classification FROM beneficiary_classifications WHERE beneficiary_id=:id");
+    $clsS = db()->prepare("SELECT classification, classification_other FROM beneficiary_classifications WHERE beneficiary_id=:id");
     $clsS->execute([':id' => $bid]);
-    $classifications = $clsS->fetchAll(PDO::FETCH_COLUMN);
+    $clsRows = $clsS->fetchAll();
+    $classifications = array_column($clsRows, 'classification');
+    $classificationOther = '';
+    foreach ($clsRows as $row) {
+        if ($row['classification'] === 'Other') { $classificationOther = $row['classification_other'] ?? ''; break; }
+    }
 
     // gip_profiles.batch_id is a single direct FK (no assignment-history table),
     // so we can only ever surface a 0-or-1-entry "history" from the live link.
@@ -432,7 +437,7 @@ function gipBuildProfile($bid) {
         'province'                => $b['province_name'] ?? '',
         'region'                  => $b['region_name'] ?? '',
         'classification'          => array_values($classifications),
-        'classificationOther'     => '',
+        'classificationOther'     => $classificationOther,
         'highestEducation'        => gipReverseMapEducation($b['educational_attainment'] ?? '', !empty($gp['year_graduated'])),
         'schoolName'              => $gp['school_name'] ?? '',
         'course'                  => $gp['course_degree'] ?? '',
@@ -494,10 +499,13 @@ function gipCreateProfile() {
 
         $validCls = gipValidClassifications();
         $rawCls   = is_array($d['classification'] ?? null) ? $d['classification'] : [];
-        $ins = $pdo->prepare("INSERT INTO beneficiary_classifications(beneficiary_id,classification) VALUES(:bid,:cls) ON CONFLICT DO NOTHING");
+        $ins = $pdo->prepare("INSERT INTO beneficiary_classifications(beneficiary_id,classification,classification_other) VALUES(:bid,:cls,:clsOther) ON CONFLICT DO NOTHING");
         foreach ($rawCls as $c) {
             $norm = gipNormalizeClassification($c);
-            if (in_array($norm, $validCls, true)) $ins->execute([':bid'=>$bid,':cls'=>$norm]);
+            if (in_array($norm, $validCls, true)) {
+                $clsOther = $norm === 'Other' ? gipNullStr($d['classificationOther'] ?? '') : null;
+                $ins->execute([':bid'=>$bid,':cls'=>$norm,':clsOther'=>$clsOther]);
+            }
         }
 
         $pdo->prepare("INSERT INTO gip_profiles(beneficiary_service_id,school_name,course_degree,strand,year_level,year_graduated,remarks,status) VALUES(:bsid,:school,:course,:strand,:ylvl,:yr,:rmk,'Inactive')")
@@ -539,10 +547,13 @@ function gipUpdateProfile($id) {
         $pdo->prepare("DELETE FROM beneficiary_classifications WHERE beneficiary_id=:bid")->execute([':bid'=>$bid]);
         $validCls = gipValidClassifications();
         $rawCls   = is_array($d['classification'] ?? null) ? $d['classification'] : [];
-        $ins = $pdo->prepare("INSERT INTO beneficiary_classifications(beneficiary_id,classification) VALUES(:bid,:cls)");
+        $ins = $pdo->prepare("INSERT INTO beneficiary_classifications(beneficiary_id,classification,classification_other) VALUES(:bid,:cls,:clsOther)");
         foreach ($rawCls as $c) {
             $norm = gipNormalizeClassification($c);
-            if (in_array($norm, $validCls, true)) $ins->execute([':bid'=>$bid,':cls'=>$norm]);
+            if (in_array($norm, $validCls, true)) {
+                $clsOther = $norm === 'Other' ? gipNullStr($d['classificationOther'] ?? '') : null;
+                $ins->execute([':bid'=>$bid,':cls'=>$norm,':clsOther'=>$clsOther]);
+            }
         }
 
         $ex = db()->prepare("SELECT 1 FROM gip_profiles WHERE beneficiary_service_id=:id");
@@ -610,6 +621,20 @@ function gipAssignBatch() {
     $gpId = $gpS->fetchColumn();
     if (!$gpId) error('GIP profile not found.', 404);
     $gpId = (int) $gpId;
+
+    // Same rule as unassign: once the applicant's current batch has moved past
+    // Planned, there's no history table to fall back on — batch_id is the only
+    // record that assignment ever happened, so reassigning would erase it.
+    $curS = db()->prepare(
+        "SELECT gb.status FROM gip_profiles gp
+         LEFT JOIN gip_batches gb ON gb.batch_id = gp.batch_id
+         WHERE gp.gip_profile_id = :gpid AND gp.batch_id IS NOT NULL"
+    );
+    $curS->execute([':gpid' => $gpId]);
+    $curBatchStatus = $curS->fetchColumn();
+    if ($curBatchStatus !== false && $curBatchStatus !== 'Planned') {
+        error('This applicant is already assigned to a batch that is no longer Planned — reassigning would erase the only record of that assignment.', 409);
+    }
 
     $batchS = db()->prepare("SELECT status, slot_count FROM gip_batches WHERE batch_id=:id");
     $batchS->execute([':id' => $batchId]);
