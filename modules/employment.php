@@ -193,11 +193,11 @@ function efDeriveEducation($d)
     $elem = isset($d['elementary']) && is_array($d['elementary']) ? $d['elementary'] : [];
 
     if (efYes($tert['graduated'] ?? '')) return 'College Graduate';
-    if (efEduHasData($tert)) return 'College Undergraduate';
+    if (efEduHasData($tert)) return 'College Level';
     if (efYes($sec['graduated'] ?? '')) return 'Senior High School Graduate';
-    if (efEduHasData($sec)) return 'Senior High School Undergraduate';
+    if (efEduHasData($sec)) return 'Senior High School Level';
     if (efYes($elem['graduated'] ?? '')) return 'Elementary Graduate';
-    if (efEduHasData($elem)) return 'Elementary Undergraduate';
+    if (efEduHasData($elem)) return 'Elementary Level';
     return null;
 }
 

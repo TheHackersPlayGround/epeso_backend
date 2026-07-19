@@ -558,7 +558,7 @@ function spesDeleteProfile($id) {
     $chk->execute([':bid' => $bid, ':sid' => spesServiceId()]);
     $row = $chk->fetch();
     if ($row && $row['batch_id'] && $row['status'] === 'Active') {
-        error('This applicant cannot be deleted because they are currently assigned to a batch. Unassign them first.', 409);
+        error('This applicant cannot be deleted because they are currently assigned to a batch. Unassign them first (only possible while the batch is still Planned), or wait until it is marked Completed.', 409);
     }
 
     db()->prepare("UPDATE beneficiaries SET deleted_at=now(),deleted_by=:uid WHERE beneficiary_id=:id")->execute([':uid' => $uid, ':id' => $bid]);

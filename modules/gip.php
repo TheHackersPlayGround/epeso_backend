@@ -55,14 +55,14 @@ function gipServiceId() {
 // Map frontend education labels to educational_attainment enum.
 function gipMapEducation($v) {
     $map = [
-        'Elementary Level'            => 'Elementary Undergraduate',
+        'Elementary Level'            => 'Elementary Level',
         'Elementary Graduate'         => 'Elementary Graduate',
-        'High School Level'           => 'Junior High School Undergraduate',
+        'High School Level'           => 'Junior High School Level',
         'High School Graduate'        => 'Junior High School Graduate',
-        'Senior High School Level'    => 'Senior High School Undergraduate',
+        'Senior High School Level'    => 'Senior High School Level',
         'Senior High School Graduate' => 'Senior High School Graduate',
         'Vocational / Technical'      => 'Vocational Graduate',
-        'College Level'               => 'College Undergraduate',
+        'College Level'               => 'College Level',
         'College Graduate'            => 'College Graduate',
         "Master's Level"              => "Master's Degree",
         "Master's Graduate"           => "Master's Degree",
@@ -82,14 +82,14 @@ function gipMapEducation($v) {
 // whether a year_graduated value is on record.
 function gipReverseMapEducation($enumValue, $hasYearGraduated) {
     $map = [
-        'Elementary Undergraduate'          => 'Elementary Level',
+        'Elementary Level'                  => 'Elementary Level',
         'Elementary Graduate'               => 'Elementary Graduate',
-        'Junior High School Undergraduate'  => 'High School Level',
+        'Junior High School Level'          => 'High School Level',
         'Junior High School Graduate'       => 'High School Graduate',
-        'Senior High School Undergraduate'  => 'Senior High School Level',
+        'Senior High School Level'          => 'Senior High School Level',
         'Senior High School Graduate'       => 'Senior High School Graduate',
         'Vocational Graduate'               => 'Vocational / Technical',
-        'College Undergraduate'             => 'College Level',
+        'College Level'                     => 'College Level',
         'College Graduate'                  => 'College Graduate',
         'Doctorate Degree'                  => 'Doctoral',
     ];
@@ -592,7 +592,7 @@ function gipDeleteProfile($id) {
     $chk->execute([':bid' => $bid, ':sid' => gipServiceId()]);
     $row = $chk->fetch();
     if ($row && $row['batch_id'] && $row['status'] === 'Active') {
-        error('This applicant cannot be deleted because they are currently assigned to a batch. Unassign them first.', 409);
+        error('This applicant cannot be deleted because they are currently assigned to a batch. Unassign them first (only possible while the batch is still Planned), or wait until it is marked Completed.', 409);
     }
 
     db()->prepare("UPDATE beneficiaries SET deleted_at=now(),deleted_by=:uid WHERE beneficiary_id=:id")->execute([':uid' => $uid, ':id' => $bid]);

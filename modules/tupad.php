@@ -455,7 +455,7 @@ function tupadDeleteProfile($id) {
     $chk->execute([':bid' => $bid, ':sid' => tupadServiceId()]);
     $projStatus = $chk->fetchColumn();
     if ($projStatus !== false && in_array($projStatus, ['Planned', 'Ongoing'], true)) {
-        error('This beneficiary cannot be deleted because they are currently assigned to an active project. Unassign them first.', 409);
+        error('This beneficiary cannot be deleted because they are currently assigned to an active project. Unassign them first (only possible while the project is still Planned), or wait until it is marked Completed.', 409);
     }
 
     db()->prepare("UPDATE beneficiaries SET deleted_at=now(),deleted_by=:uid WHERE beneficiary_id=:id")->execute([':uid' => $uid, ':id' => $bid]);

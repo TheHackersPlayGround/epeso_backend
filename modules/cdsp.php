@@ -51,14 +51,14 @@ function cdspYearOrNull($v) {
 // Map frontend education labels to educational_attainment enum.
 function cdspMapEducation($v) {
     $map = [
-        'Elementary Level'            => 'Elementary Undergraduate',
+        'Elementary Level'            => 'Elementary Level',
         'Elementary Graduate'         => 'Elementary Graduate',
-        'High School Level'           => 'Junior High School Undergraduate',
+        'High School Level'           => 'Junior High School Level',
         'High School Graduate'        => 'Junior High School Graduate',
-        'Senior High School Level'    => 'Senior High School Undergraduate',
+        'Senior High School Level'    => 'Senior High School Level',
         'Senior High School Graduate' => 'Senior High School Graduate',
         'Vocational / Technical'      => 'Vocational Graduate',
-        'College Level'               => 'College Undergraduate',
+        'College Level'               => 'College Level',
         'College Graduate'            => 'College Graduate',
         "Master's Level"              => "Master's Degree",
         "Master's Graduate"           => "Master's Degree",
@@ -76,14 +76,14 @@ function cdspMapEducation($v) {
 // mirroring gipReverseMapEducation() in gip.php.
 function cdspReverseMapEducation($enumValue, $hasYearGraduated) {
     $map = [
-        'Elementary Undergraduate'         => 'Elementary Level',
+        'Elementary Level'                 => 'Elementary Level',
         'Elementary Graduate'              => 'Elementary Graduate',
-        'Junior High School Undergraduate' => 'High School Level',
+        'Junior High School Level'         => 'High School Level',
         'Junior High School Graduate'      => 'High School Graduate',
-        'Senior High School Undergraduate' => 'Senior High School Level',
+        'Senior High School Level'         => 'Senior High School Level',
         'Senior High School Graduate'      => 'Senior High School Graduate',
         'Vocational Graduate'              => 'Vocational / Technical',
-        'College Undergraduate'            => 'College Level',
+        'College Level'                    => 'College Level',
         'College Graduate'                 => 'College Graduate',
     ];
     if (isset($map[$enumValue])) return $map[$enumValue];
