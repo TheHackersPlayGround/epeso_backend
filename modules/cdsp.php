@@ -102,7 +102,7 @@ function cdspNormalizeClassification($c) {
 }
 
 function cdspValidClassifications() {
-    return ['Student','Fresh Graduate','Employed','Underemployed','Unemployed',
+    return ['Student','Fresh Graduate',
             'Out of School Youth','Person with Disability','Solo Parent',
             'Women','Senior Citizen','Returning OFW','Other','Indigenous People'];
 }
@@ -293,7 +293,6 @@ function cdspFormatActivity($r) {
         'id'              => (int)$r['activity_id'],
         'serviceId'       => (int)$r['service_id'],
         'service'         => $r['service_name'],
-        'program'         => 'CDSP',
         'title'           => $r['activity_title'],
         'description'     => $r['description'] ?? '',
         'date'            => $r['activity_date'] ?? '',
@@ -600,13 +599,6 @@ function cdspBuildProfile($bid) {
         'remarks'                 => $cp['remarks'] ?? '',
         'status'                  => $frontendStatus,
         'attachedDocuments'       => cdspFetchSavedDocuments($bid),
-        // Legacy compat fields
-        'employerName'=>'','employmentType'=>'','monthlyIncome'=>'',
-        'careerGoal'=>'','coachingType'=>'','careerAssessmentResult'=>'',
-        'targetJob'=>'','industriesOfInterest'=>[],'preEmploymentRequirements'=>[],
-        'school'=>'','courseProgram'=>$cp['course_program']??'',
-        'expectedGraduation'=>'',
-        'applicantSignature'=>'','dateSignature'=>'','counselorName'=>'',
     ];
 }
 

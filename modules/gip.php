@@ -108,7 +108,7 @@ function gipNormalizeClassification($c) {
 }
 
 function gipValidClassifications() {
-    return ['Student','Fresh Graduate','Employed','Underemployed','Unemployed',
+    return ['Student','Fresh Graduate',
             'Out of School Youth','Person with Disability','Solo Parent',
             'Women','Senior Citizen','Returning OFW','Other','Indigenous People'];
 }
