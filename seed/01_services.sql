@@ -15,3 +15,12 @@ INSERT INTO services (service_code, service_name, is_active, created_at, updated
   ('OFW',    'OFW Assistance',                                 true, now(), now()),
   ('SKILLS', 'Skills Training',                                 true, now(), now())
 ON CONFLICT (service_code) DO NOTHING;
+
+-- CDSP's own sub-services (what the profile form's "Service Availed" section
+-- offers). Looked up by service_code, not a hardcoded id, since insertion
+-- order/sequence state can differ between environments.
+INSERT INTO services (service_code, service_name, parent_service_id, is_active, created_at, updated_at) VALUES
+  ('CDSP-CC',   'Career Coaching',                          (SELECT service_id FROM services WHERE service_code='CDSP'), true, now(), now()),
+  ('CDSP-PEC',  'Pre-Employment Coaching',                   (SELECT service_id FROM services WHERE service_code='CDSP'), true, now(), now()),
+  ('CDSP-LEGS', 'Labor Employment for Graduating Students',  (SELECT service_id FROM services WHERE service_code='CDSP'), true, now(), now())
+ON CONFLICT (service_code) DO NOTHING;

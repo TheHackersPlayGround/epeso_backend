@@ -374,8 +374,20 @@ function cdspUpdateActivityStatus($id) {
 
 function cdspDeleteActivity($id) {
     if (!is_numeric($id)) error('Invalid activity id.', 422);
-    db()->prepare("DELETE FROM cdsp_activity_participants WHERE activity_id=:id")->execute([':id'=>(int)$id]);
-    db()->prepare("DELETE FROM cdsp_activities WHERE activity_id=:id")->execute([':id'=>(int)$id]);
+    $id = (int)$id;
+
+    // Blocks deletion regardless of status (Planned/Ongoing/Completed) - a
+    // Completed activity's participant rows are real historical attendance
+    // records, not just in-progress state, so they deserve the same
+    // protection as an active one. Mirrors cdspDeleteProfile's lock spirit.
+    $chk = db()->prepare("SELECT COUNT(*) FROM cdsp_activity_participants WHERE activity_id = :id");
+    $chk->execute([':id' => $id]);
+    if ((int)$chk->fetchColumn() > 0) {
+        error('This activity has enrolled participants. Remove all participants before deleting it.', 409);
+    }
+
+    db()->prepare("DELETE FROM cdsp_activity_participants WHERE activity_id=:id")->execute([':id'=>$id]);
+    db()->prepare("DELETE FROM cdsp_activities WHERE activity_id=:id")->execute([':id'=>$id]);
     json(['status' => 'ok', 'message' => 'Activity deleted.']);
 }
 
@@ -676,12 +688,33 @@ function cdspUpdateProfile($id) {
     if (cdspNullStr($d['lastName'] ?? '')  === null) error('Last name is required.', 422);
     if (empty($d['highestEducation']))               error('Highest educational attainment is required.', 422);
     if (empty($d['employmentStatus']))               error('Employment status is required.', 422);
+    if (empty($d['serviceAvailed']))                  error('Service availed is required.', 422);
+    $newServiceId = cdspServiceIdByName($d['serviceAvailed']);
+    if (!$newServiceId) error('Selected CDSP service not found.', 422);
 
-    $chk = db()->prepare("SELECT bs.beneficiary_service_id FROM beneficiary_services bs JOIN services sv ON sv.service_id=bs.service_id WHERE bs.beneficiary_id=:bid AND sv.parent_service_id=:pid ORDER BY bs.beneficiary_service_id DESC LIMIT 1");
+    $chk = db()->prepare("SELECT bs.beneficiary_service_id, bs.service_id FROM beneficiary_services bs JOIN services sv ON sv.service_id=bs.service_id WHERE bs.beneficiary_id=:bid AND sv.parent_service_id=:pid ORDER BY bs.beneficiary_service_id DESC LIMIT 1");
     $chk->execute([':bid'=>$bid,':pid'=>cdspParentServiceId()]);
-    $bsId = $chk->fetchColumn();
-    if (!$bsId) error('CDSP profile not found.', 404);
-    $bsId = (int)$bsId;
+    $bsRow = $chk->fetch();
+    if (!$bsRow) error('CDSP profile not found.', 404);
+    $bsId = (int)$bsRow['beneficiary_service_id'];
+
+    // Block a service change once the beneficiary has ANY activity
+    // participation history under their CURRENT service - Planned, Ongoing,
+    // or Completed. beneficiary_service_id is a shared anchor referenced by
+    // cdsp_profiles, documents, and every other module's profile table, so
+    // it represents a specific enrollment event, not a casually-editable
+    // field - swapping the service out from under it would retroactively
+    // rewrite what all of that linked history appears to belong to. Same
+    // lock spirit as cdspDeleteActivity's participant-history check.
+    if ((int)$bsRow['service_id'] !== $newServiceId) {
+        $hasHistory = db()->prepare(
+            "SELECT 1 FROM cdsp_activity_participants WHERE beneficiary_service_id = :bsid LIMIT 1"
+        );
+        $hasHistory->execute([':bsid'=>$bsId]);
+        if ($hasHistory->fetchColumn()) {
+            error('This applicant has activity participation history under their current service. This cannot be changed once history exists.', 409);
+        }
+    }
 
     $sex = in_array($d['sex'] ?? '', ['Male','Female'], true) ? $d['sex'] : null;
     if (!$sex) error('Sex is required.', 422);
@@ -712,8 +745,8 @@ function cdspUpdateProfile($id) {
         }
         $pdo->prepare("UPDATE beneficiaries SET {$sets} WHERE beneficiary_id=:bid")->execute($params);
 
-        $pdo->prepare("UPDATE beneficiary_services SET received_by=:rby,date_applied=:date WHERE beneficiary_service_id=:bsid")
-            ->execute([':rby'=>cdspNullStr($d['receivedBy']??''),':date'=>cdspDate($d['dateApplicationReceived']??'')??date('Y-m-d'),':bsid'=>$bsId]);
+        $pdo->prepare("UPDATE beneficiary_services SET service_id=:sid,received_by=:rby,date_applied=:date WHERE beneficiary_service_id=:bsid")
+            ->execute([':sid'=>$newServiceId,':rby'=>cdspNullStr($d['receivedBy']??''),':date'=>cdspDate($d['dateApplicationReceived']??'')??date('Y-m-d'),':bsid'=>$bsId]);
 
         $pdo->prepare("DELETE FROM beneficiary_classifications WHERE beneficiary_id=:bid")->execute([':bid'=>$bid]);
         $validCls = cdspValidClassifications();
