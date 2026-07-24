@@ -324,13 +324,13 @@ function gipDeleteBatch($id) {
         error("Cannot delete: {$cnt} applicant" . ($cnt === 1 ? '' : 's') . " linked to this batch (current or past interns).", 409);
     }
 
-    $docs = db()->prepare("SELECT file_path FROM documents WHERE batch_id=:id");
+    $docs = db()->prepare("SELECT file_path FROM documents WHERE gip_batch_id=:id");
     $docs->execute([':id' => $id]);
     foreach ($docs->fetchAll(PDO::FETCH_COLUMN) as $path) {
         $abs = __DIR__ . '/../' . $path;
         if (is_file($abs)) @unlink($abs);
     }
-    // documents.batch_id is ON DELETE CASCADE, so deleting the batch row also
+    // documents.gip_batch_id is ON DELETE CASCADE, so deleting the batch row also
     // removes its document rows once the files above are unlinked from disk.
     db()->prepare("DELETE FROM gip_batches WHERE batch_id=:id")->execute([':id' => $id]);
     json(['status' => 'ok', 'message' => 'Batch deleted.']);
@@ -758,7 +758,7 @@ function gipFetchSavedDocuments($bid) {
 }
 
 // ─── Documents (batch) ────────────────────────────────────────────────────────
-// Batch files aren't tied to a beneficiary, so they key off documents.batch_id
+// Batch files aren't tied to a beneficiary, so they key off documents.gip_batch_id
 // instead (nullable FK, ON DELETE CASCADE) — same shared table, same pattern.
 
 function gipSyncBatchDocuments($pdo, $batchId, $uid, $docsPayload) {
@@ -772,7 +772,7 @@ function gipSyncBatchDocuments($pdo, $batchId, $uid, $docsPayload) {
         }
     }
 
-    $sel = $pdo->prepare("SELECT document_id, file_path FROM documents WHERE batch_id=:bid");
+    $sel = $pdo->prepare("SELECT document_id, file_path FROM documents WHERE gip_batch_id=:bid");
     $sel->execute([':bid' => $batchId]);
     foreach ($sel->fetchAll() as $row) {
         if (!in_array((int) $row['document_id'], $keep, true)) {
@@ -783,7 +783,7 @@ function gipSyncBatchDocuments($pdo, $batchId, $uid, $docsPayload) {
     }
 
     $ins = $pdo->prepare(
-        "INSERT INTO documents(batch_id,document_source,document_type,title,file_name,file_path,file_size,mime_type,uploaded_by)
+        "INSERT INTO documents(gip_batch_id,document_source,document_type,title,file_name,file_path,file_size,mime_type,uploaded_by)
          VALUES(:bid,'GIP Batch',NULL,:title,:fname,:fpath,:size,:mime,:uid)"
     );
     foreach ($docs as $doc) {
@@ -808,7 +808,7 @@ function gipSyncBatchDocuments($pdo, $batchId, $uid, $docsPayload) {
 function gipFetchBatchDocuments($batchId) {
     $s = db()->prepare(
         "SELECT document_id, title, file_name, file_path, file_size
-         FROM documents WHERE batch_id=:bid ORDER BY document_id"
+         FROM documents WHERE gip_batch_id=:bid ORDER BY document_id"
     );
     $s->execute([':bid' => $batchId]);
     return array_map(function ($r) {

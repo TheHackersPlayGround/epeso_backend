@@ -726,7 +726,7 @@ function spesFetchSavedDocuments($bid) {
 // ─── Documents (batch) ────────────────────────────────────────────────────────
 // Batch files aren't tied to a beneficiary, so they key off
 // documents.spes_batch_id instead (nullable FK, ON DELETE CASCADE) — same
-// shared table, same pattern GIP uses via documents.batch_id.
+// shared table, same pattern GIP uses via documents.gip_batch_id.
 
 function spesSyncBatchDocuments($pdo, $batchId, $uid, $docsPayload) {
     $docs = is_array($docsPayload) ? $docsPayload : [];
