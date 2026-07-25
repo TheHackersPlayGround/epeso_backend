@@ -120,7 +120,7 @@ function ofwSyncDocuments($pdo, $bid, $bsId, $uid, $d) {
         }
     }
 
-    $sel = $pdo->prepare("SELECT document_id, document_type, file_path FROM documents WHERE beneficiary_id=:bid AND document_source='OFW'");
+    $sel = $pdo->prepare("SELECT document_id, document_type, file_path FROM attached_documents WHERE beneficiary_id=:bid AND document_source='OFW'");
     $sel->execute([':bid' => $bid]);
     foreach ($sel->fetchAll() as $row) {
         $type = $row['document_type'];
@@ -132,12 +132,12 @@ function ofwSyncDocuments($pdo, $bid, $bsId, $uid, $d) {
         if ($shouldDelete) {
             $abs = __DIR__ . '/../' . $row['file_path'];
             if (is_file($abs)) @unlink($abs);
-            $pdo->prepare("DELETE FROM documents WHERE document_id=:id")->execute([':id' => (int) $row['document_id']]);
+            $pdo->prepare("DELETE FROM attached_documents WHERE document_id=:id")->execute([':id' => (int) $row['document_id']]);
         }
     }
 
     $ins = $pdo->prepare(
-        "INSERT INTO documents(beneficiary_id,beneficiary_service_id,document_source,document_type,title,file_name,file_path,file_size,mime_type,uploaded_by)
+        "INSERT INTO attached_documents(beneficiary_id,beneficiary_service_id,document_source,document_type,title,file_name,file_path,file_size,mime_type,uploaded_by)
          VALUES(:bid,:bsid,'OFW',:dtype,:title,:fname,:fpath,:size,:mime,:uid)"
     );
 
@@ -181,7 +181,7 @@ function ofwSyncDocuments($pdo, $bid, $bsId, $uid, $d) {
 function ofwFetchDocuments($bid) {
     $s = db()->prepare(
         "SELECT document_id, document_type, title, file_name, file_path, file_size
-         FROM documents WHERE beneficiary_id=:bid AND document_source='OFW' ORDER BY document_id"
+         FROM attached_documents WHERE beneficiary_id=:bid AND document_source='OFW' ORDER BY document_id"
     );
     $s->execute([':bid' => $bid]);
     $rows = $s->fetchAll();
@@ -599,13 +599,13 @@ function ofwHardDeleteApplicant($bid) {
             $pdo->prepare("DELETE FROM ofw_profiles WHERE beneficiary_service_id = :id")->execute([':id' => (int) $bsId]);
         }
 
-        $docs = $pdo->prepare("SELECT file_path FROM documents WHERE beneficiary_id = :id AND document_source = 'OFW'");
+        $docs = $pdo->prepare("SELECT file_path FROM attached_documents WHERE beneficiary_id = :id AND document_source = 'OFW'");
         $docs->execute([':id' => $bid]);
         foreach ($docs->fetchAll(PDO::FETCH_COLUMN) as $path) {
             $abs = __DIR__ . '/../' . $path;
             if (is_file($abs)) @unlink($abs);
         }
-        $pdo->prepare("DELETE FROM documents WHERE beneficiary_id = :id AND document_source = 'OFW'")->execute([':id' => $bid]);
+        $pdo->prepare("DELETE FROM attached_documents WHERE beneficiary_id = :id AND document_source = 'OFW'")->execute([':id' => $bid]);
 
         // Matches cdsp.php/gip.php/skills_training.php's hard-delete exactly:
         // unscoped deletes, deliberately kept consistent cross-module behavior.

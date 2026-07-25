@@ -1,0 +1,12 @@
+-- Removes the old generic 'maintenance' permission (id 9), now fully unused
+-- after migration 045 replaced it with per-program variants
+-- (cdsp-maintenance, spes-maintenance, gip-maintenance,
+-- livelihood-maintenance, skills-maintenance). Nothing in the codebase
+-- checks 'maintenance' anymore (backend requirePermission() calls and both
+-- frontend permission screens were already switched over) -- this is pure
+-- data cleanup, not a behavior change.
+--
+-- Deleting this row cascades (ON DELETE CASCADE) to remove any leftover
+-- user_permissions rows still tied to it -- those rows aren't read by
+-- anything either, so this has no effect on any user's actual access.
+DELETE FROM permissions WHERE permission_name = 'maintenance';

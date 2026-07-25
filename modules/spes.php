@@ -7,11 +7,11 @@ include_once __DIR__ . '/../core/guard.php';
 function handle($action, $id, $method)
 {
     switch ($action) {
-        case 'listBatches':       requirePermission('spes','Viewer'); return spesListBatches();
-        case 'createBatch':       requirePermission('spes','Editor'); return spesCreateBatch();
-        case 'updateBatch':       requirePermission('spes','Editor'); return spesUpdateBatch($id);
-        case 'deleteBatch':       requirePermission('spes','Editor'); return spesDeleteBatch($id);
-        case 'updateBatchStatus': requirePermission('spes','Editor'); return spesUpdateBatchStatus($id);
+        case 'listBatches':       requirePermission('spes-maintenance','Viewer'); return spesListBatches();
+        case 'createBatch':       requirePermission('spes-maintenance','Editor'); return spesCreateBatch();
+        case 'updateBatch':       requirePermission('spes-maintenance','Editor'); return spesUpdateBatch($id);
+        case 'deleteBatch':       requirePermission('spes-maintenance','Editor'); return spesDeleteBatch($id);
+        case 'updateBatchStatus': requirePermission('spes-maintenance','Editor'); return spesUpdateBatchStatus($id);
         case 'listProfiles':      requirePermission('spes','Viewer'); return spesListProfiles();
         case 'getProfile':        requirePermission('spes','Viewer'); return spesGetProfile($id);
         case 'createProfile':     requirePermission('spes','Editor'); return spesCreateProfile();
@@ -283,7 +283,7 @@ function spesDeleteBatch($id) {
         error("Cannot delete: {$cnt} applicant" . ($cnt === 1 ? '' : 's') . " linked to this batch (current or past assignees).", 409);
     }
 
-    $docs = db()->prepare("SELECT file_path FROM documents WHERE spes_batch_id=:id");
+    $docs = db()->prepare("SELECT file_path FROM attached_documents WHERE spes_batch_id=:id");
     $docs->execute([':id' => $id]);
     foreach ($docs->fetchAll(PDO::FETCH_COLUMN) as $path) {
         $abs = __DIR__ . '/../' . $path;
@@ -669,18 +669,18 @@ function spesSyncDocuments($pdo, $bid, $bsId, $uid, $d) {
         }
     }
 
-    $sel = $pdo->prepare("SELECT document_id, file_path FROM documents WHERE beneficiary_id=:bid AND document_source='SPES'");
+    $sel = $pdo->prepare("SELECT document_id, file_path FROM attached_documents WHERE beneficiary_id=:bid AND document_source='SPES'");
     $sel->execute([':bid' => $bid]);
     foreach ($sel->fetchAll() as $row) {
         if (!in_array((int) $row['document_id'], $keep, true)) {
             $abs = __DIR__ . '/../' . $row['file_path'];
             if (is_file($abs)) @unlink($abs);
-            $pdo->prepare("DELETE FROM documents WHERE document_id=:id")->execute([':id' => (int) $row['document_id']]);
+            $pdo->prepare("DELETE FROM attached_documents WHERE document_id=:id")->execute([':id' => (int) $row['document_id']]);
         }
     }
 
     $ins = $pdo->prepare(
-        "INSERT INTO documents(beneficiary_id,beneficiary_service_id,document_source,document_type,title,file_name,file_path,file_size,mime_type,uploaded_by)
+        "INSERT INTO attached_documents(beneficiary_id,beneficiary_service_id,document_source,document_type,title,file_name,file_path,file_size,mime_type,uploaded_by)
          VALUES(:bid,:bsid,'SPES',:dtype,:title,:fname,:fpath,:size,:mime,:uid)"
     );
     foreach ($docs as $doc) {
@@ -708,7 +708,7 @@ function spesSyncDocuments($pdo, $bid, $bsId, $uid, $d) {
 function spesFetchSavedDocuments($bid) {
     $s = db()->prepare(
         "SELECT document_id, document_type, title, file_name, file_path, file_size
-         FROM documents WHERE beneficiary_id=:bid AND document_source='SPES' ORDER BY document_id"
+         FROM attached_documents WHERE beneficiary_id=:bid AND document_source='SPES' ORDER BY document_id"
     );
     $s->execute([':bid' => $bid]);
     return array_map(function ($r) {
@@ -739,18 +739,18 @@ function spesSyncBatchDocuments($pdo, $batchId, $uid, $docsPayload) {
         }
     }
 
-    $sel = $pdo->prepare("SELECT document_id, file_path FROM documents WHERE spes_batch_id=:bid");
+    $sel = $pdo->prepare("SELECT document_id, file_path FROM attached_documents WHERE spes_batch_id=:bid");
     $sel->execute([':bid' => $batchId]);
     foreach ($sel->fetchAll() as $row) {
         if (!in_array((int) $row['document_id'], $keep, true)) {
             $abs = __DIR__ . '/../' . $row['file_path'];
             if (is_file($abs)) @unlink($abs);
-            $pdo->prepare("DELETE FROM documents WHERE document_id=:id")->execute([':id' => (int) $row['document_id']]);
+            $pdo->prepare("DELETE FROM attached_documents WHERE document_id=:id")->execute([':id' => (int) $row['document_id']]);
         }
     }
 
     $ins = $pdo->prepare(
-        "INSERT INTO documents(spes_batch_id,document_source,document_type,title,file_name,file_path,file_size,mime_type,uploaded_by)
+        "INSERT INTO attached_documents(spes_batch_id,document_source,document_type,title,file_name,file_path,file_size,mime_type,uploaded_by)
          VALUES(:bid,'SPES Batch',NULL,:title,:fname,:fpath,:size,:mime,:uid)"
     );
     foreach ($docs as $doc) {
@@ -775,7 +775,7 @@ function spesSyncBatchDocuments($pdo, $batchId, $uid, $docsPayload) {
 function spesFetchBatchDocuments($batchId) {
     $s = db()->prepare(
         "SELECT document_id, file_name, file_path, file_size
-         FROM documents WHERE spes_batch_id=:bid ORDER BY document_id"
+         FROM attached_documents WHERE spes_batch_id=:bid ORDER BY document_id"
     );
     $s->execute([':bid' => $batchId]);
     return array_map(function ($r) {
@@ -880,13 +880,13 @@ function spesHardDeleteApplicant($bid) {
             $pdo->prepare("DELETE FROM spes_profiles WHERE beneficiary_service_id = :id")->execute([':id' => (int) $bsId]);
         }
 
-        $docs = $pdo->prepare("SELECT file_path FROM documents WHERE beneficiary_id = :id AND document_source = 'SPES'");
+        $docs = $pdo->prepare("SELECT file_path FROM attached_documents WHERE beneficiary_id = :id AND document_source = 'SPES'");
         $docs->execute([':id' => $bid]);
         foreach ($docs->fetchAll(PDO::FETCH_COLUMN) as $path) {
             $abs = __DIR__ . '/../' . $path;
             if (is_file($abs)) @unlink($abs);
         }
-        $pdo->prepare("DELETE FROM documents WHERE beneficiary_id = :id AND document_source = 'SPES'")->execute([':id' => $bid]);
+        $pdo->prepare("DELETE FROM attached_documents WHERE beneficiary_id = :id AND document_source = 'SPES'")->execute([':id' => $bid]);
         $pdo->prepare("DELETE FROM beneficiary_classifications WHERE beneficiary_id = :id")->execute([':id' => $bid]);
         $pdo->prepare("DELETE FROM beneficiary_services WHERE beneficiary_id = :id")->execute([':id' => $bid]);
         $pdo->prepare("DELETE FROM beneficiaries WHERE beneficiary_id = :id")->execute([':id' => $bid]);

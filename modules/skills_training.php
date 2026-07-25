@@ -26,20 +26,20 @@ include_once __DIR__ . '/../core/guard.php';
 function handle($action, $id, $method)
 {
     switch ($action) {
-        case 'listBatches':              requirePermission('skills','Viewer'); return stListBatches();
-        case 'createBatch':              requirePermission('skills','Editor'); return stCreateBatch();
-        case 'deleteBatch':              requirePermission('skills','Editor'); return stDeleteBatch($id);
+        case 'listBatches':              requirePermission('skills-maintenance','Viewer'); return stListBatches();
+        case 'createBatch':              requirePermission('skills-maintenance','Editor'); return stCreateBatch();
+        case 'deleteBatch':              requirePermission('skills-maintenance','Editor'); return stDeleteBatch($id);
 
-        case 'listActivities':           requirePermission('skills','Viewer'); return stListActivities();
-        case 'createActivity':           requirePermission('skills','Editor'); return stCreateActivity();
-        case 'updateActivity':           requirePermission('skills','Editor'); return stUpdateActivity($id);
-        case 'updateActivityStatus':     requirePermission('skills','Editor'); return stUpdateActivityStatus($id);
-        case 'deleteActivity':           requirePermission('skills','Editor'); return stDeleteActivity($id);
+        case 'listActivities':           requirePermission('skills-maintenance','Viewer'); return stListActivities();
+        case 'createActivity':           requirePermission('skills-maintenance','Editor'); return stCreateActivity();
+        case 'updateActivity':           requirePermission('skills-maintenance','Editor'); return stUpdateActivity($id);
+        case 'updateActivityStatus':     requirePermission('skills-maintenance','Editor'); return stUpdateActivityStatus($id);
+        case 'deleteActivity':           requirePermission('skills-maintenance','Editor'); return stDeleteActivity($id);
 
-        case 'listActivityParticipants': requirePermission('skills','Viewer'); return stListActivityParticipants($id);
-        case 'addParticipant':           requirePermission('skills','Editor'); return stAddParticipant();
-        case 'removeParticipant':        requirePermission('skills','Editor'); return stRemoveParticipant();
-        case 'updateAttendance':         requirePermission('skills','Editor'); return stUpdateAttendance();
+        case 'listActivityParticipants': requirePermission('skills-maintenance','Viewer'); return stListActivityParticipants($id);
+        case 'addParticipant':           requirePermission('skills-maintenance','Editor'); return stAddParticipant();
+        case 'removeParticipant':        requirePermission('skills-maintenance','Editor'); return stRemoveParticipant();
+        case 'updateAttendance':         requirePermission('skills-maintenance','Editor'); return stUpdateAttendance();
 
         case 'listQualifications':       requirePermission('skills','Viewer'); return stListQualifications();
         case 'listPurposes':             requirePermission('skills','Viewer'); return stListPurposes();
@@ -393,18 +393,18 @@ function stSyncDocuments($pdo, $bid, $bsId, $uid, $d) {
         }
     }
 
-    $sel = $pdo->prepare("SELECT document_id, file_path FROM documents WHERE beneficiary_id=:bid AND document_source='Skills Training'");
+    $sel = $pdo->prepare("SELECT document_id, file_path FROM attached_documents WHERE beneficiary_id=:bid AND document_source='Skills Training'");
     $sel->execute([':bid' => $bid]);
     foreach ($sel->fetchAll() as $row) {
         if (!in_array((int) $row['document_id'], $keep, true)) {
             $abs = __DIR__ . '/../' . $row['file_path'];
             if (is_file($abs)) @unlink($abs);
-            $pdo->prepare("DELETE FROM documents WHERE document_id=:id")->execute([':id' => (int) $row['document_id']]);
+            $pdo->prepare("DELETE FROM attached_documents WHERE document_id=:id")->execute([':id' => (int) $row['document_id']]);
         }
     }
 
     $ins = $pdo->prepare(
-        "INSERT INTO documents(beneficiary_id,beneficiary_service_id,document_source,document_type,title,file_name,file_path,file_size,mime_type,uploaded_by)
+        "INSERT INTO attached_documents(beneficiary_id,beneficiary_service_id,document_source,document_type,title,file_name,file_path,file_size,mime_type,uploaded_by)
          VALUES(:bid,:bsid,'Skills Training',:dtype,:title,:fname,:fpath,:size,:mime,:uid)"
     );
     foreach ($docs as $doc) {
@@ -432,7 +432,7 @@ function stSyncDocuments($pdo, $bid, $bsId, $uid, $d) {
 function stFetchSavedDocuments($bid) {
     $s = db()->prepare(
         "SELECT document_id, document_type, title, file_name, file_path, file_size
-         FROM documents WHERE beneficiary_id=:bid AND document_source='Skills Training' ORDER BY document_id"
+         FROM attached_documents WHERE beneficiary_id=:bid AND document_source='Skills Training' ORDER BY document_id"
     );
     $s->execute([':bid' => $bid]);
     return array_map(function ($r) {
@@ -852,13 +852,13 @@ function stHardDeleteApplicant($bid) {
             $pdo->prepare("DELETE FROM skills_training_profiles WHERE beneficiary_service_id = :id")->execute([':id' => $bsId]);
         }
 
-        $docs = $pdo->prepare("SELECT file_path FROM documents WHERE beneficiary_id = :id AND document_source = 'Skills Training'");
+        $docs = $pdo->prepare("SELECT file_path FROM attached_documents WHERE beneficiary_id = :id AND document_source = 'Skills Training'");
         $docs->execute([':id' => $bid]);
         foreach ($docs->fetchAll(PDO::FETCH_COLUMN) as $path) {
             $abs = __DIR__ . '/../' . $path;
             if (is_file($abs)) @unlink($abs);
         }
-        $pdo->prepare("DELETE FROM documents WHERE beneficiary_id = :id AND document_source = 'Skills Training'")->execute([':id' => $bid]);
+        $pdo->prepare("DELETE FROM attached_documents WHERE beneficiary_id = :id AND document_source = 'Skills Training'")->execute([':id' => $bid]);
         $pdo->prepare("DELETE FROM beneficiary_classifications WHERE beneficiary_id = :id")->execute([':id' => $bid]);
         // Matches cdsp.php/gip.php/employment.php's hard-delete exactly: unscoped
         // deletes of beneficiary_services/beneficiaries, not just this module's rows.

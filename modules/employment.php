@@ -470,13 +470,13 @@ function employmentSavePhoto($pdo, $bid, $bsId, $uid, $d)
 // Remove a beneficiary's 2x2 photo document(s) and their files.
 function employmentDeletePhotos($pdo, $bid)
 {
-    $sel = $pdo->prepare("SELECT file_path FROM documents WHERE beneficiary_id = :bid AND document_type = '2x2 ID Picture'");
+    $sel = $pdo->prepare("SELECT file_path FROM attached_documents WHERE beneficiary_id = :bid AND document_type = '2x2 ID Picture'");
     $sel->execute([':bid' => $bid]);
     foreach ($sel->fetchAll(PDO::FETCH_COLUMN) as $path) {
         $abs = __DIR__ . '/../' . $path;
         if (is_file($abs)) @unlink($abs);
     }
-    $pdo->prepare("DELETE FROM documents WHERE beneficiary_id = :bid AND document_type = '2x2 ID Picture'")
+    $pdo->prepare("DELETE FROM attached_documents WHERE beneficiary_id = :bid AND document_type = '2x2 ID Picture'")
         ->execute([':bid' => $bid]);
 }
 
@@ -523,13 +523,13 @@ function employmentSyncDocuments($pdo, $bid, $bsId, $uid, $d)
     }
 
     // Remove non-photo docs that are no longer present (unlink file + delete row).
-    $sel = $pdo->prepare("SELECT document_id, file_path FROM documents WHERE beneficiary_id = :bid AND document_type IS DISTINCT FROM '2x2 ID Picture'");
+    $sel = $pdo->prepare("SELECT document_id, file_path FROM attached_documents WHERE beneficiary_id = :bid AND document_type IS DISTINCT FROM '2x2 ID Picture'");
     $sel->execute([':bid' => $bid]);
     foreach ($sel->fetchAll() as $row) {
         if (!in_array((int) $row['document_id'], $keep, true)) {
             $abs = __DIR__ . '/../' . $row['file_path'];
             if (is_file($abs)) @unlink($abs);
-            $pdo->prepare("DELETE FROM documents WHERE document_id = :id")->execute([':id' => (int) $row['document_id']]);
+            $pdo->prepare("DELETE FROM attached_documents WHERE document_id = :id")->execute([':id' => (int) $row['document_id']]);
         }
     }
 
@@ -572,7 +572,7 @@ function employmentSyncDocuments($pdo, $bid, $bsId, $uid, $d)
 // Unlink every stored file for a beneficiary's documents (used before deleting).
 function employmentUnlinkDocs($pdo, $bid)
 {
-    $sel = $pdo->prepare("SELECT file_path FROM documents WHERE beneficiary_id = :id");
+    $sel = $pdo->prepare("SELECT file_path FROM attached_documents WHERE beneficiary_id = :id");
     $sel->execute([':id' => $bid]);
     foreach ($sel->fetchAll(PDO::FETCH_COLUMN) as $path) {
         $abs = __DIR__ . '/../' . $path;
@@ -786,7 +786,7 @@ function employmentGetApplicantPhoto($id)
         error('Invalid applicant id.', 422);
     }
     $stmt = db()->prepare(
-        "SELECT file_path, mime_type FROM documents
+        "SELECT file_path, mime_type FROM attached_documents
          WHERE beneficiary_id = :id AND document_type = '2x2 ID Picture'
          ORDER BY document_id DESC LIMIT 1"
     );
@@ -875,7 +875,7 @@ function employmentBuildApplicant($bid)
     }
 
     // ── 2x2 photo document → public URL (so the form can display it) ──
-    $photo = db()->prepare("SELECT file_path FROM documents WHERE beneficiary_id = :id AND document_type = '2x2 ID Picture' ORDER BY document_id DESC LIMIT 1");
+    $photo = db()->prepare("SELECT file_path FROM attached_documents WHERE beneficiary_id = :id AND document_type = '2x2 ID Picture' ORDER BY document_id DESC LIMIT 1");
     $photo->execute([':id' => $bid]);
     $photoPath = $photo->fetchColumn();
     $profileImage = $photoPath ? efUploadBaseUrl() . $photoPath : '';
@@ -885,7 +885,7 @@ function employmentBuildApplicant($bid)
     // list where it was uploaded (it is also surfaced separately as profileImage).
     $docRows = db()->prepare(
         "SELECT document_id, document_type, title, file_name, file_path, file_size
-         FROM documents
+         FROM attached_documents
          WHERE beneficiary_id = :id
          ORDER BY document_id"
     );

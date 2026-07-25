@@ -7,11 +7,11 @@ include_once __DIR__ . '/../core/guard.php';
 function handle($action, $id, $method)
 {
     switch ($action) {
-        case 'listBatches':       requirePermission('gip','Viewer'); return gipListBatches();
-        case 'createBatch':       requirePermission('gip','Editor'); return gipCreateBatch();
-        case 'updateBatch':       requirePermission('gip','Editor'); return gipUpdateBatch($id);
-        case 'deleteBatch':       requirePermission('gip','Editor'); return gipDeleteBatch($id);
-        case 'updateBatchStatus': requirePermission('gip','Editor'); return gipUpdateBatchStatus($id);
+        case 'listBatches':       requirePermission('gip-maintenance','Viewer'); return gipListBatches();
+        case 'createBatch':       requirePermission('gip-maintenance','Editor'); return gipCreateBatch();
+        case 'updateBatch':       requirePermission('gip-maintenance','Editor'); return gipUpdateBatch($id);
+        case 'deleteBatch':       requirePermission('gip-maintenance','Editor'); return gipDeleteBatch($id);
+        case 'updateBatchStatus': requirePermission('gip-maintenance','Editor'); return gipUpdateBatchStatus($id);
         case 'listProfiles':      requirePermission('gip','Viewer'); return gipListProfiles();
         case 'getProfile':        requirePermission('gip','Viewer'); return gipGetProfile($id);
         case 'createProfile':     requirePermission('gip','Editor'); return gipCreateProfile();
@@ -324,7 +324,7 @@ function gipDeleteBatch($id) {
         error("Cannot delete: {$cnt} applicant" . ($cnt === 1 ? '' : 's') . " linked to this batch (current or past interns).", 409);
     }
 
-    $docs = db()->prepare("SELECT file_path FROM documents WHERE gip_batch_id=:id");
+    $docs = db()->prepare("SELECT file_path FROM attached_documents WHERE gip_batch_id=:id");
     $docs->execute([':id' => $id]);
     foreach ($docs->fetchAll(PDO::FETCH_COLUMN) as $path) {
         $abs = __DIR__ . '/../' . $path;
@@ -703,18 +703,18 @@ function gipSyncDocuments($pdo, $bid, $bsId, $uid, $d) {
         }
     }
 
-    $sel = $pdo->prepare("SELECT document_id, file_path FROM documents WHERE beneficiary_id=:bid AND document_source='GIP'");
+    $sel = $pdo->prepare("SELECT document_id, file_path FROM attached_documents WHERE beneficiary_id=:bid AND document_source='GIP'");
     $sel->execute([':bid' => $bid]);
     foreach ($sel->fetchAll() as $row) {
         if (!in_array((int) $row['document_id'], $keep, true)) {
             $abs = __DIR__ . '/../' . $row['file_path'];
             if (is_file($abs)) @unlink($abs);
-            $pdo->prepare("DELETE FROM documents WHERE document_id=:id")->execute([':id' => (int) $row['document_id']]);
+            $pdo->prepare("DELETE FROM attached_documents WHERE document_id=:id")->execute([':id' => (int) $row['document_id']]);
         }
     }
 
     $ins = $pdo->prepare(
-        "INSERT INTO documents(beneficiary_id,beneficiary_service_id,document_source,document_type,title,file_name,file_path,file_size,mime_type,uploaded_by)
+        "INSERT INTO attached_documents(beneficiary_id,beneficiary_service_id,document_source,document_type,title,file_name,file_path,file_size,mime_type,uploaded_by)
          VALUES(:bid,:bsid,'GIP',:dtype,:title,:fname,:fpath,:size,:mime,:uid)"
     );
     foreach ($docs as $doc) {
@@ -742,7 +742,7 @@ function gipSyncDocuments($pdo, $bid, $bsId, $uid, $d) {
 function gipFetchSavedDocuments($bid) {
     $s = db()->prepare(
         "SELECT document_id, document_type, title, file_name, file_path, file_size
-         FROM documents WHERE beneficiary_id=:bid AND document_source='GIP' ORDER BY document_id"
+         FROM attached_documents WHERE beneficiary_id=:bid AND document_source='GIP' ORDER BY document_id"
     );
     $s->execute([':bid' => $bid]);
     return array_map(function ($r) {
@@ -772,18 +772,18 @@ function gipSyncBatchDocuments($pdo, $batchId, $uid, $docsPayload) {
         }
     }
 
-    $sel = $pdo->prepare("SELECT document_id, file_path FROM documents WHERE gip_batch_id=:bid");
+    $sel = $pdo->prepare("SELECT document_id, file_path FROM attached_documents WHERE gip_batch_id=:bid");
     $sel->execute([':bid' => $batchId]);
     foreach ($sel->fetchAll() as $row) {
         if (!in_array((int) $row['document_id'], $keep, true)) {
             $abs = __DIR__ . '/../' . $row['file_path'];
             if (is_file($abs)) @unlink($abs);
-            $pdo->prepare("DELETE FROM documents WHERE document_id=:id")->execute([':id' => (int) $row['document_id']]);
+            $pdo->prepare("DELETE FROM attached_documents WHERE document_id=:id")->execute([':id' => (int) $row['document_id']]);
         }
     }
 
     $ins = $pdo->prepare(
-        "INSERT INTO documents(gip_batch_id,document_source,document_type,title,file_name,file_path,file_size,mime_type,uploaded_by)
+        "INSERT INTO attached_documents(gip_batch_id,document_source,document_type,title,file_name,file_path,file_size,mime_type,uploaded_by)
          VALUES(:bid,'GIP Batch',NULL,:title,:fname,:fpath,:size,:mime,:uid)"
     );
     foreach ($docs as $doc) {
@@ -808,7 +808,7 @@ function gipSyncBatchDocuments($pdo, $batchId, $uid, $docsPayload) {
 function gipFetchBatchDocuments($batchId) {
     $s = db()->prepare(
         "SELECT document_id, title, file_name, file_path, file_size
-         FROM documents WHERE gip_batch_id=:bid ORDER BY document_id"
+         FROM attached_documents WHERE gip_batch_id=:bid ORDER BY document_id"
     );
     $s->execute([':bid' => $batchId]);
     return array_map(function ($r) {
@@ -913,13 +913,13 @@ function gipHardDeleteApplicant($bid) {
             $pdo->prepare("DELETE FROM gip_profiles WHERE beneficiary_service_id = :id")->execute([':id' => (int) $bsId]);
         }
 
-        $docs = $pdo->prepare("SELECT file_path FROM documents WHERE beneficiary_id = :id AND document_source = 'GIP'");
+        $docs = $pdo->prepare("SELECT file_path FROM attached_documents WHERE beneficiary_id = :id AND document_source = 'GIP'");
         $docs->execute([':id' => $bid]);
         foreach ($docs->fetchAll(PDO::FETCH_COLUMN) as $path) {
             $abs = __DIR__ . '/../' . $path;
             if (is_file($abs)) @unlink($abs);
         }
-        $pdo->prepare("DELETE FROM documents WHERE beneficiary_id = :id AND document_source = 'GIP'")->execute([':id' => $bid]);
+        $pdo->prepare("DELETE FROM attached_documents WHERE beneficiary_id = :id AND document_source = 'GIP'")->execute([':id' => $bid]);
         $pdo->prepare("DELETE FROM beneficiary_classifications WHERE beneficiary_id = :id")->execute([':id' => $bid]);
         $pdo->prepare("DELETE FROM beneficiary_services WHERE beneficiary_id = :id")->execute([':id' => $bid]);
         $pdo->prepare("DELETE FROM beneficiaries WHERE beneficiary_id = :id")->execute([':id' => $bid]);

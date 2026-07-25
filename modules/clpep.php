@@ -22,11 +22,11 @@ include_once __DIR__ . '/../core/guard.php';
 function handle($action, $id, $method)
 {
     switch ($action) {
-        case 'listInterventions':        requirePermission('livelihood','Viewer'); return clpepListInterventions();
-        case 'createIntervention':       requirePermission('livelihood','Editor'); return clpepCreateIntervention();
-        case 'updateIntervention':       requirePermission('livelihood','Editor'); return clpepUpdateIntervention($id);
-        case 'deleteIntervention':       requirePermission('livelihood','Editor'); return clpepDeleteIntervention($id);
-        case 'updateInterventionStatus': requirePermission('livelihood','Editor'); return clpepUpdateInterventionStatus($id);
+        case 'listInterventions':        requirePermission('livelihood-maintenance','Viewer'); return clpepListInterventions();
+        case 'createIntervention':       requirePermission('livelihood-maintenance','Editor'); return clpepCreateIntervention();
+        case 'updateIntervention':       requirePermission('livelihood-maintenance','Editor'); return clpepUpdateIntervention($id);
+        case 'deleteIntervention':       requirePermission('livelihood-maintenance','Editor'); return clpepDeleteIntervention($id);
+        case 'updateInterventionStatus': requirePermission('livelihood-maintenance','Editor'); return clpepUpdateInterventionStatus($id);
         case 'listProfiles':             requirePermission('livelihood','Viewer'); return clpepListProfiles();
         case 'getProfile':               requirePermission('livelihood','Viewer'); return clpepGetProfile($id);
         case 'createProfile':            requirePermission('livelihood','Editor'); return clpepCreateProfile();
@@ -251,7 +251,7 @@ function clpepDeleteIntervention($id) {
         error("Cannot delete: {$cnt} " . ($cnt === 1 ? 'beneficiary' : 'beneficiaries') . " assigned to this intervention. Unassign them first.", 409);
     }
 
-    $docs = db()->prepare("SELECT file_path FROM documents WHERE clpep_intervention_id=:id");
+    $docs = db()->prepare("SELECT file_path FROM attached_documents WHERE clpep_intervention_id=:id");
     $docs->execute([':id' => $id]);
     foreach ($docs->fetchAll(PDO::FETCH_COLUMN) as $path) {
         $abs = __DIR__ . '/../' . $path;
@@ -651,18 +651,18 @@ function clpepSyncDocuments($pdo, $bid, $bsId, $uid, $d) {
         }
     }
 
-    $sel = $pdo->prepare("SELECT document_id, file_path FROM documents WHERE beneficiary_id=:bid AND document_source='CLPEP'");
+    $sel = $pdo->prepare("SELECT document_id, file_path FROM attached_documents WHERE beneficiary_id=:bid AND document_source='CLPEP'");
     $sel->execute([':bid' => $bid]);
     foreach ($sel->fetchAll() as $row) {
         if (!in_array((int) $row['document_id'], $keep, true)) {
             $abs = __DIR__ . '/../' . $row['file_path'];
             if (is_file($abs)) @unlink($abs);
-            $pdo->prepare("DELETE FROM documents WHERE document_id=:id")->execute([':id' => (int) $row['document_id']]);
+            $pdo->prepare("DELETE FROM attached_documents WHERE document_id=:id")->execute([':id' => (int) $row['document_id']]);
         }
     }
 
     $ins = $pdo->prepare(
-        "INSERT INTO documents(beneficiary_id,beneficiary_service_id,document_source,title,file_name,file_path,file_size,mime_type,uploaded_by)
+        "INSERT INTO attached_documents(beneficiary_id,beneficiary_service_id,document_source,title,file_name,file_path,file_size,mime_type,uploaded_by)
          VALUES(:bid,:bsid,'CLPEP',:title,:fname,:fpath,:size,:mime,:uid)"
     );
     foreach ($docs as $doc) {
@@ -687,7 +687,7 @@ function clpepSyncDocuments($pdo, $bid, $bsId, $uid, $d) {
 function clpepFetchSavedDocuments($bid) {
     $s = db()->prepare(
         "SELECT document_id, file_name, file_path, file_size
-         FROM documents WHERE beneficiary_id=:bid AND document_source='CLPEP' ORDER BY document_id"
+         FROM attached_documents WHERE beneficiary_id=:bid AND document_source='CLPEP' ORDER BY document_id"
     );
     $s->execute([':bid' => $bid]);
     return array_map(function ($r) {
@@ -713,18 +713,18 @@ function clpepSyncInterventionDocuments($pdo, $interventionId, $uid, $docsPayloa
         }
     }
 
-    $sel = $pdo->prepare("SELECT document_id, file_path FROM documents WHERE clpep_intervention_id=:iid");
+    $sel = $pdo->prepare("SELECT document_id, file_path FROM attached_documents WHERE clpep_intervention_id=:iid");
     $sel->execute([':iid' => $interventionId]);
     foreach ($sel->fetchAll() as $row) {
         if (!in_array((int) $row['document_id'], $keep, true)) {
             $abs = __DIR__ . '/../' . $row['file_path'];
             if (is_file($abs)) @unlink($abs);
-            $pdo->prepare("DELETE FROM documents WHERE document_id=:id")->execute([':id' => (int) $row['document_id']]);
+            $pdo->prepare("DELETE FROM attached_documents WHERE document_id=:id")->execute([':id' => (int) $row['document_id']]);
         }
     }
 
     $ins = $pdo->prepare(
-        "INSERT INTO documents(clpep_intervention_id,document_source,title,file_name,file_path,file_size,mime_type,uploaded_by)
+        "INSERT INTO attached_documents(clpep_intervention_id,document_source,title,file_name,file_path,file_size,mime_type,uploaded_by)
          VALUES(:iid,'CLPEP Intervention',:title,:fname,:fpath,:size,:mime,:uid)"
     );
     foreach ($docs as $doc) {
@@ -749,7 +749,7 @@ function clpepSyncInterventionDocuments($pdo, $interventionId, $uid, $docsPayloa
 function clpepFetchInterventionDocuments($interventionId) {
     $s = db()->prepare(
         "SELECT document_id, file_name, file_path, file_size, mime_type
-         FROM documents WHERE clpep_intervention_id=:iid ORDER BY document_id"
+         FROM attached_documents WHERE clpep_intervention_id=:iid ORDER BY document_id"
     );
     $s->execute([':iid' => $interventionId]);
     return array_map(function ($r) {
@@ -843,13 +843,13 @@ function clpepHardDeleteApplicant($bid) {
             $pdo->prepare("DELETE FROM clpep_profiles WHERE beneficiary_service_id = :id")->execute([':id' => (int) $bsId]);
         }
 
-        $docs = $pdo->prepare("SELECT file_path FROM documents WHERE beneficiary_id = :id AND document_source = 'CLPEP'");
+        $docs = $pdo->prepare("SELECT file_path FROM attached_documents WHERE beneficiary_id = :id AND document_source = 'CLPEP'");
         $docs->execute([':id' => $bid]);
         foreach ($docs->fetchAll(PDO::FETCH_COLUMN) as $path) {
             $abs = __DIR__ . '/../' . $path;
             if (is_file($abs)) @unlink($abs);
         }
-        $pdo->prepare("DELETE FROM documents WHERE beneficiary_id = :id AND document_source = 'CLPEP'")->execute([':id' => $bid]);
+        $pdo->prepare("DELETE FROM attached_documents WHERE beneficiary_id = :id AND document_source = 'CLPEP'")->execute([':id' => $bid]);
         $pdo->prepare("DELETE FROM beneficiary_services WHERE beneficiary_id = :id")->execute([':id' => $bid]);
         $pdo->prepare("DELETE FROM beneficiaries WHERE beneficiary_id = :id")->execute([':id' => $bid]);
 

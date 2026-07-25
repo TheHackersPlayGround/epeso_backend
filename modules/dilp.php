@@ -13,11 +13,11 @@ include_once __DIR__ . '/../core/guard.php';
 function handle($action, $id, $method)
 {
     switch ($action) {
-        case 'listProjects':        requirePermission('livelihood','Viewer'); return dilpListProjects();
-        case 'createProject':       requirePermission('livelihood','Editor'); return dilpCreateProject();
-        case 'updateProject':       requirePermission('livelihood','Editor'); return dilpUpdateProject($id);
-        case 'deleteProject':       requirePermission('livelihood','Editor'); return dilpDeleteProject($id);
-        case 'updateProjectStatus': requirePermission('livelihood','Editor'); return dilpUpdateProjectStatus($id);
+        case 'listProjects':        requirePermission('livelihood-maintenance','Viewer'); return dilpListProjects();
+        case 'createProject':       requirePermission('livelihood-maintenance','Editor'); return dilpCreateProject();
+        case 'updateProject':       requirePermission('livelihood-maintenance','Editor'); return dilpUpdateProject($id);
+        case 'deleteProject':       requirePermission('livelihood-maintenance','Editor'); return dilpDeleteProject($id);
+        case 'updateProjectStatus': requirePermission('livelihood-maintenance','Editor'); return dilpUpdateProjectStatus($id);
         case 'listProfiles':        requirePermission('livelihood','Viewer'); return dilpListProfiles();
         case 'getProfile':          requirePermission('livelihood','Viewer'); return dilpGetProfile($id);
         case 'createProfile':       requirePermission('livelihood','Editor'); return dilpCreateProfile();
@@ -277,7 +277,7 @@ function dilpDeleteProject($id) {
         error("Cannot delete: {$cnt} " . ($cnt === 1 ? 'beneficiary' : 'beneficiaries') . " assigned to this project. Unassign them first.", 409);
     }
 
-    $docs = db()->prepare("SELECT file_path FROM documents WHERE dilp_project_id=:id");
+    $docs = db()->prepare("SELECT file_path FROM attached_documents WHERE dilp_project_id=:id");
     $docs->execute([':id' => $id]);
     foreach ($docs->fetchAll(PDO::FETCH_COLUMN) as $path) {
         $abs = __DIR__ . '/../' . $path;
@@ -626,18 +626,18 @@ function dilpSyncDocuments($pdo, $bid, $bsId, $uid, $d) {
         }
     }
 
-    $sel = $pdo->prepare("SELECT document_id, file_path FROM documents WHERE beneficiary_id=:bid AND document_source='DILP'");
+    $sel = $pdo->prepare("SELECT document_id, file_path FROM attached_documents WHERE beneficiary_id=:bid AND document_source='DILP'");
     $sel->execute([':bid' => $bid]);
     foreach ($sel->fetchAll() as $row) {
         if (!in_array((int) $row['document_id'], $keep, true)) {
             $abs = __DIR__ . '/../' . $row['file_path'];
             if (is_file($abs)) @unlink($abs);
-            $pdo->prepare("DELETE FROM documents WHERE document_id=:id")->execute([':id' => (int) $row['document_id']]);
+            $pdo->prepare("DELETE FROM attached_documents WHERE document_id=:id")->execute([':id' => (int) $row['document_id']]);
         }
     }
 
     $ins = $pdo->prepare(
-        "INSERT INTO documents(beneficiary_id,beneficiary_service_id,document_source,document_type,title,file_name,file_path,file_size,mime_type,uploaded_by)
+        "INSERT INTO attached_documents(beneficiary_id,beneficiary_service_id,document_source,document_type,title,file_name,file_path,file_size,mime_type,uploaded_by)
          VALUES(:bid,:bsid,'DILP',:dtype,:title,:fname,:fpath,:size,:mime,:uid)"
     );
     foreach ($docs as $doc) {
@@ -665,7 +665,7 @@ function dilpSyncDocuments($pdo, $bid, $bsId, $uid, $d) {
 function dilpFetchSavedDocuments($bid) {
     $s = db()->prepare(
         "SELECT document_id, document_type, title, file_name, file_path, file_size
-         FROM documents WHERE beneficiary_id=:bid AND document_source='DILP' ORDER BY document_id"
+         FROM attached_documents WHERE beneficiary_id=:bid AND document_source='DILP' ORDER BY document_id"
     );
     $s->execute([':bid' => $bid]);
     return array_map(function ($r) {
@@ -693,18 +693,18 @@ function dilpSyncProjectDocuments($pdo, $projectId, $uid, $docsPayload) {
         }
     }
 
-    $sel = $pdo->prepare("SELECT document_id, file_path FROM documents WHERE dilp_project_id=:pid");
+    $sel = $pdo->prepare("SELECT document_id, file_path FROM attached_documents WHERE dilp_project_id=:pid");
     $sel->execute([':pid' => $projectId]);
     foreach ($sel->fetchAll() as $row) {
         if (!in_array((int) $row['document_id'], $keep, true)) {
             $abs = __DIR__ . '/../' . $row['file_path'];
             if (is_file($abs)) @unlink($abs);
-            $pdo->prepare("DELETE FROM documents WHERE document_id=:id")->execute([':id' => (int) $row['document_id']]);
+            $pdo->prepare("DELETE FROM attached_documents WHERE document_id=:id")->execute([':id' => (int) $row['document_id']]);
         }
     }
 
     $ins = $pdo->prepare(
-        "INSERT INTO documents(dilp_project_id,document_source,document_type,title,file_name,file_path,file_size,mime_type,uploaded_by)
+        "INSERT INTO attached_documents(dilp_project_id,document_source,document_type,title,file_name,file_path,file_size,mime_type,uploaded_by)
          VALUES(:pid,'DILP Project',NULL,:title,:fname,:fpath,:size,:mime,:uid)"
     );
     foreach ($docs as $doc) {
@@ -729,7 +729,7 @@ function dilpSyncProjectDocuments($pdo, $projectId, $uid, $docsPayload) {
 function dilpFetchProjectDocuments($projectId) {
     $s = db()->prepare(
         "SELECT document_id, file_name, file_path, file_size
-         FROM documents WHERE dilp_project_id=:pid ORDER BY document_id"
+         FROM attached_documents WHERE dilp_project_id=:pid ORDER BY document_id"
     );
     $s->execute([':pid' => $projectId]);
     return array_map(function ($r) {
@@ -822,13 +822,13 @@ function dilpHardDeleteApplicant($bid) {
             $pdo->prepare("DELETE FROM dilp_project_beneficiaries WHERE beneficiary_service_id = :id")->execute([':id' => (int) $bsId]);
         }
 
-        $docs = $pdo->prepare("SELECT file_path FROM documents WHERE beneficiary_id = :id AND document_source = 'DILP'");
+        $docs = $pdo->prepare("SELECT file_path FROM attached_documents WHERE beneficiary_id = :id AND document_source = 'DILP'");
         $docs->execute([':id' => $bid]);
         foreach ($docs->fetchAll(PDO::FETCH_COLUMN) as $path) {
             $abs = __DIR__ . '/../' . $path;
             if (is_file($abs)) @unlink($abs);
         }
-        $pdo->prepare("DELETE FROM documents WHERE beneficiary_id = :id AND document_source = 'DILP'")->execute([':id' => $bid]);
+        $pdo->prepare("DELETE FROM attached_documents WHERE beneficiary_id = :id AND document_source = 'DILP'")->execute([':id' => $bid]);
         $pdo->prepare("DELETE FROM beneficiary_classifications WHERE beneficiary_id = :id")->execute([':id' => $bid]);
         $pdo->prepare("DELETE FROM beneficiary_services WHERE beneficiary_id = :id")->execute([':id' => $bid]);
         $pdo->prepare("DELETE FROM beneficiaries WHERE beneficiary_id = :id")->execute([':id' => $bid]);

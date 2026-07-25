@@ -7,18 +7,18 @@ include_once __DIR__ . '/../core/guard.php';
 function handle($action, $id, $method)
 {
     switch ($action) {
-        case 'listServices':             requirePermission('cdsp','Viewer'); return cdspListServices();
-        case 'createService':            requirePermission('cdsp','Editor'); return cdspCreateService();
-        case 'deleteService':            requirePermission('cdsp','Editor'); return cdspDeleteService($id);
-        case 'listActivities':           requirePermission('cdsp','Viewer'); return cdspListActivities();
-        case 'createActivity':           requirePermission('cdsp','Editor'); return cdspCreateActivity();
-        case 'updateActivity':           requirePermission('cdsp','Editor'); return cdspUpdateActivity($id);
-        case 'updateActivityStatus':     requirePermission('cdsp','Editor'); return cdspUpdateActivityStatus($id);
-        case 'deleteActivity':           requirePermission('cdsp','Editor'); return cdspDeleteActivity($id);
-        case 'listActivityParticipants': requirePermission('cdsp','Viewer'); return cdspListActivityParticipants($id);
-        case 'addParticipant':           requirePermission('cdsp','Editor'); return cdspAddParticipant();
-        case 'removeParticipant':        requirePermission('cdsp','Editor'); return cdspRemoveParticipant();
-        case 'updateAttendance':         requirePermission('cdsp','Editor'); return cdspUpdateAttendance();
+        case 'listServices':             requirePermission('cdsp-maintenance','Viewer'); return cdspListServices();
+        case 'createService':            requirePermission('cdsp-maintenance','Editor'); return cdspCreateService();
+        case 'deleteService':            requirePermission('cdsp-maintenance','Editor'); return cdspDeleteService($id);
+        case 'listActivities':           requirePermission('cdsp-maintenance','Viewer'); return cdspListActivities();
+        case 'createActivity':           requirePermission('cdsp-maintenance','Editor'); return cdspCreateActivity();
+        case 'updateActivity':           requirePermission('cdsp-maintenance','Editor'); return cdspUpdateActivity($id);
+        case 'updateActivityStatus':     requirePermission('cdsp-maintenance','Editor'); return cdspUpdateActivityStatus($id);
+        case 'deleteActivity':           requirePermission('cdsp-maintenance','Editor'); return cdspDeleteActivity($id);
+        case 'listActivityParticipants': requirePermission('cdsp-maintenance','Viewer'); return cdspListActivityParticipants($id);
+        case 'addParticipant':           requirePermission('cdsp-maintenance','Editor'); return cdspAddParticipant();
+        case 'removeParticipant':        requirePermission('cdsp-maintenance','Editor'); return cdspRemoveParticipant();
+        case 'updateAttendance':         requirePermission('cdsp-maintenance','Editor'); return cdspUpdateAttendance();
         case 'listProfiles':             requirePermission('cdsp','Viewer'); return cdspListProfiles();
         case 'getProfile':               requirePermission('cdsp','Viewer'); return cdspGetProfile($id);
         case 'createProfile':            requirePermission('cdsp','Editor'); return cdspCreateProfile();
@@ -154,18 +154,18 @@ function cdspSyncDocuments($pdo, $bid, $bsId, $uid, $d) {
         }
     }
 
-    $sel = $pdo->prepare("SELECT document_id, file_path FROM documents WHERE beneficiary_id=:bid AND document_source='CDSP'");
+    $sel = $pdo->prepare("SELECT document_id, file_path FROM attached_documents WHERE beneficiary_id=:bid AND document_source='CDSP'");
     $sel->execute([':bid' => $bid]);
     foreach ($sel->fetchAll() as $row) {
         if (!in_array((int) $row['document_id'], $keep, true)) {
             $abs = __DIR__ . '/../' . $row['file_path'];
             if (is_file($abs)) @unlink($abs);
-            $pdo->prepare("DELETE FROM documents WHERE document_id=:id")->execute([':id' => (int) $row['document_id']]);
+            $pdo->prepare("DELETE FROM attached_documents WHERE document_id=:id")->execute([':id' => (int) $row['document_id']]);
         }
     }
 
     $ins = $pdo->prepare(
-        "INSERT INTO documents(beneficiary_id,beneficiary_service_id,document_source,document_type,title,file_name,file_path,file_size,mime_type,uploaded_by)
+        "INSERT INTO attached_documents(beneficiary_id,beneficiary_service_id,document_source,document_type,title,file_name,file_path,file_size,mime_type,uploaded_by)
          VALUES(:bid,:bsid,'CDSP',:dtype,:title,:fname,:fpath,:size,:mime,:uid)"
     );
     foreach ($docs as $doc) {
@@ -193,7 +193,7 @@ function cdspSyncDocuments($pdo, $bid, $bsId, $uid, $d) {
 function cdspFetchSavedDocuments($bid) {
     $s = db()->prepare(
         "SELECT document_id, document_type, title, file_name, file_path, file_size
-         FROM documents WHERE beneficiary_id=:bid AND document_source='CDSP' ORDER BY document_id"
+         FROM attached_documents WHERE beneficiary_id=:bid AND document_source='CDSP' ORDER BY document_id"
     );
     $s->execute([':bid' => $bid]);
     return array_map(function ($r) {
@@ -701,7 +701,7 @@ function cdspUpdateProfile($id) {
     // Block a service change once the beneficiary has ANY activity
     // participation history under their CURRENT service - Planned, Ongoing,
     // or Completed. beneficiary_service_id is a shared anchor referenced by
-    // cdsp_profiles, documents, and every other module's profile table, so
+    // cdsp_profiles, attached_documents, and every other module's profile table, so
     // it represents a specific enrollment event, not a casually-editable
     // field - swapping the service out from under it would retroactively
     // rewrite what all of that linked history appears to belong to. Same
@@ -902,13 +902,13 @@ function cdspHardDeleteApplicant($bid) {
             $pdo->prepare("DELETE FROM cdsp_profiles WHERE beneficiary_service_id = :id")->execute([':id' => (int) $bsId]);
         }
 
-        $docs = $pdo->prepare("SELECT file_path FROM documents WHERE beneficiary_id = :id AND document_source = 'CDSP'");
+        $docs = $pdo->prepare("SELECT file_path FROM attached_documents WHERE beneficiary_id = :id AND document_source = 'CDSP'");
         $docs->execute([':id' => $bid]);
         foreach ($docs->fetchAll(PDO::FETCH_COLUMN) as $path) {
             $abs = __DIR__ . '/../' . $path;
             if (is_file($abs)) @unlink($abs);
         }
-        $pdo->prepare("DELETE FROM documents WHERE beneficiary_id = :id AND document_source = 'CDSP'")->execute([':id' => $bid]);
+        $pdo->prepare("DELETE FROM attached_documents WHERE beneficiary_id = :id AND document_source = 'CDSP'")->execute([':id' => $bid]);
         $pdo->prepare("DELETE FROM beneficiary_classifications WHERE beneficiary_id = :id")->execute([':id' => $bid]);
         $pdo->prepare("DELETE FROM beneficiary_services WHERE beneficiary_id = :id")->execute([':id' => $bid]);
         $pdo->prepare("DELETE FROM beneficiaries WHERE beneficiary_id = :id")->execute([':id' => $bid]);

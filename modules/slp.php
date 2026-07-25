@@ -25,11 +25,11 @@ include_once __DIR__ . '/../core/guard.php';
 function handle($action, $id, $method)
 {
     switch ($action) {
-        case 'listProjects':        requirePermission('livelihood','Viewer'); return slpListProjects();
-        case 'createProject':       requirePermission('livelihood','Editor'); return slpCreateProject();
-        case 'updateProject':       requirePermission('livelihood','Editor'); return slpUpdateProject($id);
-        case 'deleteProject':       requirePermission('livelihood','Editor'); return slpDeleteProject($id);
-        case 'updateProjectStatus': requirePermission('livelihood','Editor'); return slpUpdateProjectStatus($id);
+        case 'listProjects':        requirePermission('livelihood-maintenance','Viewer'); return slpListProjects();
+        case 'createProject':       requirePermission('livelihood-maintenance','Editor'); return slpCreateProject();
+        case 'updateProject':       requirePermission('livelihood-maintenance','Editor'); return slpUpdateProject($id);
+        case 'deleteProject':       requirePermission('livelihood-maintenance','Editor'); return slpDeleteProject($id);
+        case 'updateProjectStatus': requirePermission('livelihood-maintenance','Editor'); return slpUpdateProjectStatus($id);
         case 'listProfiles':        requirePermission('livelihood','Viewer'); return slpListProfiles();
         case 'getProfile':          requirePermission('livelihood','Viewer'); return slpGetProfile($id);
         case 'createProfile':       requirePermission('livelihood','Editor'); return slpCreateProfile();
@@ -269,7 +269,7 @@ function slpDeleteProject($id) {
         error("Cannot delete: {$cnt} " . ($cnt === 1 ? 'beneficiary' : 'beneficiaries') . " assigned to this project. Unassign them first.", 409);
     }
 
-    $docs = db()->prepare("SELECT file_path FROM documents WHERE slp_project_id=:id");
+    $docs = db()->prepare("SELECT file_path FROM attached_documents WHERE slp_project_id=:id");
     $docs->execute([':id' => $id]);
     foreach ($docs->fetchAll(PDO::FETCH_COLUMN) as $path) {
         $abs = __DIR__ . '/../' . $path;
@@ -738,18 +738,18 @@ function slpSyncDocuments($pdo, $bid, $bsId, $uid, $d) {
         }
     }
 
-    $sel = $pdo->prepare("SELECT document_id, file_path FROM documents WHERE beneficiary_id=:bid AND document_source='SLP'");
+    $sel = $pdo->prepare("SELECT document_id, file_path FROM attached_documents WHERE beneficiary_id=:bid AND document_source='SLP'");
     $sel->execute([':bid' => $bid]);
     foreach ($sel->fetchAll() as $row) {
         if (!in_array((int) $row['document_id'], $keep, true)) {
             $abs = __DIR__ . '/../' . $row['file_path'];
             if (is_file($abs)) @unlink($abs);
-            $pdo->prepare("DELETE FROM documents WHERE document_id=:id")->execute([':id' => (int) $row['document_id']]);
+            $pdo->prepare("DELETE FROM attached_documents WHERE document_id=:id")->execute([':id' => (int) $row['document_id']]);
         }
     }
 
     $ins = $pdo->prepare(
-        "INSERT INTO documents(beneficiary_id,beneficiary_service_id,document_source,title,file_name,file_path,file_size,mime_type,uploaded_by)
+        "INSERT INTO attached_documents(beneficiary_id,beneficiary_service_id,document_source,title,file_name,file_path,file_size,mime_type,uploaded_by)
          VALUES(:bid,:bsid,'SLP',:title,:fname,:fpath,:size,:mime,:uid)"
     );
     foreach ($docs as $doc) {
@@ -774,7 +774,7 @@ function slpSyncDocuments($pdo, $bid, $bsId, $uid, $d) {
 function slpFetchSavedDocuments($bid) {
     $s = db()->prepare(
         "SELECT document_id, file_name, file_path, file_size
-         FROM documents WHERE beneficiary_id=:bid AND document_source='SLP' ORDER BY document_id"
+         FROM attached_documents WHERE beneficiary_id=:bid AND document_source='SLP' ORDER BY document_id"
     );
     $s->execute([':bid' => $bid]);
     return array_map(function ($r) {
@@ -800,18 +800,18 @@ function slpSyncProjectDocuments($pdo, $projectId, $uid, $docsPayload) {
         }
     }
 
-    $sel = $pdo->prepare("SELECT document_id, file_path FROM documents WHERE slp_project_id=:pid");
+    $sel = $pdo->prepare("SELECT document_id, file_path FROM attached_documents WHERE slp_project_id=:pid");
     $sel->execute([':pid' => $projectId]);
     foreach ($sel->fetchAll() as $row) {
         if (!in_array((int) $row['document_id'], $keep, true)) {
             $abs = __DIR__ . '/../' . $row['file_path'];
             if (is_file($abs)) @unlink($abs);
-            $pdo->prepare("DELETE FROM documents WHERE document_id=:id")->execute([':id' => (int) $row['document_id']]);
+            $pdo->prepare("DELETE FROM attached_documents WHERE document_id=:id")->execute([':id' => (int) $row['document_id']]);
         }
     }
 
     $ins = $pdo->prepare(
-        "INSERT INTO documents(slp_project_id,document_source,title,file_name,file_path,file_size,mime_type,uploaded_by)
+        "INSERT INTO attached_documents(slp_project_id,document_source,title,file_name,file_path,file_size,mime_type,uploaded_by)
          VALUES(:pid,'SLP Project',:title,:fname,:fpath,:size,:mime,:uid)"
     );
     foreach ($docs as $doc) {
@@ -836,7 +836,7 @@ function slpSyncProjectDocuments($pdo, $projectId, $uid, $docsPayload) {
 function slpFetchProjectDocuments($projectId) {
     $s = db()->prepare(
         "SELECT document_id, file_name, file_path, file_size, mime_type
-         FROM documents WHERE slp_project_id=:pid ORDER BY document_id"
+         FROM attached_documents WHERE slp_project_id=:pid ORDER BY document_id"
     );
     $s->execute([':pid' => $projectId]);
     return array_map(function ($r) {
@@ -930,13 +930,13 @@ function slpHardDeleteApplicant($bid) {
             $pdo->prepare("DELETE FROM slp_profiles WHERE beneficiary_service_id = :id")->execute([':id' => (int) $bsId]);
         }
 
-        $docs = $pdo->prepare("SELECT file_path FROM documents WHERE beneficiary_id = :id AND document_source = 'SLP'");
+        $docs = $pdo->prepare("SELECT file_path FROM attached_documents WHERE beneficiary_id = :id AND document_source = 'SLP'");
         $docs->execute([':id' => $bid]);
         foreach ($docs->fetchAll(PDO::FETCH_COLUMN) as $path) {
             $abs = __DIR__ . '/../' . $path;
             if (is_file($abs)) @unlink($abs);
         }
-        $pdo->prepare("DELETE FROM documents WHERE beneficiary_id = :id AND document_source = 'SLP'")->execute([':id' => $bid]);
+        $pdo->prepare("DELETE FROM attached_documents WHERE beneficiary_id = :id AND document_source = 'SLP'")->execute([':id' => $bid]);
         $pdo->prepare("DELETE FROM beneficiary_classifications WHERE beneficiary_id = :id")->execute([':id' => $bid]);
         $pdo->prepare("DELETE FROM disabilities WHERE beneficiary_id = :id")->execute([':id' => $bid]);
         $pdo->prepare("DELETE FROM beneficiary_services WHERE beneficiary_id = :id")->execute([':id' => $bid]);

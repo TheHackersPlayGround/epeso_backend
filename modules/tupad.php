@@ -20,11 +20,11 @@ include_once __DIR__ . '/../core/guard.php';
 function handle($action, $id, $method)
 {
     switch ($action) {
-        case 'listProjects':        requirePermission('livelihood','Viewer'); return tupadListProjects();
-        case 'createProject':       requirePermission('livelihood','Editor'); return tupadCreateProject();
-        case 'updateProject':       requirePermission('livelihood','Editor'); return tupadUpdateProject($id);
-        case 'deleteProject':       requirePermission('livelihood','Editor'); return tupadDeleteProject($id);
-        case 'updateProjectStatus': requirePermission('livelihood','Editor'); return tupadUpdateProjectStatus($id);
+        case 'listProjects':        requirePermission('livelihood-maintenance','Viewer'); return tupadListProjects();
+        case 'createProject':       requirePermission('livelihood-maintenance','Editor'); return tupadCreateProject();
+        case 'updateProject':       requirePermission('livelihood-maintenance','Editor'); return tupadUpdateProject($id);
+        case 'deleteProject':       requirePermission('livelihood-maintenance','Editor'); return tupadDeleteProject($id);
+        case 'updateProjectStatus': requirePermission('livelihood-maintenance','Editor'); return tupadUpdateProjectStatus($id);
         case 'listProfiles':        requirePermission('livelihood','Viewer'); return tupadListProfiles();
         case 'getProfile':          requirePermission('livelihood','Viewer'); return tupadGetProfile($id);
         case 'createProfile':       requirePermission('livelihood','Editor'); return tupadCreateProfile();
@@ -219,7 +219,7 @@ function tupadDeleteProject($id) {
         error("Cannot delete: {$cnt} " . ($cnt === 1 ? 'beneficiary' : 'beneficiaries') . " assigned to this project. Unassign them first.", 409);
     }
 
-    $docs = db()->prepare("SELECT file_path FROM documents WHERE tupad_project_id=:id");
+    $docs = db()->prepare("SELECT file_path FROM attached_documents WHERE tupad_project_id=:id");
     $docs->execute([':id' => $id]);
     foreach ($docs->fetchAll(PDO::FETCH_COLUMN) as $path) {
         $abs = __DIR__ . '/../' . $path;
@@ -555,18 +555,18 @@ function tupadSyncDocuments($pdo, $bid, $bsId, $uid, $d) {
         }
     }
 
-    $sel = $pdo->prepare("SELECT document_id, file_path FROM documents WHERE beneficiary_id=:bid AND document_source='TUPAD'");
+    $sel = $pdo->prepare("SELECT document_id, file_path FROM attached_documents WHERE beneficiary_id=:bid AND document_source='TUPAD'");
     $sel->execute([':bid' => $bid]);
     foreach ($sel->fetchAll() as $row) {
         if (!in_array((int) $row['document_id'], $keep, true)) {
             $abs = __DIR__ . '/../' . $row['file_path'];
             if (is_file($abs)) @unlink($abs);
-            $pdo->prepare("DELETE FROM documents WHERE document_id=:id")->execute([':id' => (int) $row['document_id']]);
+            $pdo->prepare("DELETE FROM attached_documents WHERE document_id=:id")->execute([':id' => (int) $row['document_id']]);
         }
     }
 
     $ins = $pdo->prepare(
-        "INSERT INTO documents(beneficiary_id,beneficiary_service_id,document_source,document_type,title,file_name,file_path,file_size,mime_type,uploaded_by)
+        "INSERT INTO attached_documents(beneficiary_id,beneficiary_service_id,document_source,document_type,title,file_name,file_path,file_size,mime_type,uploaded_by)
          VALUES(:bid,:bsid,'TUPAD',:dtype,:title,:fname,:fpath,:size,:mime,:uid)"
     );
     foreach ($docs as $doc) {
@@ -594,7 +594,7 @@ function tupadSyncDocuments($pdo, $bid, $bsId, $uid, $d) {
 function tupadFetchSavedDocuments($bid) {
     $s = db()->prepare(
         "SELECT document_id, document_type, title, file_name, file_path, file_size
-         FROM documents WHERE beneficiary_id=:bid AND document_source='TUPAD' ORDER BY document_id"
+         FROM attached_documents WHERE beneficiary_id=:bid AND document_source='TUPAD' ORDER BY document_id"
     );
     $s->execute([':bid' => $bid]);
     return array_map(function ($r) {
@@ -622,18 +622,18 @@ function tupadSyncProjectDocuments($pdo, $projectId, $uid, $docsPayload) {
         }
     }
 
-    $sel = $pdo->prepare("SELECT document_id, file_path FROM documents WHERE tupad_project_id=:pid");
+    $sel = $pdo->prepare("SELECT document_id, file_path FROM attached_documents WHERE tupad_project_id=:pid");
     $sel->execute([':pid' => $projectId]);
     foreach ($sel->fetchAll() as $row) {
         if (!in_array((int) $row['document_id'], $keep, true)) {
             $abs = __DIR__ . '/../' . $row['file_path'];
             if (is_file($abs)) @unlink($abs);
-            $pdo->prepare("DELETE FROM documents WHERE document_id=:id")->execute([':id' => (int) $row['document_id']]);
+            $pdo->prepare("DELETE FROM attached_documents WHERE document_id=:id")->execute([':id' => (int) $row['document_id']]);
         }
     }
 
     $ins = $pdo->prepare(
-        "INSERT INTO documents(tupad_project_id,document_source,document_type,title,file_name,file_path,file_size,mime_type,uploaded_by)
+        "INSERT INTO attached_documents(tupad_project_id,document_source,document_type,title,file_name,file_path,file_size,mime_type,uploaded_by)
          VALUES(:pid,'TUPAD Project',NULL,:title,:fname,:fpath,:size,:mime,:uid)"
     );
     foreach ($docs as $doc) {
@@ -658,7 +658,7 @@ function tupadSyncProjectDocuments($pdo, $projectId, $uid, $docsPayload) {
 function tupadFetchProjectDocuments($projectId) {
     $s = db()->prepare(
         "SELECT document_id, file_name, file_path, file_size
-         FROM documents WHERE tupad_project_id=:pid ORDER BY document_id"
+         FROM attached_documents WHERE tupad_project_id=:pid ORDER BY document_id"
     );
     $s->execute([':pid' => $projectId]);
     return array_map(function ($r) {
@@ -751,13 +751,13 @@ function tupadHardDeleteApplicant($bid) {
             $pdo->prepare("DELETE FROM tupad_project_beneficiaries WHERE beneficiary_service_id = :id")->execute([':id' => (int) $bsId]);
         }
 
-        $docs = $pdo->prepare("SELECT file_path FROM documents WHERE beneficiary_id = :id AND document_source = 'TUPAD'");
+        $docs = $pdo->prepare("SELECT file_path FROM attached_documents WHERE beneficiary_id = :id AND document_source = 'TUPAD'");
         $docs->execute([':id' => $bid]);
         foreach ($docs->fetchAll(PDO::FETCH_COLUMN) as $path) {
             $abs = __DIR__ . '/../' . $path;
             if (is_file($abs)) @unlink($abs);
         }
-        $pdo->prepare("DELETE FROM documents WHERE beneficiary_id = :id AND document_source = 'TUPAD'")->execute([':id' => $bid]);
+        $pdo->prepare("DELETE FROM attached_documents WHERE beneficiary_id = :id AND document_source = 'TUPAD'")->execute([':id' => $bid]);
         $pdo->prepare("DELETE FROM beneficiary_services WHERE beneficiary_id = :id")->execute([':id' => $bid]);
         $pdo->prepare("DELETE FROM beneficiaries WHERE beneficiary_id = :id")->execute([':id' => $bid]);
 
