@@ -433,15 +433,14 @@ function clpepCreateProfile() {
         $bsId = (int) $s2->fetchColumn();
 
         $pdo->prepare(
-            "INSERT INTO clpep_profiles(beneficiary_service_id,child_labor_status,school_status,nature_of_work,currently_working,hours_worked_per_week,school_name,grade_year_level,guardian_name,guardian_relationship,guardian_contact_no,status,date_applied,created_at,updated_at)
-             VALUES(:bsid,:cls,:school,:nature,:working,:hours,:sname,:grade,:gname,:grel,:gcontact,'Inactive',:date,now(),now())"
+            "INSERT INTO clpep_profiles(beneficiary_service_id,child_labor_status,school_status,nature_of_work,currently_working,hours_worked_per_week,school_name,grade_year_level,guardian_name,guardian_relationship,guardian_contact_no,status,created_at,updated_at)
+             VALUES(:bsid,:cls,:school,:nature,:working,:hours,:sname,:grade,:gname,:grel,:gcontact,'Inactive',now(),now())"
         )->execute([
             ':bsid' => $bsId, ':cls' => $childLabor, ':school' => $school,
             ':nature' => clpepNullStr($d['natureOfWork'] ?? ''), ':working' => clpepBoolOrNull($d['currentlyWorking'] ?? null),
             ':hours' => clpepNumOrNull($d['hoursWorkedPerWeek'] ?? null), ':sname' => clpepNullStr($d['schoolName'] ?? ''),
             ':grade' => clpepNullStr($d['gradeYearLevel'] ?? ''), ':gname' => clpepNullStr($d['guardianName'] ?? ''),
             ':grel' => clpepNullStr($d['guardianRelationship'] ?? ''), ':gcontact' => clpepNullStr($d['guardianContactNumber'] ?? ''),
-            ':date' => clpepDate($d['dateApplied'] ?? '') ?? date('Y-m-d'),
         ]);
 
         clpepSyncDocuments($pdo, $bid, $bsId, $uid, $d);
@@ -486,14 +485,14 @@ function clpepUpdateProfile($id) {
             ]);
 
         $pdo->prepare(
-            "UPDATE clpep_profiles SET child_labor_status=:cls,school_status=:school,nature_of_work=:nature,currently_working=:working,hours_worked_per_week=:hours,school_name=:sname,grade_year_level=:grade,guardian_name=:gname,guardian_relationship=:grel,guardian_contact_no=:gcontact,date_applied=:date,updated_at=now() WHERE beneficiary_service_id=:bsid"
+            "UPDATE clpep_profiles SET child_labor_status=:cls,school_status=:school,nature_of_work=:nature,currently_working=:working,hours_worked_per_week=:hours,school_name=:sname,grade_year_level=:grade,guardian_name=:gname,guardian_relationship=:grel,guardian_contact_no=:gcontact,updated_at=now() WHERE beneficiary_service_id=:bsid"
         )->execute([
             ':cls' => $childLabor, ':school' => $school,
             ':nature' => clpepNullStr($d['natureOfWork'] ?? ''), ':working' => clpepBoolOrNull($d['currentlyWorking'] ?? null),
             ':hours' => clpepNumOrNull($d['hoursWorkedPerWeek'] ?? null), ':sname' => clpepNullStr($d['schoolName'] ?? ''),
             ':grade' => clpepNullStr($d['gradeYearLevel'] ?? ''), ':gname' => clpepNullStr($d['guardianName'] ?? ''),
             ':grel' => clpepNullStr($d['guardianRelationship'] ?? ''), ':gcontact' => clpepNullStr($d['guardianContactNumber'] ?? ''),
-            ':date' => clpepDate($d['dateApplied'] ?? '') ?? date('Y-m-d'), ':bsid' => $bsId,
+            ':bsid' => $bsId,
         ]);
 
         clpepSyncDocuments($pdo, $bid, $bsId, $uid, $d);

@@ -312,7 +312,7 @@ function slpBuildProfile($bid) {
                 bs.beneficiary_service_id, bs.date_applied AS bs_date_applied, bs.received_by, bs.remarks AS bs_remarks,
                 sp.slp_profile_id, sp.slp_participant_id_no, sp.participant_type, sp.eligibility_type, sp.referring_party,
                 sp.source_of_income, sp.household_monthly_income, sp.vulnerability_score, sp.vulnerability_severity,
-                sp.assessment_result, sp.slp_track, sp.status AS profile_status, sp.date_applied AS profile_date_applied,
+                sp.assessment_result, sp.slp_track, sp.status AS profile_status,
                 sp.remarks AS profile_remarks, sp.indigenous_group
          FROM beneficiaries b
          JOIN beneficiary_services bs ON bs.beneficiary_id = b.beneficiary_id
@@ -416,7 +416,7 @@ function slpBuildProfile($bid) {
         'assignedProjectStatus'       => $current['status'] ?? '',
         'assignmentHistory'           => $assignmentHistory,
         'attachedDocuments'           => slpFetchSavedDocuments($bid),
-        'dateApplied'                 => $b['profile_date_applied'] ?? $b['bs_date_applied'] ?? '',
+        'dateApplied'                 => $b['bs_date_applied'] ?? '',
         'receivedBy'                  => $b['received_by'] ?? '',
         'status'                      => $b['profile_status'] ?? 'Inactive',
     ];
@@ -524,8 +524,8 @@ function slpCreateProfile() {
         $bsId = (int) $s2->fetchColumn();
 
         $pdo->prepare(
-            "INSERT INTO slp_profiles(beneficiary_service_id,slp_participant_id_no,participant_type,eligibility_type,referring_party,source_of_income,household_monthly_income,vulnerability_score,vulnerability_severity,assessment_result,slp_track,indigenous_group,status,date_applied,remarks,created_at,updated_at)
-             VALUES(:bsid,:pidno,:ptype,:elig,:refparty,:income,:hhincome,:vscore,:vsev,:assess,:track,:ipgroup,'Inactive',:date,:remarks,now(),now())"
+            "INSERT INTO slp_profiles(beneficiary_service_id,slp_participant_id_no,participant_type,eligibility_type,referring_party,source_of_income,household_monthly_income,vulnerability_score,vulnerability_severity,assessment_result,slp_track,indigenous_group,status,remarks,created_at,updated_at)
+             VALUES(:bsid,:pidno,:ptype,:elig,:refparty,:income,:hhincome,:vscore,:vsev,:assess,:track,:ipgroup,'Inactive',:remarks,now(),now())"
         )->execute([
             ':bsid' => $bsId, ':pidno' => slpNullStr($d['slpParticipantIdNumber'] ?? ''),
             ':ptype' => $is4Ps ? '4Ps' : 'Non-4Ps', ':elig' => $eligibility,
@@ -533,7 +533,7 @@ function slpCreateProfile() {
             ':income' => slpNullStr($d['sourceOfIncome'] ?? ''), ':hhincome' => slpMoneyOrNull($d['totalHouseholdMonthlyIncome'] ?? null),
             ':vscore' => slpNumOrNull($d['householdVulnerabilityScore'] ?? null), ':vsev' => $severity, ':assess' => $assessment,
             ':track' => $track, ':ipgroup' => in_array('Indigenous People (IP)', is_array($d['sector'] ?? null) ? $d['sector'] : [], true) ? slpNullStr($d['sectorIpGroupSpecify'] ?? '') : null,
-            ':date' => slpDate($d['dateApplied'] ?? '') ?? date('Y-m-d'), ':remarks' => slpNullStr($d['remarks'] ?? ''),
+            ':remarks' => slpNullStr($d['remarks'] ?? ''),
         ]);
 
         slpSyncClassifications($pdo, $bid, $d);
@@ -582,14 +582,14 @@ function slpUpdateProfile($id) {
             ]);
 
         $pdo->prepare(
-            "UPDATE slp_profiles SET slp_participant_id_no=:pidno,participant_type=:ptype,eligibility_type=:elig,referring_party=:refparty,source_of_income=:income,household_monthly_income=:hhincome,vulnerability_score=:vscore,vulnerability_severity=:vsev,assessment_result=:assess,slp_track=:track,indigenous_group=:ipgroup,date_applied=:date,remarks=:remarks,updated_at=now() WHERE beneficiary_service_id=:bsid"
+            "UPDATE slp_profiles SET slp_participant_id_no=:pidno,participant_type=:ptype,eligibility_type=:elig,referring_party=:refparty,source_of_income=:income,household_monthly_income=:hhincome,vulnerability_score=:vscore,vulnerability_severity=:vsev,assessment_result=:assess,slp_track=:track,indigenous_group=:ipgroup,remarks=:remarks,updated_at=now() WHERE beneficiary_service_id=:bsid"
         )->execute([
             ':pidno' => slpNullStr($d['slpParticipantIdNumber'] ?? ''), ':ptype' => $is4Ps ? '4Ps' : 'Non-4Ps', ':elig' => $eligibility,
             ':refparty' => $eligibility === 'Referral' ? slpNullStr($d['referringParty'] ?? '') : null,
             ':income' => slpNullStr($d['sourceOfIncome'] ?? ''), ':hhincome' => slpMoneyOrNull($d['totalHouseholdMonthlyIncome'] ?? null),
             ':vscore' => slpNumOrNull($d['householdVulnerabilityScore'] ?? null), ':vsev' => $severity, ':assess' => $assessment,
             ':track' => $track, ':ipgroup' => in_array('Indigenous People (IP)', is_array($d['sector'] ?? null) ? $d['sector'] : [], true) ? slpNullStr($d['sectorIpGroupSpecify'] ?? '') : null,
-            ':date' => slpDate($d['dateApplied'] ?? '') ?? date('Y-m-d'), ':remarks' => slpNullStr($d['remarks'] ?? ''), ':bsid' => $bsId,
+            ':remarks' => slpNullStr($d['remarks'] ?? ''), ':bsid' => $bsId,
         ]);
 
         slpSyncClassifications($pdo, $bid, $d);
