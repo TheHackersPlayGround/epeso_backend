@@ -3,6 +3,7 @@
 
 include_once __DIR__ . '/../core/helpers.php';
 include_once __DIR__ . '/../core/guard.php';
+include_once __DIR__ . '/../core/activity_log.php';
 
 function handle($action, $id, $method)
 {
@@ -148,6 +149,7 @@ function gipListBatches() {
     $s = db()->query(
         "SELECT b.*, (SELECT COUNT(*) FROM gip_profiles gp WHERE gp.batch_id = b.batch_id) AS assigned_count
          FROM gip_batches b
+         WHERE b.deleted_at IS NULL
          ORDER BY b.created_at DESC, b.batch_id DESC"
     );
     json(['status' => 'ok', 'data' => array_map('gipFormatBatch', $s->fetchAll())]);
@@ -247,6 +249,7 @@ function gipCreateBatch() {
     gipCascadeBatchStatus($pdo, $id, null, $status);
 
     gipSyncBatchDocuments($pdo, $id, $uid, $d['documents'] ?? []);
+    logActivity($uid, 'Create Batch', 'gip-maintenance', "Created batch: {$name}");
     json(['status' => 'ok', 'message' => 'Batch created.', 'data' => gipGetBatchById($id)]);
 }
 
@@ -281,6 +284,7 @@ function gipUpdateBatch($id) {
     }
 
     gipSyncBatchDocuments($pdo, $id, $uid, $d['documents'] ?? []);
+    logActivity($uid, 'Update Batch', 'gip-maintenance', "Updated batch: {$name}");
     json(['status' => 'ok', 'message' => 'Batch updated.', 'data' => gipGetBatchById($id)]);
 }
 
@@ -292,10 +296,11 @@ function gipUpdateBatchStatus($id) {
     $status = in_array($d['status'] ?? '', $valid, true) ? $d['status'] : null;
     if (!$status) error('Valid status required.', 422);
 
-    $curS = db()->prepare("SELECT status FROM gip_batches WHERE batch_id=:id");
+    $curS = db()->prepare("SELECT status, batch_name FROM gip_batches WHERE batch_id=:id");
     $curS->execute([':id' => $id]);
-    $prev = $curS->fetchColumn();
-    if ($prev === false) error('Batch not found.', 404);
+    $curRow = $curS->fetch();
+    if (!$curRow) error('Batch not found.', 404);
+    $prev = $curRow['status'];
 
     $pdo = db();
     try {
@@ -307,6 +312,7 @@ function gipUpdateBatchStatus($id) {
         if ($pdo->inTransaction()) $pdo->rollBack();
         error('Failed to update batch status: ' . $e->getMessage(), 500);
     }
+    logActivity(currentUserId(), 'Update Batch Status', 'gip-maintenance', "Set batch '{$curRow['batch_name']}' status to {$status}");
     json(['status' => 'ok', 'message' => 'Status updated.', 'data' => gipGetBatchById($id)]);
 }
 
@@ -324,15 +330,17 @@ function gipDeleteBatch($id) {
         error("Cannot delete: {$cnt} applicant" . ($cnt === 1 ? '' : 's') . " linked to this batch (current or past interns).", 409);
     }
 
-    $docs = db()->prepare("SELECT file_path FROM attached_documents WHERE gip_batch_id=:id");
-    $docs->execute([':id' => $id]);
-    foreach ($docs->fetchAll(PDO::FETCH_COLUMN) as $path) {
-        $abs = __DIR__ . '/../' . $path;
-        if (is_file($abs)) @unlink($abs);
-    }
-    // documents.gip_batch_id is ON DELETE CASCADE, so deleting the batch row also
-    // removes its document rows once the files above are unlinked from disk.
-    db()->prepare("DELETE FROM gip_batches WHERE batch_id=:id")->execute([':id' => $id]);
+    $nameS = db()->prepare("SELECT batch_name FROM gip_batches WHERE batch_id=:id AND deleted_at IS NULL");
+    $nameS->execute([':id' => $id]);
+    $name = $nameS->fetchColumn();
+    if ($name === false) error('Batch not found.', 404);
+
+    // Soft delete only -- files/document rows stay intact so a restored batch
+    // still has its attachments. They're only actually removed at purge time
+    // (gipHardDeleteBatch), which is when documents.gip_batch_id's ON DELETE
+    // CASCADE actually fires.
+    db()->prepare("UPDATE gip_batches SET deleted_at=now(), deleted_by=:uid WHERE batch_id=:id")->execute([':uid' => currentUserId(), ':id' => $id]);
+    logActivity(currentUserId(), 'Delete Batch', 'gip-maintenance', "Deleted batch: {$name}");
     json(['status' => 'ok', 'message' => 'Batch deleted.']);
 }
 
@@ -518,6 +526,7 @@ function gipCreateProfile() {
         if ($pdo->inTransaction()) $pdo->rollBack();
         error('Failed to save profile: ' . $e->getMessage(), 500);
     }
+    logActivity($uid, 'Create Profile', 'gip', "Created applicant: " . trim($d['lastName']) . ", " . trim($d['firstName']));
     json(['status' => 'ok', 'message' => 'Profile saved.', 'data' => gipBuildProfile($bid)]);
 }
 
@@ -573,6 +582,7 @@ function gipUpdateProfile($id) {
         if ($pdo->inTransaction()) $pdo->rollBack();
         error('Failed to update profile: ' . $e->getMessage(), 500);
     }
+    logActivity($uid, 'Update Profile', 'gip', "Updated applicant: " . trim($d['lastName']) . ", " . trim($d['firstName']));
     json(['status' => 'ok', 'message' => 'Profile updated.', 'data' => gipBuildProfile($bid)]);
 }
 
@@ -595,7 +605,12 @@ function gipDeleteProfile($id) {
         error('This applicant cannot be deleted because they are currently assigned to a batch. Unassign them first (only possible while the batch is still Planned), or wait until it is marked Completed.', 409);
     }
 
+    $nameS = db()->prepare("SELECT first_name, last_name FROM beneficiaries WHERE beneficiary_id=:id");
+    $nameS->execute([':id' => $bid]);
+    $nameRow = $nameS->fetch();
+
     db()->prepare("UPDATE beneficiaries SET deleted_at=now(),deleted_by=:uid WHERE beneficiary_id=:id")->execute([':uid' => $uid, ':id' => $bid]);
+    logActivity($uid, 'Delete Profile', 'gip', "Moved to recycle bin: " . ($nameRow ? $nameRow['last_name'] . ', ' . $nameRow['first_name'] : "#{$bid}"));
     json(['status' => 'ok', 'message' => 'Applicant moved to recycle bin.']);
 }
 
@@ -636,7 +651,7 @@ function gipAssignBatch() {
         error('This applicant is already assigned to a batch that is no longer Planned — reassigning would erase the only record of that assignment.', 409);
     }
 
-    $batchS = db()->prepare("SELECT status, slot_count FROM gip_batches WHERE batch_id=:id");
+    $batchS = db()->prepare("SELECT status, slot_count FROM gip_batches WHERE batch_id=:id AND deleted_at IS NULL");
     $batchS->execute([':id' => $batchId]);
     $batch = $batchS->fetch();
     if (!$batch) error('Batch not found.', 404);
@@ -831,6 +846,7 @@ function gipFetchBatchDocuments($batchId) {
 function gipRecycleMap() {
     return [
         'gipApplicant' => ['beneficiaries', 'beneficiary_id'],
+        'gipBatch'     => ['gip_batches', 'batch_id'],
     ];
 }
 
@@ -868,6 +884,26 @@ function gipListDeleted() {
             'deletedAt'   => $r['deleted_at'],
         ];
     }, $s->fetchAll());
+
+    $batchS = db()->prepare(
+        "SELECT b.batch_id AS id, b.batch_name AS name, b.deleted_at, u.username AS deleted_by
+         FROM gip_batches b
+         LEFT JOIN users u ON u.user_id = b.deleted_by
+         WHERE b.deleted_at IS NOT NULL"
+    );
+    $batchS->execute();
+    foreach ($batchS->fetchAll() as $r) {
+        $items[] = [
+            'recordType'  => 'gipBatch',
+            'id'          => (int) $r['id'],
+            'name'        => $r['name'],
+            'module'      => 'GIP Batches',
+            'description' => 'Government Internship Program batch',
+            'deletedBy'   => $r['deleted_by'] ?? '',
+            'deletedAt'   => $r['deleted_at'],
+        ];
+    }
+
     json(['status' => 'ok', 'data' => $items]);
 }
 
@@ -880,6 +916,7 @@ function gipRestoreRecord() {
     $stmt->execute([':id' => $id]);
     if ($stmt->rowCount() === 0) error('Record not found in recycle bin.', 404);
 
+    logActivity(currentUserId(), 'Restore Record', 'gip', "Restored {$type} #{$id} from recycle bin");
     json(['status' => 'ok', 'message' => 'Record restored.']);
 }
 
@@ -893,8 +930,28 @@ function gipPurgeRecord() {
     $chk->execute([':id' => $id]);
     if (!$chk->fetchColumn()) error('Record not found in recycle bin.', 404);
 
-    gipHardDeleteApplicant($id);
+    if ($type === 'gipApplicant') {
+        gipHardDeleteApplicant($id);
+    } else {
+        gipHardDeleteBatch($id);
+    }
+    logActivity(currentUserId(), 'Purge Record', 'gip', "Permanently deleted {$type} #{$id}");
     json(['status' => 'ok', 'message' => 'Record permanently deleted.']);
+}
+
+// Permanently remove a GIP batch and its uploaded files. Only reachable for an
+// already soft-deleted batch, which gipDeleteBatch's in-use guard already
+// guaranteed has zero linked profiles -- no cascade cleanup needed there.
+function gipHardDeleteBatch($id) {
+    $docs = db()->prepare("SELECT file_path FROM attached_documents WHERE gip_batch_id=:id");
+    $docs->execute([':id' => $id]);
+    foreach ($docs->fetchAll(PDO::FETCH_COLUMN) as $path) {
+        $abs = __DIR__ . '/../' . $path;
+        if (is_file($abs)) @unlink($abs);
+    }
+    // documents.gip_batch_id is ON DELETE CASCADE, so this also removes the
+    // document rows themselves.
+    db()->prepare("DELETE FROM gip_batches WHERE batch_id=:id")->execute([':id' => $id]);
 }
 
 // Permanently remove a GIP applicant and its GIP-specific data (uploaded

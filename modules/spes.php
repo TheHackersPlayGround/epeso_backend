@@ -3,6 +3,7 @@
 
 include_once __DIR__ . '/../core/helpers.php';
 include_once __DIR__ . '/../core/guard.php';
+include_once __DIR__ . '/../core/activity_log.php';
 
 function handle($action, $id, $method)
 {
@@ -97,6 +98,7 @@ function spesListBatches() {
     $s = db()->query(
         "SELECT b.*, (SELECT COUNT(*) FROM spes_profiles sp WHERE sp.batch_id = b.batch_id) AS assigned_count
          FROM spes_batches b
+         WHERE b.deleted_at IS NULL
          ORDER BY b.created_at DESC, b.batch_id DESC"
     );
     json(['status' => 'ok', 'data' => array_map('spesFormatBatch', $s->fetchAll())]);
@@ -202,6 +204,7 @@ function spesCreateBatch() {
     spesCascadeBatchStatus($pdo, $id, null, $status);
 
     spesSyncBatchDocuments($pdo, $id, $uid, $d['documents'] ?? []);
+    logActivity($uid, 'Create Batch', 'spes-maintenance', "Created batch: {$name}");
     json(['status' => 'ok', 'message' => 'Batch created.', 'data' => spesGetBatchById($id)]);
 }
 
@@ -240,6 +243,7 @@ function spesUpdateBatch($id) {
     }
 
     spesSyncBatchDocuments($pdo, $id, $uid, $d['documents'] ?? []);
+    logActivity($uid, 'Update Batch', 'spes-maintenance', "Updated batch: {$name}");
     json(['status' => 'ok', 'message' => 'Batch updated.', 'data' => spesGetBatchById($id)]);
 }
 
@@ -251,10 +255,11 @@ function spesUpdateBatchStatus($id) {
     $status = in_array($d['status'] ?? '', $valid, true) ? $d['status'] : null;
     if (!$status) error('Valid status required.', 422);
 
-    $curS = db()->prepare("SELECT status FROM spes_batches WHERE batch_id=:id");
+    $curS = db()->prepare("SELECT status, batch_name FROM spes_batches WHERE batch_id=:id");
     $curS->execute([':id' => $id]);
-    $prev = $curS->fetchColumn();
-    if ($prev === false) error('Batch not found.', 404);
+    $curRow = $curS->fetch();
+    if (!$curRow) error('Batch not found.', 404);
+    $prev = $curRow['status'];
 
     $pdo = db();
     try {
@@ -266,6 +271,7 @@ function spesUpdateBatchStatus($id) {
         if ($pdo->inTransaction()) $pdo->rollBack();
         error('Failed to update batch status: ' . $e->getMessage(), 500);
     }
+    logActivity(currentUserId(), 'Update Batch Status', 'spes-maintenance', "Set batch '{$curRow['batch_name']}' status to {$status}");
     json(['status' => 'ok', 'message' => 'Status updated.', 'data' => spesGetBatchById($id)]);
 }
 
@@ -283,15 +289,15 @@ function spesDeleteBatch($id) {
         error("Cannot delete: {$cnt} applicant" . ($cnt === 1 ? '' : 's') . " linked to this batch (current or past assignees).", 409);
     }
 
-    $docs = db()->prepare("SELECT file_path FROM attached_documents WHERE spes_batch_id=:id");
-    $docs->execute([':id' => $id]);
-    foreach ($docs->fetchAll(PDO::FETCH_COLUMN) as $path) {
-        $abs = __DIR__ . '/../' . $path;
-        if (is_file($abs)) @unlink($abs);
-    }
-    // documents.spes_batch_id is ON DELETE CASCADE, so deleting the batch row
-    // also removes its document rows once the files above are unlinked.
-    db()->prepare("DELETE FROM spes_batches WHERE batch_id=:id")->execute([':id' => $id]);
+    $nameS = db()->prepare("SELECT batch_name FROM spes_batches WHERE batch_id=:id AND deleted_at IS NULL");
+    $nameS->execute([':id' => $id]);
+    $name = $nameS->fetchColumn();
+    if ($name === false) error('Batch not found.', 404);
+
+    // Soft delete only -- files/document rows stay intact so a restored batch
+    // still has its attachments; they're only removed at purge time.
+    db()->prepare("UPDATE spes_batches SET deleted_at=now(), deleted_by=:uid WHERE batch_id=:id")->execute([':uid' => currentUserId(), ':id' => $id]);
+    logActivity(currentUserId(), 'Delete Batch', 'spes-maintenance', "Deleted batch: {$name}");
     json(['status' => 'ok', 'message' => 'Batch deleted.']);
 }
 
@@ -479,6 +485,7 @@ function spesCreateProfile() {
         if ($pdo->inTransaction()) $pdo->rollBack();
         error('Failed to save profile: ' . $e->getMessage(), 500);
     }
+    logActivity($uid, 'Create Profile', 'spes', "Created applicant: " . trim($d['lastName']) . ", " . trim($d['firstName']));
     json(['status' => 'ok', 'message' => 'Profile saved.', 'data' => spesBuildProfile($bid)]);
 }
 
@@ -539,6 +546,7 @@ function spesUpdateProfile($id) {
         if ($pdo->inTransaction()) $pdo->rollBack();
         error('Failed to update profile: ' . $e->getMessage(), 500);
     }
+    logActivity($uid, 'Update Profile', 'spes', "Updated applicant: " . trim($d['lastName']) . ", " . trim($d['firstName']));
     json(['status' => 'ok', 'message' => 'Profile updated.', 'data' => spesBuildProfile($bid)]);
 }
 
@@ -561,7 +569,12 @@ function spesDeleteProfile($id) {
         error('This applicant cannot be deleted because they are currently assigned to a batch. Unassign them first (only possible while the batch is still Planned), or wait until it is marked Completed.', 409);
     }
 
+    $nameS = db()->prepare("SELECT first_name, last_name FROM beneficiaries WHERE beneficiary_id=:id");
+    $nameS->execute([':id' => $bid]);
+    $nameRow = $nameS->fetch();
+
     db()->prepare("UPDATE beneficiaries SET deleted_at=now(),deleted_by=:uid WHERE beneficiary_id=:id")->execute([':uid' => $uid, ':id' => $bid]);
+    logActivity($uid, 'Delete Profile', 'spes', "Moved to recycle bin: " . ($nameRow ? $nameRow['last_name'] . ', ' . $nameRow['first_name'] : "#{$bid}"));
     json(['status' => 'ok', 'message' => 'Applicant moved to recycle bin.']);
 }
 
@@ -602,7 +615,7 @@ function spesAssignBatch() {
         error('This applicant is already assigned to a batch that is no longer Planned — reassigning would erase the only record of that assignment.', 409);
     }
 
-    $batchS = db()->prepare("SELECT status, available_slots FROM spes_batches WHERE batch_id=:id");
+    $batchS = db()->prepare("SELECT status, available_slots FROM spes_batches WHERE batch_id=:id AND deleted_at IS NULL");
     $batchS->execute([':id' => $batchId]);
     $batch = $batchS->fetch();
     if (!$batch) error('Batch not found.', 404);
@@ -798,6 +811,7 @@ function spesFetchBatchDocuments($batchId) {
 function spesRecycleMap() {
     return [
         'spesApplicant' => ['beneficiaries', 'beneficiary_id'],
+        'spesBatch'     => ['spes_batches', 'batch_id'],
     ];
 }
 
@@ -835,6 +849,26 @@ function spesListDeleted() {
             'deletedAt'   => $r['deleted_at'],
         ];
     }, $s->fetchAll());
+
+    $batchS = db()->prepare(
+        "SELECT b.batch_id AS id, b.batch_name AS name, b.deleted_at, u.username AS deleted_by
+         FROM spes_batches b
+         LEFT JOIN users u ON u.user_id = b.deleted_by
+         WHERE b.deleted_at IS NOT NULL"
+    );
+    $batchS->execute();
+    foreach ($batchS->fetchAll() as $r) {
+        $items[] = [
+            'recordType'  => 'spesBatch',
+            'id'          => (int) $r['id'],
+            'name'        => $r['name'],
+            'module'      => 'SPES Batches',
+            'description' => 'Special Program for Employment of Students batch',
+            'deletedBy'   => $r['deleted_by'] ?? '',
+            'deletedAt'   => $r['deleted_at'],
+        ];
+    }
+
     json(['status' => 'ok', 'data' => $items]);
 }
 
@@ -847,6 +881,7 @@ function spesRestoreRecord() {
     $stmt->execute([':id' => $id]);
     if ($stmt->rowCount() === 0) error('Record not found in recycle bin.', 404);
 
+    logActivity(currentUserId(), 'Restore Record', 'spes', "Restored {$type} #{$id} from recycle bin");
     json(['status' => 'ok', 'message' => 'Record restored.']);
 }
 
@@ -860,8 +895,26 @@ function spesPurgeRecord() {
     $chk->execute([':id' => $id]);
     if (!$chk->fetchColumn()) error('Record not found in recycle bin.', 404);
 
-    spesHardDeleteApplicant($id);
+    if ($type === 'spesApplicant') {
+        spesHardDeleteApplicant($id);
+    } else {
+        spesHardDeleteBatch($id);
+    }
+    logActivity(currentUserId(), 'Purge Record', 'spes', "Permanently deleted {$type} #{$id}");
     json(['status' => 'ok', 'message' => 'Record permanently deleted.']);
+}
+
+// Permanently remove a SPES batch and its uploaded files. Only reachable for
+// an already soft-deleted batch, which spesDeleteBatch's in-use guard already
+// guaranteed has zero linked profiles.
+function spesHardDeleteBatch($id) {
+    $docs = db()->prepare("SELECT file_path FROM attached_documents WHERE spes_batch_id=:id");
+    $docs->execute([':id' => $id]);
+    foreach ($docs->fetchAll(PDO::FETCH_COLUMN) as $path) {
+        $abs = __DIR__ . '/../' . $path;
+        if (is_file($abs)) @unlink($abs);
+    }
+    db()->prepare("DELETE FROM spes_batches WHERE batch_id=:id")->execute([':id' => $id]);
 }
 
 // Permanently remove a SPES applicant and its SPES-specific data (uploaded

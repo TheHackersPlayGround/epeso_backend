@@ -18,6 +18,7 @@
 
 include_once __DIR__ . '/../core/helpers.php';
 include_once __DIR__ . '/../core/guard.php';
+include_once __DIR__ . '/../core/activity_log.php';
 
 function handle($action, $id, $method)
 {
@@ -101,6 +102,7 @@ function clpepListInterventions() {
     $s = db()->query(
         "SELECT i.*, (SELECT COUNT(*) FROM clpep_intervention_beneficiaries ib WHERE ib.intervention_id = i.intervention_id) AS assigned_count
          FROM clpep_interventions i
+         WHERE i.deleted_at IS NULL
          ORDER BY i.created_at DESC, i.intervention_id DESC"
     );
     json(['status' => 'ok', 'data' => array_map('clpepFormatIntervention', $s->fetchAll())]);
@@ -175,6 +177,7 @@ function clpepCreateIntervention() {
     $id = (int) $s->fetchColumn();
 
     clpepSyncInterventionDocuments($pdo, $id, $uid, $d['documents'] ?? []);
+    logActivity($uid, 'Create Intervention', 'livelihood-maintenance', "Created intervention: {$name}");
     json(['status' => 'ok', 'message' => 'Intervention created.', 'data' => clpepGetInterventionById($id)]);
 }
 
@@ -205,6 +208,7 @@ function clpepUpdateIntervention($id) {
     ]);
 
     clpepSyncInterventionDocuments($pdo, $id, $uid, $d['documents'] ?? []);
+    logActivity($uid, 'Update Intervention', 'livelihood-maintenance', "Updated intervention: {$name}");
     json(['status' => 'ok', 'message' => 'Intervention updated.', 'data' => clpepGetInterventionById($id)]);
 }
 
@@ -216,9 +220,10 @@ function clpepUpdateInterventionStatus($id) {
     $status = in_array($d['status'] ?? '', $valid, true) ? $d['status'] : null;
     if (!$status) error('Valid status required.', 422);
 
-    $chk = db()->prepare("SELECT 1 FROM clpep_interventions WHERE intervention_id=:id");
+    $chk = db()->prepare("SELECT intervention_name FROM clpep_interventions WHERE intervention_id=:id");
     $chk->execute([':id' => $id]);
-    if (!$chk->fetchColumn()) error('Intervention not found.', 404);
+    $ivName = $chk->fetchColumn();
+    if ($ivName === false) error('Intervention not found.', 404);
 
     db()->prepare("UPDATE clpep_interventions SET status=:s, updated_at=now() WHERE intervention_id=:id")->execute([':s' => $status, ':id' => $id]);
 
@@ -227,6 +232,7 @@ function clpepUpdateInterventionStatus($id) {
     // which compute it purely at read time).
     clpepRefreshDerivedStatusForIntervention($id, $status);
 
+    logActivity(currentUserId(), 'Update Intervention Status', 'livelihood-maintenance', "Set intervention '{$ivName}' status to {$status}");
     json(['status' => 'ok', 'message' => 'Status updated.', 'data' => clpepGetInterventionById($id)]);
 }
 
@@ -251,13 +257,15 @@ function clpepDeleteIntervention($id) {
         error("Cannot delete: {$cnt} " . ($cnt === 1 ? 'beneficiary' : 'beneficiaries') . " assigned to this intervention. Unassign them first.", 409);
     }
 
-    $docs = db()->prepare("SELECT file_path FROM attached_documents WHERE clpep_intervention_id=:id");
-    $docs->execute([':id' => $id]);
-    foreach ($docs->fetchAll(PDO::FETCH_COLUMN) as $path) {
-        $abs = __DIR__ . '/../' . $path;
-        if (is_file($abs)) @unlink($abs);
-    }
-    db()->prepare("DELETE FROM clpep_interventions WHERE intervention_id=:id")->execute([':id' => $id]);
+    $nameS = db()->prepare("SELECT intervention_name FROM clpep_interventions WHERE intervention_id=:id AND deleted_at IS NULL");
+    $nameS->execute([':id' => $id]);
+    $name = $nameS->fetchColumn();
+    if ($name === false) error('Intervention not found.', 404);
+
+    // Soft delete only -- files/document rows stay intact so a restored
+    // intervention still has its attachments; they're only removed at purge time.
+    db()->prepare("UPDATE clpep_interventions SET deleted_at=now(), deleted_by=:uid WHERE intervention_id=:id")->execute([':uid' => currentUserId(), ':id' => $id]);
+    logActivity(currentUserId(), 'Delete Intervention', 'livelihood-maintenance', "Deleted intervention: {$name}");
     json(['status' => 'ok', 'message' => 'Intervention deleted.']);
 }
 
@@ -450,6 +458,7 @@ function clpepCreateProfile() {
         if ($pdo->inTransaction()) $pdo->rollBack();
         error('Failed to save profile: ' . $e->getMessage(), 500);
     }
+    logActivity($uid, 'Create Profile', 'livelihood', "Created beneficiary: " . trim($d['lastName']) . ", " . trim($d['firstName']));
     json(['status' => 'ok', 'message' => 'Profile saved.', 'data' => clpepBuildProfile($bid)]);
 }
 
@@ -502,6 +511,7 @@ function clpepUpdateProfile($id) {
         if ($pdo->inTransaction()) $pdo->rollBack();
         error('Failed to update profile: ' . $e->getMessage(), 500);
     }
+    logActivity($uid, 'Update Profile', 'livelihood', "Updated beneficiary: " . trim($d['lastName']) . ", " . trim($d['firstName']));
     json(['status' => 'ok', 'message' => 'Profile updated.', 'data' => clpepBuildProfile($bid)]);
 }
 
@@ -526,7 +536,12 @@ function clpepDeleteProfile($id) {
         error('This beneficiary cannot be deleted because they are currently assigned to an active intervention. Unassign them first (only possible while the intervention is still Planned), or wait until it is marked Completed.', 409);
     }
 
+    $nameS = db()->prepare("SELECT first_name, last_name FROM beneficiaries WHERE beneficiary_id=:id");
+    $nameS->execute([':id' => $bid]);
+    $nameRow = $nameS->fetch();
+
     db()->prepare("UPDATE beneficiaries SET deleted_at=now(),deleted_by=:uid WHERE beneficiary_id=:id")->execute([':uid' => $uid, ':id' => $bid]);
+    logActivity($uid, 'Delete Profile', 'livelihood', "Moved to recycle bin: " . ($nameRow ? $nameRow['last_name'] . ', ' . $nameRow['first_name'] : "#{$bid}"));
     json(['status' => 'ok', 'message' => 'Beneficiary moved to recycle bin.']);
 }
 
@@ -553,7 +568,7 @@ function clpepAssignIntervention() {
     if (!$bsId) error('CLPEP profile not found.', 404);
     $bsId = (int) $bsId;
 
-    $ivS = db()->prepare("SELECT status, target_beneficiaries FROM clpep_interventions WHERE intervention_id=:id");
+    $ivS = db()->prepare("SELECT status, target_beneficiaries FROM clpep_interventions WHERE intervention_id=:id AND deleted_at IS NULL");
     $ivS->execute([':id' => $interventionId]);
     $iv = $ivS->fetch();
     if (!$iv) error('Intervention not found.', 404);
@@ -767,7 +782,8 @@ function clpepFetchInterventionDocuments($interventionId) {
 
 function clpepRecycleMap() {
     return [
-        'clpepApplicant' => ['beneficiaries', 'beneficiary_id'],
+        'clpepApplicant'    => ['beneficiaries', 'beneficiary_id'],
+        'clpepIntervention' => ['clpep_interventions', 'intervention_id'],
     ];
 }
 
@@ -803,6 +819,26 @@ function clpepListDeleted() {
             'deletedAt'   => $r['deleted_at'],
         ];
     }, $s->fetchAll());
+
+    $ivS = db()->prepare(
+        "SELECT i.intervention_id AS id, i.intervention_name AS name, i.deleted_at, u.username AS deleted_by
+         FROM clpep_interventions i
+         LEFT JOIN users u ON u.user_id = i.deleted_by
+         WHERE i.deleted_at IS NOT NULL"
+    );
+    $ivS->execute();
+    foreach ($ivS->fetchAll() as $r) {
+        $items[] = [
+            'recordType'  => 'clpepIntervention',
+            'id'          => (int) $r['id'],
+            'name'        => $r['name'],
+            'module'      => 'CLPEP Interventions',
+            'description' => 'Child Labor Prevention and Elimination Program intervention',
+            'deletedBy'   => $r['deleted_by'] ?? '',
+            'deletedAt'   => $r['deleted_at'],
+        ];
+    }
+
     json(['status' => 'ok', 'data' => $items]);
 }
 
@@ -814,6 +850,7 @@ function clpepRestoreRecord() {
     $stmt->execute([':id' => $id]);
     if ($stmt->rowCount() === 0) error('Record not found in recycle bin.', 404);
 
+    logActivity(currentUserId(), 'Restore Record', 'livelihood', "Restored {$type} #{$id} from recycle bin");
     json(['status' => 'ok', 'message' => 'Record restored.']);
 }
 
@@ -825,8 +862,27 @@ function clpepPurgeRecord() {
     $chk->execute([':id' => $id]);
     if (!$chk->fetchColumn()) error('Record not found in recycle bin.', 404);
 
-    clpepHardDeleteApplicant($id);
+    if ($type === 'clpepApplicant') {
+        clpepHardDeleteApplicant($id);
+    } else {
+        clpepHardDeleteIntervention($id);
+    }
+    logActivity(currentUserId(), 'Purge Record', 'livelihood', "Permanently deleted {$type} #{$id}");
     json(['status' => 'ok', 'message' => 'Record permanently deleted.']);
+}
+
+// Permanently remove a CLPEP intervention and its uploaded files. Only
+// reachable for an already soft-deleted intervention, which
+// clpepDeleteIntervention's in-use guard already guaranteed has zero linked
+// beneficiaries.
+function clpepHardDeleteIntervention($id) {
+    $docs = db()->prepare("SELECT file_path FROM attached_documents WHERE clpep_intervention_id=:id");
+    $docs->execute([':id' => $id]);
+    foreach ($docs->fetchAll(PDO::FETCH_COLUMN) as $path) {
+        $abs = __DIR__ . '/../' . $path;
+        if (is_file($abs)) @unlink($abs);
+    }
+    db()->prepare("DELETE FROM clpep_interventions WHERE intervention_id=:id")->execute([':id' => $id]);
 }
 
 function clpepHardDeleteApplicant($bid) {

@@ -2,6 +2,7 @@
 // Login, logout, me, change-password, security-answers
 
 include_once __DIR__ . '/../core/helpers.php';
+include_once __DIR__ . '/../core/activity_log.php';
 
 // Router entry point. index.php calls this with the parsed action.
 function handle($action, $id, $method)
@@ -86,10 +87,12 @@ function authLogin()
 
     // Same vague message whether the user is missing or the password is wrong.
     if (!$user || !password_verify($password, $user['password_hash'])) {
+        logActivity(is_array($user) ? $user['user_id'] : null, 'Login', 'system', "Failed login attempt for username: {$username}", 'Failed');
         error('Invalid username or password.', 401);
     }
 
     if ($user['status'] !== 'Active') {
+        logActivity($user['user_id'], 'Login', 'system', "Login blocked (inactive account): {$username}", 'Failed');
         error('This account is inactive. Please contact an administrator.', 403);
     }
 
@@ -99,6 +102,8 @@ function authLogin()
 
     // Remember who is logged in.
     $_SESSION['user_id'] = (int) $user['user_id'];
+
+    logActivity((int) $user['user_id'], 'Login', 'system', "Successful login: {$username}", 'Success');
 
     $pub = publicUser($user);
     $pub['permissions'] = authPermissionNames((int) $user['user_id'], $user['role']);
@@ -175,6 +180,9 @@ function authPermissionNames($userId, $role)
 // POST /api/auth/logout
 function authLogout()
 {
+    if (!empty($_SESSION['user_id'])) {
+        logActivity((int) $_SESSION['user_id'], 'Logout', 'system', 'User logged out.', 'Success');
+    }
     $_SESSION = [];
     session_destroy();
     json(['status' => 'ok', 'message' => 'Logged out.']);

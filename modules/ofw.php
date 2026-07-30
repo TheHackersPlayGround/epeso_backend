@@ -27,6 +27,7 @@
 
 include_once __DIR__ . '/../core/helpers.php';
 include_once __DIR__ . '/../core/guard.php';
+include_once __DIR__ . '/../core/activity_log.php';
 
 function handle($action, $id, $method)
 {
@@ -429,6 +430,7 @@ function ofwCreateProfile() {
         if ($pdo->inTransaction()) $pdo->rollBack();
         error('Failed to save profile: ' . $e->getMessage(), 500);
     }
+    logActivity($uid, 'Create Profile', 'ofw', "Created applicant: " . trim($d['lastName']) . ", " . trim($d['firstName']));
     json(['status' => 'ok', 'message' => 'Profile saved.', 'data' => ofwBuildProfile($bid)]);
 }
 
@@ -494,6 +496,7 @@ function ofwUpdateProfile($id) {
         if ($pdo->inTransaction()) $pdo->rollBack();
         error('Failed to update profile: ' . $e->getMessage(), 500);
     }
+    logActivity($uid, 'Update Profile', 'ofw', "Updated applicant: " . trim($d['lastName']) . ", " . trim($d['firstName']));
     json(['status' => 'ok', 'message' => 'Profile updated.', 'data' => ofwBuildProfile($bid)]);
 }
 
@@ -512,6 +515,7 @@ function ofwUpdateStatus($id) {
 
     db()->prepare("UPDATE ofw_profiles SET status=:st, updated_at=now() WHERE ofw_profile_id=:pid")
         ->execute([':st' => $status, ':pid' => (int)$profileId]);
+    logActivity(currentUserId(), 'Update Status', 'ofw', "Set OFW profile #{$bid} status to {$status}");
     json(['status' => 'ok', 'message' => 'Status updated.', 'data' => ofwBuildProfile($bid)]);
 }
 
@@ -519,7 +523,13 @@ function ofwDeleteProfile($id) {
     if (!is_numeric($id)) error('Invalid id.', 422);
     $bid = (int)$id;
     $uid = requireLogin();
+
+    $nameS = db()->prepare("SELECT first_name, last_name FROM beneficiaries WHERE beneficiary_id=:id");
+    $nameS->execute([':id' => $bid]);
+    $nameRow = $nameS->fetch();
+
     db()->prepare("UPDATE beneficiaries SET deleted_at=now(),deleted_by=:uid WHERE beneficiary_id=:id")->execute([':uid' => $uid, ':id' => $bid]);
+    logActivity($uid, 'Delete Profile', 'ofw', "Moved to recycle bin: " . ($nameRow ? $nameRow['last_name'] . ', ' . $nameRow['first_name'] : "#{$bid}"));
     json(['status' => 'ok', 'message' => 'Profile moved to recycle bin.']);
 }
 
@@ -568,6 +578,7 @@ function ofwRestoreRecord() {
     $stmt = db()->prepare("UPDATE {$table} SET deleted_at = NULL, deleted_by = NULL WHERE {$pk} = :id AND deleted_at IS NOT NULL");
     $stmt->execute([':id' => $id]);
     if ($stmt->rowCount() === 0) error('Record not found in recycle bin.', 404);
+    logActivity(currentUserId(), 'Restore Record', 'ofw', "Restored {$type} #{$id} from recycle bin");
     json(['status' => 'ok', 'message' => 'Record restored.']);
 }
 
@@ -578,6 +589,7 @@ function ofwPurgeRecord() {
     $chk->execute([':id' => $id]);
     if (!$chk->fetchColumn()) error('Record not found in recycle bin.', 404);
     ofwHardDeleteApplicant($id);
+    logActivity(currentUserId(), 'Purge Record', 'ofw', "Permanently deleted {$type} #{$id}");
     json(['status' => 'ok', 'message' => 'Record permanently deleted.']);
 }
 

@@ -3,6 +3,7 @@
 
 include_once __DIR__ . '/../core/helpers.php';
 include_once __DIR__ . '/../core/guard.php';
+include_once __DIR__ . '/../core/activity_log.php';
 
 // Router entry point. index.php calls this with the parsed action/id/method.
 function handle($action, $id, $method)
@@ -203,6 +204,7 @@ function usersCreate()
         error('Could not create user.', 500, $e->getMessage());
     }
 
+    logActivity($createdBy, 'Add User', 'security', "Created user: {$username} ({$role})", 'Success');
     json(['status' => 'ok', 'user' => fetchUser($userId)], 201);
 }
 
@@ -301,6 +303,7 @@ function usersUpdate($id)
         error($e->getMessage(), 422);
     }
 
+    logActivity(currentUserId(), 'Update User', 'security', "Updated user: {$username} ({$role})", 'Success');
     json(['status' => 'ok', 'user' => fetchUser($id)]);
 }
 
@@ -312,7 +315,7 @@ function usersDelete($id)
         error('A valid user id is required.', 422);
     }
 
-    $stmt = db()->prepare("SELECT role, status FROM users WHERE user_id = :id");
+    $stmt = db()->prepare("SELECT username, role, status FROM users WHERE user_id = :id");
     $stmt->execute([':id' => $id]);
     $user = $stmt->fetch();
     if (!$user) {
@@ -340,6 +343,7 @@ function usersDelete($id)
         error('Could not delete user.', 500, $e->getMessage());
     }
 
+    logActivity(currentUserId(), 'Delete User', 'security', "Deleted user: {$user['username']} ({$user['role']})", 'Success');
     json(['status' => 'ok', 'message' => 'User deleted.']);
 }
 

@@ -9,6 +9,7 @@
 
 include_once __DIR__ . '/../core/helpers.php';
 include_once __DIR__ . '/../core/guard.php';
+include_once __DIR__ . '/../core/activity_log.php';
 
 function handle($action, $id, $method)
 {
@@ -109,6 +110,7 @@ function dilpListProjects() {
     $s = db()->query(
         "SELECT p.*, (SELECT COUNT(*) FROM dilp_project_beneficiaries pb WHERE pb.dilp_project_id = p.dilp_project_id) AS assigned_count
          FROM dilp_projects p
+         WHERE p.deleted_at IS NULL
          ORDER BY p.created_at DESC, p.dilp_project_id DESC"
     );
     json(['status' => 'ok', 'data' => array_map('dilpFormatProject', $s->fetchAll())]);
@@ -217,6 +219,7 @@ function dilpCreateProject() {
     $id = (int) $s->fetchColumn();
 
     dilpSyncProjectDocuments($pdo, $id, $uid, $d['documents'] ?? []);
+    logActivity($uid, 'Create Project', 'livelihood-maintenance', "Created project: {$name}");
     json(['status' => 'ok', 'message' => 'Project created.', 'data' => dilpGetProjectById($id)]);
 }
 
@@ -245,6 +248,7 @@ function dilpUpdateProject($id) {
     ]);
 
     dilpSyncProjectDocuments($pdo, $id, $uid, $d['documents'] ?? []);
+    logActivity($uid, 'Update Project', 'livelihood-maintenance', "Updated project: {$name}");
     json(['status' => 'ok', 'message' => 'Project updated.', 'data' => dilpGetProjectById($id)]);
 }
 
@@ -256,13 +260,15 @@ function dilpUpdateProjectStatus($id) {
     $status = in_array($d['status'] ?? '', $valid, true) ? $d['status'] : null;
     if (!$status) error('Valid status required.', 422);
 
-    $chk = db()->prepare("SELECT 1 FROM dilp_projects WHERE dilp_project_id=:id");
+    $chk = db()->prepare("SELECT project_name FROM dilp_projects WHERE dilp_project_id=:id");
     $chk->execute([':id' => $id]);
-    if (!$chk->fetchColumn()) error('Project not found.', 404);
+    $projName = $chk->fetchColumn();
+    if ($projName === false) error('Project not found.', 404);
 
     // No cascade write needed here: beneficiary status is derived at read time
     // from this same status column, so simply changing it here is sufficient.
     db()->prepare("UPDATE dilp_projects SET status=:s, updated_at=now() WHERE dilp_project_id=:id")->execute([':s' => $status, ':id' => $id]);
+    logActivity(currentUserId(), 'Update Project Status', 'livelihood-maintenance', "Set project '{$projName}' status to {$status}");
     json(['status' => 'ok', 'message' => 'Status updated.', 'data' => dilpGetProjectById($id)]);
 }
 
@@ -277,13 +283,15 @@ function dilpDeleteProject($id) {
         error("Cannot delete: {$cnt} " . ($cnt === 1 ? 'beneficiary' : 'beneficiaries') . " assigned to this project. Unassign them first.", 409);
     }
 
-    $docs = db()->prepare("SELECT file_path FROM attached_documents WHERE dilp_project_id=:id");
-    $docs->execute([':id' => $id]);
-    foreach ($docs->fetchAll(PDO::FETCH_COLUMN) as $path) {
-        $abs = __DIR__ . '/../' . $path;
-        if (is_file($abs)) @unlink($abs);
-    }
-    db()->prepare("DELETE FROM dilp_projects WHERE dilp_project_id=:id")->execute([':id' => $id]);
+    $nameS = db()->prepare("SELECT project_name FROM dilp_projects WHERE dilp_project_id=:id AND deleted_at IS NULL");
+    $nameS->execute([':id' => $id]);
+    $name = $nameS->fetchColumn();
+    if ($name === false) error('Project not found.', 404);
+
+    // Soft delete only -- files/document rows stay intact so a restored project
+    // still has its attachments; they're only removed at purge time.
+    db()->prepare("UPDATE dilp_projects SET deleted_at=now(), deleted_by=:uid WHERE dilp_project_id=:id")->execute([':uid' => currentUserId(), ':id' => $id]);
+    logActivity(currentUserId(), 'Delete Project', 'livelihood-maintenance', "Deleted project: {$name}");
     json(['status' => 'ok', 'message' => 'Project deleted.']);
 }
 
@@ -452,6 +460,7 @@ function dilpCreateProfile() {
         if ($pdo->inTransaction()) $pdo->rollBack();
         error('Failed to save profile: ' . $e->getMessage(), 500);
     }
+    logActivity($uid, 'Create Profile', 'livelihood', "Created beneficiary: " . trim($d['lastName']) . ", " . trim($d['firstName']));
     json(['status' => 'ok', 'message' => 'Profile saved.', 'data' => dilpBuildProfile($bid)]);
 }
 
@@ -504,6 +513,7 @@ function dilpUpdateProfile($id) {
         if ($pdo->inTransaction()) $pdo->rollBack();
         error('Failed to update profile: ' . $e->getMessage(), 500);
     }
+    logActivity($uid, 'Update Profile', 'livelihood', "Updated beneficiary: " . trim($d['lastName']) . ", " . trim($d['firstName']));
     json(['status' => 'ok', 'message' => 'Profile updated.', 'data' => dilpBuildProfile($bid)]);
 }
 
@@ -527,7 +537,12 @@ function dilpDeleteProfile($id) {
         error('This beneficiary cannot be deleted because they are currently assigned to an active project. Unassign them first (only possible while the project is still Planned), or wait until it is marked Completed.', 409);
     }
 
+    $nameS = db()->prepare("SELECT first_name, last_name FROM beneficiaries WHERE beneficiary_id=:id");
+    $nameS->execute([':id' => $bid]);
+    $nameRow = $nameS->fetch();
+
     db()->prepare("UPDATE beneficiaries SET deleted_at=now(),deleted_by=:uid WHERE beneficiary_id=:id")->execute([':uid' => $uid, ':id' => $bid]);
+    logActivity($uid, 'Delete Profile', 'livelihood', "Moved to recycle bin: " . ($nameRow ? $nameRow['last_name'] . ', ' . $nameRow['first_name'] : "#{$bid}"));
     json(['status' => 'ok', 'message' => 'Beneficiary moved to recycle bin.']);
 }
 
@@ -567,7 +582,7 @@ function dilpAssignProject() {
         error('This beneficiary is already assigned to a project that is no longer Planned — reassigning would erase the only record of that assignment.', 409);
     }
 
-    $projS = db()->prepare("SELECT status FROM dilp_projects WHERE dilp_project_id=:id");
+    $projS = db()->prepare("SELECT status FROM dilp_projects WHERE dilp_project_id=:id AND deleted_at IS NULL");
     $projS->execute([':id' => $projectId]);
     $status = $projS->fetchColumn();
     if ($status === false) error('Project not found.', 404);
@@ -749,6 +764,7 @@ function dilpFetchProjectDocuments($projectId) {
 function dilpRecycleMap() {
     return [
         'dilpApplicant' => ['beneficiaries', 'beneficiary_id'],
+        'dilpProject'   => ['dilp_projects', 'dilp_project_id'],
     ];
 }
 
@@ -784,6 +800,26 @@ function dilpListDeleted() {
             'deletedAt'   => $r['deleted_at'],
         ];
     }, $s->fetchAll());
+
+    $projS = db()->prepare(
+        "SELECT p.dilp_project_id AS id, p.project_name AS name, p.deleted_at, u.username AS deleted_by
+         FROM dilp_projects p
+         LEFT JOIN users u ON u.user_id = p.deleted_by
+         WHERE p.deleted_at IS NOT NULL"
+    );
+    $projS->execute();
+    foreach ($projS->fetchAll() as $r) {
+        $items[] = [
+            'recordType'  => 'dilpProject',
+            'id'          => (int) $r['id'],
+            'name'        => $r['name'],
+            'module'      => 'DILP Projects',
+            'description' => 'DOLE Integrated Livelihood Program project',
+            'deletedBy'   => $r['deleted_by'] ?? '',
+            'deletedAt'   => $r['deleted_at'],
+        ];
+    }
+
     json(['status' => 'ok', 'data' => $items]);
 }
 
@@ -795,6 +831,7 @@ function dilpRestoreRecord() {
     $stmt->execute([':id' => $id]);
     if ($stmt->rowCount() === 0) error('Record not found in recycle bin.', 404);
 
+    logActivity(currentUserId(), 'Restore Record', 'livelihood', "Restored {$type} #{$id} from recycle bin");
     json(['status' => 'ok', 'message' => 'Record restored.']);
 }
 
@@ -806,8 +843,26 @@ function dilpPurgeRecord() {
     $chk->execute([':id' => $id]);
     if (!$chk->fetchColumn()) error('Record not found in recycle bin.', 404);
 
-    dilpHardDeleteApplicant($id);
+    if ($type === 'dilpApplicant') {
+        dilpHardDeleteApplicant($id);
+    } else {
+        dilpHardDeleteProject($id);
+    }
+    logActivity(currentUserId(), 'Purge Record', 'livelihood', "Permanently deleted {$type} #{$id}");
     json(['status' => 'ok', 'message' => 'Record permanently deleted.']);
+}
+
+// Permanently remove a DILP project and its uploaded files. Only reachable
+// for an already soft-deleted project, which dilpDeleteProject's in-use guard
+// already guaranteed has zero linked beneficiaries.
+function dilpHardDeleteProject($id) {
+    $docs = db()->prepare("SELECT file_path FROM attached_documents WHERE dilp_project_id=:id");
+    $docs->execute([':id' => $id]);
+    foreach ($docs->fetchAll(PDO::FETCH_COLUMN) as $path) {
+        $abs = __DIR__ . '/../' . $path;
+        if (is_file($abs)) @unlink($abs);
+    }
+    db()->prepare("DELETE FROM dilp_projects WHERE dilp_project_id=:id")->execute([':id' => $id]);
 }
 
 function dilpHardDeleteApplicant($bid) {

@@ -22,6 +22,7 @@
 
 include_once __DIR__ . '/../core/helpers.php';
 include_once __DIR__ . '/../core/guard.php';
+include_once __DIR__ . '/../core/activity_log.php';
 
 function handle($action, $id, $method)
 {
@@ -112,6 +113,7 @@ function stListBatches() {
         "SELECT b.batch_id, b.batch_name, b.description, b.is_active,
                 (SELECT COUNT(*) FROM skills_training_activities a WHERE a.batch_id = b.batch_id) AS training_count
          FROM skills_training_batches b
+         WHERE b.deleted_at IS NULL
          ORDER BY b.batch_name"
     );
     $out = array_map(function($r) {
@@ -130,22 +132,28 @@ function stCreateBatch() {
     $d = body();
     $name = trim($d['batchName'] ?? '');
     if ($name === '') error('Batch name is required.', 422);
-    $chk = db()->prepare("SELECT 1 FROM skills_training_batches WHERE batch_name=:n");
+    $chk = db()->prepare("SELECT 1 FROM skills_training_batches WHERE batch_name=:n AND deleted_at IS NULL");
     $chk->execute([':n' => $name]);
     if ($chk->fetchColumn()) error('This batch already exists.', 409);
     $s = db()->prepare("INSERT INTO skills_training_batches(batch_name,description,is_active,created_at,updated_at) VALUES(:n,:d,true,now(),now()) RETURNING batch_id");
     $s->execute([':n' => $name, ':d' => stNullStr($d['description'] ?? '')]);
+    logActivity(currentUserId(), 'Create Batch', 'skills-maintenance', "Created batch: {$name}");
     json(['status' => 'ok', 'message' => 'Batch added.', 'data' => ['id' => (int)$s->fetchColumn(), 'batchName' => $name]]);
 }
 
 function stDeleteBatch($id) {
     if (!is_numeric($id)) error('Invalid batch id.', 422);
     $id = (int)$id;
-    $cntS = db()->prepare("SELECT COUNT(*) FROM skills_training_activities WHERE batch_id=:id");
+    $cntS = db()->prepare("SELECT COUNT(*) FROM skills_training_activities WHERE batch_id=:id AND deleted_at IS NULL");
     $cntS->execute([':id' => $id]);
     $cnt = (int)$cntS->fetchColumn();
     if ($cnt > 0) error("Cannot delete: $cnt training" . ($cnt === 1 ? '' : 's') . ' still under this batch.', 409);
-    db()->prepare("DELETE FROM skills_training_batches WHERE batch_id=:id")->execute([':id' => $id]);
+    $nameS = db()->prepare("SELECT batch_name FROM skills_training_batches WHERE batch_id=:id AND deleted_at IS NULL");
+    $nameS->execute([':id' => $id]);
+    $name = $nameS->fetchColumn();
+    if ($name === false) error('Batch not found.', 404);
+    db()->prepare("UPDATE skills_training_batches SET deleted_at=now(), deleted_by=:uid WHERE batch_id=:id")->execute([':uid' => currentUserId(), ':id' => $id]);
+    logActivity(currentUserId(), 'Delete Batch', 'skills-maintenance', "Deleted batch: {$name}");
     json(['status' => 'ok', 'message' => 'Batch deleted.']);
 }
 
@@ -175,6 +183,7 @@ function stListActivities() {
                 (SELECT COUNT(*) FROM skills_training_activity_participants p WHERE p.activity_id = a.activity_id) AS assigned_count
          FROM skills_training_activities a
          JOIN skills_training_batches b ON b.batch_id = a.batch_id
+         WHERE a.deleted_at IS NULL
          ORDER BY a.activity_date DESC, a.activity_id DESC"
     );
     json(['status' => 'ok', 'data' => array_map('stFormatActivity', $s->fetchAll())]);
@@ -199,7 +208,7 @@ function stCreateActivity() {
     if (stNullStr($d['title'] ?? '') === null) error('Training title is required.', 422);
     $batchId = stIntOrNull($d['batchId'] ?? '');
     if (!$batchId) error('Training batch is required.', 422);
-    $chk = db()->prepare("SELECT 1 FROM skills_training_batches WHERE batch_id=:id");
+    $chk = db()->prepare("SELECT 1 FROM skills_training_batches WHERE batch_id=:id AND deleted_at IS NULL");
     $chk->execute([':id' => $batchId]);
     if (!$chk->fetchColumn()) error('Selected batch not found.', 422);
 
@@ -214,6 +223,7 @@ function stCreateActivity() {
         ':date' => stDate($d['date'] ?? '') ?? date('Y-m-d'), ':venue' => stNullStr($d['location'] ?? ''),
         ':fac' => stNullStr($d['facilitator'] ?? ''), ':pc' => stIntOrNull($d['participants'] ?? '') ?? 0,
     ]);
+    logActivity(currentUserId(), 'Create Activity', 'skills-maintenance', "Created training: " . trim($d['title']));
     json(['status' => 'ok', 'message' => 'Training created.', 'data' => stGetActivityById((int)$s->fetchColumn())]);
 }
 
@@ -238,6 +248,7 @@ function stUpdateActivity($id) {
         ':fac' => stNullStr($d['facilitator'] ?? ''), ':pc' => stIntOrNull($d['participants'] ?? '') ?? 0,
         ':st' => $status, ':id' => $id,
     ]);
+    logActivity(currentUserId(), 'Update Activity', 'skills-maintenance', "Updated training: " . trim($d['title']));
     json(['status' => 'ok', 'message' => 'Training updated.', 'data' => stGetActivityById($id)]);
 }
 
@@ -249,6 +260,9 @@ function stUpdateActivityStatus($id) {
     if (!$status) error('Valid status required.', 422);
     db()->prepare("UPDATE skills_training_activities SET status=:s,updated_at=now() WHERE activity_id=:id")
         ->execute([':s' => $status, ':id' => (int)$id]);
+    $titleS = db()->prepare("SELECT activity_title FROM skills_training_activities WHERE activity_id=:id");
+    $titleS->execute([':id' => (int)$id]);
+    logActivity(currentUserId(), 'Update Activity Status', 'skills-maintenance', "Set training '{$titleS->fetchColumn()}' status to {$status}");
     json(['status' => 'ok', 'message' => 'Status updated.', 'data' => stGetActivityById((int)$id)]);
 }
 
@@ -259,7 +273,12 @@ function stDeleteActivity($id) {
     $cntS->execute([':id' => $id]);
     $cnt = (int)$cntS->fetchColumn();
     if ($cnt > 0) error("Cannot delete: $cnt applicant" . ($cnt === 1 ? ' is' : 's are') . ' still assigned to this training. Unassign them first.', 409);
-    db()->prepare("DELETE FROM skills_training_activities WHERE activity_id=:id")->execute([':id' => $id]);
+    $titleS = db()->prepare("SELECT activity_title FROM skills_training_activities WHERE activity_id=:id AND deleted_at IS NULL");
+    $titleS->execute([':id' => $id]);
+    $title = $titleS->fetchColumn();
+    if ($title === false) error('Training not found.', 404);
+    db()->prepare("UPDATE skills_training_activities SET deleted_at=now(), deleted_by=:uid WHERE activity_id=:id")->execute([':uid' => currentUserId(), ':id' => $id]);
+    logActivity(currentUserId(), 'Delete Activity', 'skills-maintenance', "Deleted training: {$title}");
     json(['status' => 'ok', 'message' => 'Training deleted.']);
 }
 
@@ -306,7 +325,7 @@ function stAddParticipant() {
     $bsId  = stIntOrNull($d['beneficiaryServiceId'] ?? '');
     if (!$actId || !$bsId) error('activityId and beneficiaryServiceId are required.', 422);
 
-    $actS = db()->prepare("SELECT status, batch_id, participant_count FROM skills_training_activities WHERE activity_id=:a");
+    $actS = db()->prepare("SELECT status, batch_id, participant_count FROM skills_training_activities WHERE activity_id=:a AND deleted_at IS NULL");
     $actS->execute([':a' => $actId]);
     $act = $actS->fetch();
     if (!$act) error('Training not found.', 404);
@@ -681,6 +700,7 @@ function stCreateProfile() {
         if ($pdo->inTransaction()) $pdo->rollBack();
         error('Failed to save profile: ' . $e->getMessage(), 500);
     }
+    logActivity($uid, 'Create Profile', 'skills', "Created applicant: " . trim($d['lastName']) . ", " . trim($d['firstName']));
     json(['status' => 'ok', 'message' => 'Profile saved.', 'data' => stBuildProfile($bid)]);
 }
 
@@ -748,6 +768,7 @@ function stUpdateProfile($id) {
         if ($pdo->inTransaction()) $pdo->rollBack();
         error('Failed to update profile: ' . $e->getMessage(), 500);
     }
+    logActivity($uid, 'Update Profile', 'skills', "Updated applicant: " . trim($d['lastName']) . ", " . trim($d['firstName']));
     json(['status' => 'ok', 'message' => 'Profile updated.', 'data' => stBuildProfile($bid)]);
 }
 
@@ -770,7 +791,12 @@ function stDeleteProfile($id) {
         error('This applicant cannot be deleted because they are currently assigned to an active training. Unassign them first (only possible while the training is still Planned), or wait until it is marked Completed.', 409);
     }
 
+    $nameS = db()->prepare("SELECT first_name, last_name FROM beneficiaries WHERE beneficiary_id=:id");
+    $nameS->execute([':id' => $bid]);
+    $nameRow = $nameS->fetch();
+
     db()->prepare("UPDATE beneficiaries SET deleted_at=now(),deleted_by=:uid WHERE beneficiary_id=:id")->execute([':uid' => $uid, ':id' => $bid]);
+    logActivity($uid, 'Delete Profile', 'skills', "Moved to recycle bin: " . ($nameRow ? $nameRow['last_name'] . ', ' . $nameRow['first_name'] : "#{$bid}"));
     json(['status' => 'ok', 'message' => 'Applicant moved to recycle bin.']);
 }
 
@@ -779,7 +805,11 @@ function stDeleteProfile($id) {
 // ═══════════════════════════════════════════════════════════════════════════════
 
 function stRecycleMap() {
-    return ['skillsTrainingApplicant' => ['beneficiaries', 'beneficiary_id']];
+    return [
+        'skillsTrainingApplicant' => ['beneficiaries', 'beneficiary_id'],
+        'skillsTrainingBatch'     => ['skills_training_batches', 'batch_id'],
+        'skillsTrainingActivity'  => ['skills_training_activities', 'activity_id'],
+    ];
 }
 
 function stRecycleTarget() {
@@ -810,6 +840,37 @@ function stListDeleted() {
             'deletedBy' => $r['deleted_by'] ?? '', 'deletedAt' => $r['deleted_at'],
         ];
     }, $s->fetchAll());
+
+    $batchS = db()->prepare(
+        "SELECT b.batch_id AS id, b.batch_name AS name, b.deleted_at, u.username AS deleted_by
+         FROM skills_training_batches b
+         LEFT JOIN users u ON u.user_id = b.deleted_by
+         WHERE b.deleted_at IS NOT NULL"
+    );
+    $batchS->execute();
+    foreach ($batchS->fetchAll() as $r) {
+        $items[] = [
+            'recordType' => 'skillsTrainingBatch', 'id' => (int) $r['id'], 'name' => $r['name'],
+            'module' => 'Skills Training Batches', 'description' => 'Skills Training batch',
+            'deletedBy' => $r['deleted_by'] ?? '', 'deletedAt' => $r['deleted_at'],
+        ];
+    }
+
+    $actS = db()->prepare(
+        "SELECT a.activity_id AS id, a.activity_title AS name, a.deleted_at, u.username AS deleted_by
+         FROM skills_training_activities a
+         LEFT JOIN users u ON u.user_id = a.deleted_by
+         WHERE a.deleted_at IS NOT NULL"
+    );
+    $actS->execute();
+    foreach ($actS->fetchAll() as $r) {
+        $items[] = [
+            'recordType' => 'skillsTrainingActivity', 'id' => (int) $r['id'], 'name' => $r['name'],
+            'module' => 'Skills Training Activities', 'description' => 'Skills Training activity',
+            'deletedBy' => $r['deleted_by'] ?? '', 'deletedAt' => $r['deleted_at'],
+        ];
+    }
+
     json(['status' => 'ok', 'data' => $items]);
 }
 
@@ -819,6 +880,7 @@ function stRestoreRecord() {
     $stmt = db()->prepare("UPDATE {$table} SET deleted_at = NULL, deleted_by = NULL WHERE {$pk} = :id AND deleted_at IS NOT NULL");
     $stmt->execute([':id' => $id]);
     if ($stmt->rowCount() === 0) error('Record not found in recycle bin.', 404);
+    logActivity(currentUserId(), 'Restore Record', 'skills', "Restored {$type} #{$id} from recycle bin");
     json(['status' => 'ok', 'message' => 'Record restored.']);
 }
 
@@ -828,7 +890,14 @@ function stPurgeRecord() {
     $chk = db()->prepare("SELECT 1 FROM {$table} WHERE {$pk} = :id AND deleted_at IS NOT NULL");
     $chk->execute([':id' => $id]);
     if (!$chk->fetchColumn()) error('Record not found in recycle bin.', 404);
-    stHardDeleteApplicant($id);
+    if ($type === 'skillsTrainingApplicant') {
+        stHardDeleteApplicant($id);
+    } elseif ($type === 'skillsTrainingBatch') {
+        db()->prepare("DELETE FROM skills_training_batches WHERE batch_id=:id")->execute([':id' => $id]);
+    } else {
+        db()->prepare("DELETE FROM skills_training_activities WHERE activity_id=:id")->execute([':id' => $id]);
+    }
+    logActivity(currentUserId(), 'Purge Record', 'skills', "Permanently deleted {$type} #{$id}");
     json(['status' => 'ok', 'message' => 'Record permanently deleted.']);
 }
 

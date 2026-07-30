@@ -16,6 +16,7 @@
 
 include_once __DIR__ . '/../core/helpers.php';
 include_once __DIR__ . '/../core/guard.php';
+include_once __DIR__ . '/../core/activity_log.php';
 
 // Router entry point. index.php calls this with the parsed action/id/method.
 function handle($action, $id, $method)
@@ -262,6 +263,7 @@ function employmentCreateApplicant()
         error('Failed to save applicant: ' . $e->getMessage(), 500);
     }
 
+    logActivity($uid, 'Create Applicant', 'employment', "Created applicant: " . trim($d['surname']) . ", " . trim($d['firstName']));
     json(['status' => 'ok', 'message' => 'Applicant saved.', 'data' => ['id' => $beneficiaryId]]);
 }
 
@@ -449,7 +451,7 @@ function employmentSavePhoto($pdo, $bid, $bsId, $uid, $d)
     if (file_put_contents($absPath, $binary) === false) return;
 
     $stmt = $pdo->prepare(
-        "INSERT INTO documents
+        "INSERT INTO attached_documents
             (beneficiary_id, beneficiary_service_id, document_source, document_type,
              title, file_name, file_path, file_size, mime_type, uploaded_by)
          VALUES
@@ -535,7 +537,7 @@ function employmentSyncDocuments($pdo, $bid, $bsId, $uid, $d)
 
     // Insert the newly-uploaded files.
     $ins = $pdo->prepare(
-        "INSERT INTO documents
+        "INSERT INTO attached_documents
             (beneficiary_id, beneficiary_service_id, document_source, document_type,
              title, file_name, file_path, file_size, mime_type, uploaded_by)
          VALUES
@@ -1151,6 +1153,7 @@ function employmentUpdateApplicant($id)
         error('Failed to update applicant. Please try again.', 500);
     }
 
+    logActivity($uid, 'Update Applicant', 'employment', "Updated applicant: " . trim($d['surname']) . ", " . trim($d['firstName']));
     json(['status' => 'ok', 'message' => 'Applicant updated.', 'data' => ['id' => $bid]]);
 }
 
@@ -1188,6 +1191,10 @@ function employmentDeleteApplicant($id)
     if ($state === 'Hired')    error('This applicant cannot be deleted because they are currently placed in a job. Update the placement status first.', 409);
     if ($state === 'Referred') error('This applicant cannot be deleted because they have an active referral. Resolve the referral first.', 409);
 
+    $nameS = db()->prepare("SELECT first_name, last_name FROM beneficiaries WHERE beneficiary_id=:id");
+    $nameS->execute([':id' => $bid]);
+    $nameRow = $nameS->fetch();
+
     try {
         db()->prepare("UPDATE beneficiaries SET deleted_at = now(), deleted_by = :uid WHERE beneficiary_id = :id")
             ->execute([':uid' => $uid, ':id' => $bid]);
@@ -1195,6 +1202,7 @@ function employmentDeleteApplicant($id)
         error('Failed to delete applicant. Please try again.', 500);
     }
 
+    logActivity($uid, 'Delete Applicant', 'employment', "Moved to recycle bin: " . ($nameRow ? $nameRow['last_name'] . ', ' . $nameRow['first_name'] : "#{$bid}"));
     json(['status' => 'ok', 'message' => 'Applicant moved to recycle bin.']);
 }
 
@@ -1214,7 +1222,7 @@ function employmentHardDeleteApplicant($bid)
             $pdo->prepare("DELETE FROM employment_facilitation_profiles WHERE beneficiary_service_id = :id")->execute([':id' => (int) $bsId]);
         }
         employmentUnlinkDocs($pdo, $bid); // unlink all document files first
-        foreach (['educations', 'trainings', 'eligibilities', 'licenses', 'work_experiences', 'job_preferences', 'languages', 'skills', 'beneficiary_classifications', 'disabilities', 'documents'] as $t) {
+        foreach (['educations', 'trainings', 'eligibilities', 'licenses', 'work_experiences', 'job_preferences', 'languages', 'skills', 'beneficiary_classifications', 'disabilities', 'attached_documents'] as $t) {
             $pdo->prepare("DELETE FROM {$t} WHERE beneficiary_id = :id")->execute([':id' => $bid]);
         }
         $pdo->prepare("DELETE FROM beneficiary_services WHERE beneficiary_id = :id")->execute([':id' => $bid]);
@@ -1407,6 +1415,7 @@ function efCreateEmployer()
         error('Failed to save employer. Please try again.', 500);
     }
 
+    logActivity(currentUserId(), 'Create Employer', 'employment', "Created employer: " . trim($d['companyName']));
     json(['status' => 'ok', 'message' => 'Employer saved.', 'data' => ['id' => $id]]);
 }
 
@@ -1435,6 +1444,7 @@ function efUpdateEmployer($id)
         error('Failed to update employer. Please try again.', 500);
     }
 
+    logActivity(currentUserId(), 'Update Employer', 'employment', "Updated employer: " . trim($d['companyName']));
     json(['status' => 'ok', 'message' => 'Employer updated.']);
 }
 
@@ -1450,6 +1460,10 @@ function efDeleteEmployer($id)
         error('Cannot delete: this employer has vacancies. Remove the vacancies first.', 409);
     }
 
+    $nameS = db()->prepare("SELECT company_name FROM employers WHERE employer_id=:id");
+    $nameS->execute([':id' => (int) $id]);
+    $name = $nameS->fetchColumn();
+
     try {
         $stmt = db()->prepare("UPDATE employers SET deleted_at = now(), deleted_by = :uid WHERE employer_id = :id AND deleted_at IS NULL");
         $stmt->execute([':uid' => $uid, ':id' => (int) $id]);
@@ -1458,17 +1472,14 @@ function efDeleteEmployer($id)
     }
     if ($stmt->rowCount() === 0) error('Employer not found.', 404);
 
+    logActivity($uid, 'Delete Employer', 'employment', "Moved to recycle bin: {$name}");
     json(['status' => 'ok', 'message' => 'Employer moved to recycle bin.']);
 }
 
 // Permanently remove an employer row. Used by the recycle bin's permanent-delete.
 function employmentHardDeleteEmployer($id)
 {
-    try {
-        db()->prepare("DELETE FROM employers WHERE employer_id = :id")->execute([':id' => (int) $id]);
-    } catch (Throwable $e) {
-        error('Failed to permanently delete employer. Please try again.', 500);
-    }
+    db()->prepare("DELETE FROM employers WHERE employer_id = :id")->execute([':id' => (int) $id]);
 }
 
 // ═══════════════════════════════════════════════════════════════════════════════
@@ -1615,6 +1626,7 @@ function efCreateVacancy()
         error('Failed to save vacancy. Please try again.', 500);
     }
 
+    logActivity(currentUserId(), 'Create Vacancy', 'employment', "Created vacancy: " . trim($d['jobTitle']));
     json(['status' => 'ok', 'message' => 'Vacancy saved.', 'data' => ['id' => $id]]);
 }
 
@@ -1659,6 +1671,7 @@ function efUpdateVacancy($id)
         error('Failed to update vacancy. Please try again.', 500);
     }
 
+    logActivity(currentUserId(), 'Update Vacancy', 'employment', "Updated vacancy: " . trim($d['jobTitle']));
     json(['status' => 'ok', 'message' => 'Vacancy updated.']);
 }
 
@@ -1681,6 +1694,7 @@ function efToggleVacancyStatus($id)
         error('Failed to update vacancy status. Please try again.', 500);
     }
 
+    logActivity(currentUserId(), 'Toggle Vacancy Status', 'employment', "Set vacancy #{$id} status to {$next}");
     json(['status' => 'ok', 'message' => "Vacancy {$next}.", 'data' => ['status' => $next]]);
 }
 
@@ -1920,6 +1934,7 @@ function efCreateReferral()
         error('Failed to create referral. Please try again.', 500);
     }
 
+    logActivity(currentUserId(), 'Create Referral', 'employment', "Created referral: applicant #{$applicantId} to vacancy #{$vacancyId}");
     json(['status' => 'ok', 'message' => 'Referral created.', 'data' => ['id' => $id]]);
 }
 
@@ -1950,6 +1965,7 @@ function efUpdateReferralStatus($id)
     if ($status !== 'Hired') {
         db()->prepare("UPDATE employment_facilitation_referrals SET status = :s, updated_at = now() WHERE referral_id = :id")
             ->execute([':s' => $status, ':id' => (int) $id]);
+        logActivity(currentUserId(), 'Update Referral Status', 'employment', "Set referral #{$id} ({$referral['company_name']} - {$referral['job_title']}) status to {$status}");
         json(['status' => 'ok', 'message' => "Referral status updated to {$status}."]);
         return;
     }
@@ -1991,6 +2007,7 @@ function efUpdateReferralStatus($id)
         error('Failed to update referral. Please try again.', 500);
     }
 
+    logActivity(currentUserId(), 'Update Referral Status', 'employment', "Referral #{$id} -> Hired ({$referral['company_name']} - {$referral['job_title']}), placement #{$placementId} created");
     json(['status' => 'ok', 'message' => 'Applicant hired and placement created.', 'data' => ['placementId' => $placementId]]);
 }
 
@@ -2011,17 +2028,14 @@ function efDeleteReferral($id)
         error('Failed to delete referral. Please try again.', 500);
     }
 
+    logActivity($uid, 'Delete Referral', 'employment', "Moved referral #{$id} to recycle bin");
     json(['status' => 'ok', 'message' => 'Referral moved to recycle bin.']);
 }
 
 // Permanently remove a referral row. Used by the recycle bin's permanent-delete.
 function employmentHardDeleteReferral($id)
 {
-    try {
-        db()->prepare("DELETE FROM employment_facilitation_referrals WHERE referral_id = :id")->execute([':id' => (int) $id]);
-    } catch (Throwable $e) {
-        error('Failed to permanently delete referral. Please try again.', 500);
-    }
+    db()->prepare("DELETE FROM employment_facilitation_referrals WHERE referral_id = :id")->execute([':id' => (int) $id]);
 }
 
 // ═══════════════════════════════════════════════════════════════════════════════
@@ -2111,6 +2125,7 @@ function efUpdatePlacement($id)
         error('Failed to update placement. Please try again.', 500);
     }
 
+    logActivity(currentUserId(), 'Update Placement', 'employment', "Updated placement #{$id}");
     json(['status' => 'ok', 'message' => 'Placement updated.']);
 }
 
@@ -2131,6 +2146,7 @@ function efUpdatePlacementStatus($id)
         error('Failed to update placement status. Please try again.', 500);
     }
 
+    logActivity(currentUserId(), 'Update Placement Status', 'employment', "Set placement #{$id} status to {$status}");
     json(['status' => 'ok', 'message' => "Placement status updated to {$status}."]);
 }
 
@@ -2211,6 +2227,7 @@ function efCreatePromotion($id)
         error('Failed to record promotion. Please try again.', 500);
     }
 
+    logActivity($uid, 'Create Promotion', 'employment', "Recorded promotion for placement #{$id}: " . trim($d['newJobTitle']));
     json(['status' => 'ok', 'message' => 'Promotion recorded.']);
 }
 
@@ -2568,6 +2585,7 @@ function efRestoreRecord()
     $stmt->execute([':id' => $id]);
     if ($stmt->rowCount() === 0) error('Record not found in recycle bin.', 404);
 
+    logActivity(currentUserId(), 'Restore Record', 'employment', "Restored {$type} #{$id} from recycle bin");
     json(['status' => 'ok', 'message' => 'Record restored.']);
 }
 
@@ -2586,5 +2604,6 @@ function efPurgeRecord()
     elseif ($type === 'employer') employmentHardDeleteEmployer($id);
     else                          employmentHardDeleteReferral($id);
 
+    logActivity(currentUserId(), 'Purge Record', 'employment', "Permanently deleted {$type} #{$id}");
     json(['status' => 'ok', 'message' => 'Record permanently deleted.']);
 }

@@ -33,6 +33,7 @@ function requireAdmin()
     return $id;
 }
 
+
 // Module-level permission gate. Mirrors the frontend canManage()/canView() rules.
 //
 //   $module  one of the 11 dashboard keys: 'employment','cdsp','gip','spes',

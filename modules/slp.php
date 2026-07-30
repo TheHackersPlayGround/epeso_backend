@@ -21,6 +21,7 @@
 
 include_once __DIR__ . '/../core/helpers.php';
 include_once __DIR__ . '/../core/guard.php';
+include_once __DIR__ . '/../core/activity_log.php';
 
 function handle($action, $id, $method)
 {
@@ -121,6 +122,7 @@ function slpListProjects() {
     $s = db()->query(
         "SELECT p.*, (SELECT COUNT(*) FROM slp_project_beneficiaries pb WHERE pb.project_id = p.project_id) AS assigned_count
          FROM slp_projects p
+         WHERE p.deleted_at IS NULL
          ORDER BY p.created_at DESC, p.project_id DESC"
     );
     json(['status' => 'ok', 'data' => array_map('slpFormatProject', $s->fetchAll())]);
@@ -195,6 +197,7 @@ function slpCreateProject() {
     $id = (int) $s->fetchColumn();
 
     slpSyncProjectDocuments($pdo, $id, $uid, $d['documents'] ?? []);
+    logActivity($uid, 'Create Project', 'livelihood-maintenance', "Created project: {$name}");
     json(['status' => 'ok', 'message' => 'Project created.', 'data' => slpGetProjectById($id)]);
 }
 
@@ -223,6 +226,7 @@ function slpUpdateProject($id) {
     ]);
 
     slpSyncProjectDocuments($pdo, $id, $uid, $d['documents'] ?? []);
+    logActivity($uid, 'Update Project', 'livelihood-maintenance', "Updated project: {$name}");
     json(['status' => 'ok', 'message' => 'Project updated.', 'data' => slpGetProjectById($id)]);
 }
 
@@ -234,9 +238,10 @@ function slpUpdateProjectStatus($id) {
     $status = in_array($d['status'] ?? '', $valid, true) ? $d['status'] : null;
     if (!$status) error('Valid status required.', 422);
 
-    $chk = db()->prepare("SELECT 1 FROM slp_projects WHERE project_id=:id");
+    $chk = db()->prepare("SELECT project_name FROM slp_projects WHERE project_id=:id");
     $chk->execute([':id' => $id]);
-    if (!$chk->fetchColumn()) error('Project not found.', 404);
+    $projName = $chk->fetchColumn();
+    if ($projName === false) error('Project not found.', 404);
 
     db()->prepare("UPDATE slp_projects SET status=:s, updated_at=now() WHERE project_id=:id")->execute([':s' => $status, ':id' => $id]);
 
@@ -245,6 +250,7 @@ function slpUpdateProjectStatus($id) {
     // compute it purely at read time).
     slpRefreshDerivedStatusForProject($id, $status);
 
+    logActivity(currentUserId(), 'Update Project Status', 'livelihood-maintenance', "Set project '{$projName}' status to {$status}");
     json(['status' => 'ok', 'message' => 'Status updated.', 'data' => slpGetProjectById($id)]);
 }
 
@@ -269,13 +275,15 @@ function slpDeleteProject($id) {
         error("Cannot delete: {$cnt} " . ($cnt === 1 ? 'beneficiary' : 'beneficiaries') . " assigned to this project. Unassign them first.", 409);
     }
 
-    $docs = db()->prepare("SELECT file_path FROM attached_documents WHERE slp_project_id=:id");
-    $docs->execute([':id' => $id]);
-    foreach ($docs->fetchAll(PDO::FETCH_COLUMN) as $path) {
-        $abs = __DIR__ . '/../' . $path;
-        if (is_file($abs)) @unlink($abs);
-    }
-    db()->prepare("DELETE FROM slp_projects WHERE project_id=:id")->execute([':id' => $id]);
+    $nameS = db()->prepare("SELECT project_name FROM slp_projects WHERE project_id=:id AND deleted_at IS NULL");
+    $nameS->execute([':id' => $id]);
+    $name = $nameS->fetchColumn();
+    if ($name === false) error('Project not found.', 404);
+
+    // Soft delete only -- files/document rows stay intact so a restored project
+    // still has its attachments; they're only removed at purge time.
+    db()->prepare("UPDATE slp_projects SET deleted_at=now(), deleted_by=:uid WHERE project_id=:id")->execute([':uid' => currentUserId(), ':id' => $id]);
+    logActivity(currentUserId(), 'Delete Project', 'livelihood-maintenance', "Deleted project: {$name}");
     json(['status' => 'ok', 'message' => 'Project deleted.']);
 }
 
@@ -544,6 +552,7 @@ function slpCreateProfile() {
         if ($pdo->inTransaction()) $pdo->rollBack();
         error('Failed to save profile: ' . $e->getMessage(), 500);
     }
+    logActivity($uid, 'Create Profile', 'livelihood', "Created beneficiary: " . trim($d['lastName']) . ", " . trim($d['firstName']));
     json(['status' => 'ok', 'message' => 'Profile saved.', 'data' => slpBuildProfile($bid)]);
 }
 
@@ -600,6 +609,7 @@ function slpUpdateProfile($id) {
         if ($pdo->inTransaction()) $pdo->rollBack();
         error('Failed to update profile: ' . $e->getMessage(), 500);
     }
+    logActivity($uid, 'Update Profile', 'livelihood', "Updated beneficiary: " . trim($d['lastName']) . ", " . trim($d['firstName']));
     json(['status' => 'ok', 'message' => 'Profile updated.', 'data' => slpBuildProfile($bid)]);
 }
 
@@ -624,7 +634,12 @@ function slpDeleteProfile($id) {
         error('This beneficiary cannot be deleted because they are currently assigned to an active project. Unassign them first (only possible while the project is still Planned), or wait until it is marked Completed.', 409);
     }
 
+    $nameS = db()->prepare("SELECT first_name, last_name FROM beneficiaries WHERE beneficiary_id=:id");
+    $nameS->execute([':id' => $bid]);
+    $nameRow = $nameS->fetch();
+
     db()->prepare("UPDATE beneficiaries SET deleted_at=now(),deleted_by=:uid WHERE beneficiary_id=:id")->execute([':uid' => $uid, ':id' => $bid]);
+    logActivity($uid, 'Delete Profile', 'livelihood', "Moved to recycle bin: " . ($nameRow ? $nameRow['last_name'] . ', ' . $nameRow['first_name'] : "#{$bid}"));
     json(['status' => 'ok', 'message' => 'Beneficiary moved to recycle bin.']);
 }
 
@@ -648,7 +663,7 @@ function slpAssignProject() {
     if (!$bsRow) error('SLP profile not found.', 404);
     $bsId = (int) $bsRow['beneficiary_service_id'];
 
-    $projS = db()->prepare("SELECT status, slp_track FROM slp_projects WHERE project_id=:id");
+    $projS = db()->prepare("SELECT status, slp_track FROM slp_projects WHERE project_id=:id AND deleted_at IS NULL");
     $projS->execute([':id' => $projectId]);
     $proj = $projS->fetch();
     if (!$proj) error('Project not found.', 404);
@@ -856,6 +871,7 @@ function slpFetchProjectDocuments($projectId) {
 function slpRecycleMap() {
     return [
         'slpApplicant' => ['beneficiaries', 'beneficiary_id'],
+        'slpProject'   => ['slp_projects', 'project_id'],
     ];
 }
 
@@ -891,6 +907,26 @@ function slpListDeleted() {
             'deletedAt'   => $r['deleted_at'],
         ];
     }, $s->fetchAll());
+
+    $projS = db()->prepare(
+        "SELECT p.project_id AS id, p.project_name AS name, p.deleted_at, u.username AS deleted_by
+         FROM slp_projects p
+         LEFT JOIN users u ON u.user_id = p.deleted_by
+         WHERE p.deleted_at IS NOT NULL"
+    );
+    $projS->execute();
+    foreach ($projS->fetchAll() as $r) {
+        $items[] = [
+            'recordType'  => 'slpProject',
+            'id'          => (int) $r['id'],
+            'name'        => $r['name'],
+            'module'      => 'SLP Projects',
+            'description' => 'Sustainable Livelihood Program project',
+            'deletedBy'   => $r['deleted_by'] ?? '',
+            'deletedAt'   => $r['deleted_at'],
+        ];
+    }
+
     json(['status' => 'ok', 'data' => $items]);
 }
 
@@ -902,6 +938,7 @@ function slpRestoreRecord() {
     $stmt->execute([':id' => $id]);
     if ($stmt->rowCount() === 0) error('Record not found in recycle bin.', 404);
 
+    logActivity(currentUserId(), 'Restore Record', 'livelihood', "Restored {$type} #{$id} from recycle bin");
     json(['status' => 'ok', 'message' => 'Record restored.']);
 }
 
@@ -913,8 +950,26 @@ function slpPurgeRecord() {
     $chk->execute([':id' => $id]);
     if (!$chk->fetchColumn()) error('Record not found in recycle bin.', 404);
 
-    slpHardDeleteApplicant($id);
+    if ($type === 'slpApplicant') {
+        slpHardDeleteApplicant($id);
+    } else {
+        slpHardDeleteProject($id);
+    }
+    logActivity(currentUserId(), 'Purge Record', 'livelihood', "Permanently deleted {$type} #{$id}");
     json(['status' => 'ok', 'message' => 'Record permanently deleted.']);
+}
+
+// Permanently remove an SLP project and its uploaded files. Only reachable
+// for an already soft-deleted project, which slpDeleteProject's in-use guard
+// already guaranteed has zero linked beneficiaries.
+function slpHardDeleteProject($id) {
+    $docs = db()->prepare("SELECT file_path FROM attached_documents WHERE slp_project_id=:id");
+    $docs->execute([':id' => $id]);
+    foreach ($docs->fetchAll(PDO::FETCH_COLUMN) as $path) {
+        $abs = __DIR__ . '/../' . $path;
+        if (is_file($abs)) @unlink($abs);
+    }
+    db()->prepare("DELETE FROM slp_projects WHERE project_id=:id")->execute([':id' => $id]);
 }
 
 function slpHardDeleteApplicant($bid) {
