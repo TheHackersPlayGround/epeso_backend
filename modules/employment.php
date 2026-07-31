@@ -2288,29 +2288,8 @@ function efReportCount($sql, $from, $to)
 // (the same span shifted back one year). Supports Monthly / Annual / Custom.
 function efMonthlyReport()
 {
-    // Resolve the reporting window. Explicit from/to wins; otherwise fall back to
-    // year+month (a single calendar month).
-    $from = isset($_GET['from']) ? trim($_GET['from']) : '';
-    $to   = isset($_GET['to'])   ? trim($_GET['to'])   : '';
-    if ($from === '' || $to === '') {
-        $y = isset($_GET['year'])  && is_numeric($_GET['year'])  ? (int) $_GET['year']  : (int) date('Y');
-        $m = isset($_GET['month']) && is_numeric($_GET['month']) ? (int) $_GET['month'] : (int) date('n');
-        if ($m < 1 || $m > 12) error('Invalid month.', 422);
-        $from = sprintf('%04d-%02d-01', $y, $m);
-        $to   = date('Y-m-t', strtotime($from)); // last day of that month
-    }
-    $fromTs = strtotime($from);
-    $toTs   = strtotime($to);
-    if ($fromTs === false || $toTs === false) error('Invalid date range.', 422);
-    $from = date('Y-m-d', $fromTs);
-    $to   = date('Y-m-d', $toTs);
-    if ($from > $to) error('The From date must be on or before the To date.', 422);
-
-    // Prior period = same span shifted back one year.
-    $pfrom = date('Y-m-d', strtotime($from . ' -1 year'));
-    $pto   = date('Y-m-d', strtotime($to   . ' -1 year'));
-    $curYear  = (int) date('Y', $fromTs);
-    $prevYear = $curYear - 1;
+    // Resolve the reporting window (shared with reports.php's summary action).
+    ['from' => $from, 'to' => $to, 'pfrom' => $pfrom, 'pto' => $pto, 'curYear' => $curYear, 'prevYear' => $prevYear] = resolveReportWindow();
 
     $sid  = efServiceId();
     $name = efReportNameExpr('b');
