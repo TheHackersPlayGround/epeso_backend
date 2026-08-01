@@ -51,6 +51,24 @@ function reportPrograms()
     ];
 }
 
+// Expands a top-level program service_code to include any CHILD service codes
+// recorded under it via parent_service_id — CDSP applicants are stored
+// against its child services (Career Coaching, Pre-Employment Coaching, Labor
+// Employment for Graduating Students), never against the CDSP row itself, and
+// those child services are admin-editable rows (not a fixed list), so this
+// resolves live rather than hardcoding the current child codes. Every other
+// program has no children, so this just returns [that program's own code].
+function reportsExpandServiceCode($topCode)
+{
+    $stmt = db()->prepare(
+        "SELECT service_code FROM services
+         WHERE service_code = :code
+            OR parent_service_id = (SELECT service_id FROM services WHERE service_code = :code)"
+    );
+    $stmt->execute([':code' => $topCode]);
+    return array_column($stmt->fetchAll(), 'service_code');
+}
+
 // COUNT(*) rows in a single-table "activity" (batch/session/project) whose
 // date column falls in [from, to]. Every one of these tables has a deleted_at
 // soft-delete column EXCEPT vacancies, which has none (matches
@@ -88,10 +106,24 @@ function reportsSummary()
         error('Select at least one program.', 422);
     }
 
-    // Flatten to the service_codes actually needed (Livelihood alone expands to 4).
-    $codes = [];
+    // Flatten to the service_codes actually needed (Livelihood alone expands to
+    // 4 top-level programs), then expand each to include any child service
+    // codes (CDSP's applicants are recorded against its children, not itself)
+    // — codeToTop remembers which top-level program code each expanded code
+    // rolls back up to, so results can be re-aggregated after grouping.
+    $topCodes = [];
     foreach ($selected as $meta) {
-        $codes = array_merge($codes, $meta['services']);
+        $topCodes = array_merge($topCodes, $meta['services']);
+    }
+    $topCodes = array_values(array_unique($topCodes));
+
+    $codes = [];
+    $codeToTop = [];
+    foreach ($topCodes as $topCode) {
+        foreach (reportsExpandServiceCode($topCode) as $childCode) {
+            $codes[] = $childCode;
+            $codeToTop[$childCode] = $topCode;
+        }
     }
     $codes = array_values(array_unique($codes));
 
@@ -117,9 +149,18 @@ function reportsSummary()
          GROUP BY s.service_code"
     );
     $stmt->execute(array_merge([':from' => $from, ':to' => $to], $codeBind));
+    // Roll each row's (possibly child) service_code back up to its top-level
+    // program code — e.g. CDSP-CC/CDSP-PEC/CDSP-LEGS rows all accumulate under
+    // 'CDSP', matching the keys reportPrograms() expects in $meta['services'].
     $bySvc = [];
     foreach ($stmt->fetchAll() as $r) {
-        $bySvc[$r['service_code']] = $r;
+        $top = $codeToTop[$r['service_code']] ?? $r['service_code'];
+        if (!isset($bySvc[$top])) {
+            $bySvc[$top] = ['total' => 0, 'male' => 0, 'female' => 0];
+        }
+        $bySvc[$top]['total'] += (int) $r['total'];
+        $bySvc[$top]['male'] += (int) $r['male'];
+        $bySvc[$top]['female'] += (int) $r['female'];
     }
 
     // Employment Facilitation is the only program with a clean single-outcome
