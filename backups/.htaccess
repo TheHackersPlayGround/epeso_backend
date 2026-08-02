@@ -1,0 +1,5 @@
+# Full database dumps live here — never web-accessible directly (unlike
+# uploads/, which is deliberately public for document previews/downloads).
+# Downloads only ever go through modules/backup.php's downloadBackup action,
+# which re-checks requireAdmin() before streaming a file.
+Require all denied
