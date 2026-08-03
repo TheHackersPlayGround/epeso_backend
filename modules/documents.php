@@ -242,6 +242,15 @@ function docsRenameDocument($id)
     $oldName = $chk->fetchColumn();
     if ($oldName === false) error('Document not found.', 404);
 
+    // The extension is not user-editable: whatever the client submits is treated as the
+    // base name only, and the original file's extension is always reappended. This stops
+    // a client-side caret-position quirk (backspacing into the extension) from silently
+    // corrupting the stored file extension.
+    $oldExt = pathinfo($oldName, PATHINFO_EXTENSION);
+    $newBase = pathinfo($name, PATHINFO_FILENAME);
+    if ($newBase === '') error('File name is required.', 422);
+    $name = $oldExt !== '' ? "{$newBase}.{$oldExt}" : $newBase;
+
     db()->prepare("UPDATE document_library SET title = :name, file_name = :name, updated_at = now() WHERE document_id = :id")
         ->execute([':name' => $name, ':id' => $id]);
 
