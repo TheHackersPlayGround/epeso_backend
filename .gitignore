@@ -5,6 +5,3 @@ uploads/*
 backups/*
 !backups/.gitkeep
 !backups/.htaccess
-
-# Per-device settings (DB password, pg_dump path, etc.) — see config.example.php
-config.php
