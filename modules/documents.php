@@ -57,6 +57,41 @@ function docsResolveParent($parentId)
     return [(int) $row['folder_id'], (int) $row['folder_level']];
 }
 
+// True if a non-deleted folder already has this name under this parent
+// (NULL-safe: PHP's ":pid" bound as null with "= :pid" never matches in SQL,
+// so root-level comparisons use "IS NULL" instead). $excludeId lets a rename
+// check against every sibling except itself.
+function docsFolderNameTaken($name, $parentId, $excludeId = null)
+{
+    $sql = "SELECT 1 FROM folders WHERE deleted_at IS NULL AND folder_name = :name AND "
+        . ($parentId === null ? 'parent_folder_id IS NULL' : 'parent_folder_id = :pid');
+    $params = [':name' => $name];
+    if ($parentId !== null) $params[':pid'] = $parentId;
+    if ($excludeId !== null) {
+        $sql .= ' AND folder_id != :exclude';
+        $params[':exclude'] = $excludeId;
+    }
+    $s = db()->prepare($sql);
+    $s->execute($params);
+    return (bool) $s->fetchColumn();
+}
+
+// Same idea as docsFolderNameTaken(), for documents within a folder.
+function docsDocumentNameTaken($name, $folderId, $excludeId = null)
+{
+    $sql = "SELECT 1 FROM document_library WHERE deleted_at IS NULL AND file_name = :name AND "
+        . ($folderId === null ? 'folder_id IS NULL' : 'folder_id = :fid');
+    $params = [':name' => $name];
+    if ($folderId !== null) $params[':fid'] = $folderId;
+    if ($excludeId !== null) {
+        $sql .= ' AND document_id != :exclude';
+        $params[':exclude'] = $excludeId;
+    }
+    $s = db()->prepare($sql);
+    $s->execute($params);
+    return (bool) $s->fetchColumn();
+}
+
 // ─── Folders ─────────────────────────────────────────────────────────────────
 
 function docsListFolders()
@@ -89,6 +124,9 @@ function docsCreateFolder()
     if ($parentLevel >= 2) {
         error('Cannot create folder: maximum nesting depth reached.', 422);
     }
+    if (docsFolderNameTaken($name, $parentId)) {
+        error("A folder named \"{$name}\" already exists here.", 409);
+    }
 
     $uid = currentUserId();
     $s = db()->prepare(
@@ -112,10 +150,16 @@ function docsRenameFolder($id)
     $name = trim((string) ($d['name'] ?? ''));
     if ($name === '') error('Folder name is required.', 422);
 
-    $chk = db()->prepare("SELECT folder_name FROM folders WHERE folder_id = :id AND deleted_at IS NULL");
+    $chk = db()->prepare("SELECT folder_name, parent_folder_id FROM folders WHERE folder_id = :id AND deleted_at IS NULL");
     $chk->execute([':id' => $id]);
-    $oldName = $chk->fetchColumn();
-    if ($oldName === false) error('Folder not found.', 404);
+    $row = $chk->fetch();
+    if (!$row) error('Folder not found.', 404);
+    $oldName = $row['folder_name'];
+    $parentId = $row['parent_folder_id'] !== null ? (int) $row['parent_folder_id'] : null;
+
+    if ($name !== $oldName && docsFolderNameTaken($name, $parentId, $id)) {
+        error("A folder named \"{$name}\" already exists here.", 409);
+    }
 
     db()->prepare("UPDATE folders SET folder_name = :name, updated_at = now() WHERE folder_id = :id")
         ->execute([':name' => $name, ':id' => $id]);
@@ -203,6 +247,9 @@ function docsUploadDocument()
 
     $origName = trim((string) ($d['fileName'] ?? 'file'));
     if ($origName === '') $origName = 'file';
+    if (docsDocumentNameTaken($origName, $folderId)) {
+        error("A file named \"{$origName}\" already exists here.", 409);
+    }
     $ext    = pathinfo($origName, PATHINFO_EXTENSION) ?: 'bin';
     $stored = 'doc_' . time() . '_' . mt_rand(1000, 9999) . '.' . $ext;
     if (file_put_contents(__DIR__ . '/../uploads/' . $stored, $binary) === false) {
@@ -237,10 +284,12 @@ function docsRenameDocument($id)
     $name = trim((string) ($d['name'] ?? ''));
     if ($name === '') error('File name is required.', 422);
 
-    $chk = db()->prepare("SELECT file_name FROM document_library WHERE document_id = :id AND deleted_at IS NULL");
+    $chk = db()->prepare("SELECT file_name, folder_id FROM document_library WHERE document_id = :id AND deleted_at IS NULL");
     $chk->execute([':id' => $id]);
-    $oldName = $chk->fetchColumn();
-    if ($oldName === false) error('Document not found.', 404);
+    $row = $chk->fetch();
+    if (!$row) error('Document not found.', 404);
+    $oldName = $row['file_name'];
+    $folderId = $row['folder_id'] !== null ? (int) $row['folder_id'] : null;
 
     // The extension is not user-editable: whatever the client submits is treated as the
     // base name only, and the original file's extension is always reappended. This stops
@@ -250,6 +299,10 @@ function docsRenameDocument($id)
     $newBase = pathinfo($name, PATHINFO_FILENAME);
     if ($newBase === '') error('File name is required.', 422);
     $name = $oldExt !== '' ? "{$newBase}.{$oldExt}" : $newBase;
+
+    if ($name !== $oldName && docsDocumentNameTaken($name, $folderId, $id)) {
+        error("A file named \"{$name}\" already exists here.", 409);
+    }
 
     db()->prepare("UPDATE document_library SET title = :name, file_name = :name, updated_at = now() WHERE document_id = :id")
         ->execute([':name' => $name, ':id' => $id]);
@@ -269,6 +322,10 @@ function docsMoveDocument($id)
     $chk->execute([':id' => $id]);
     $docName = $chk->fetchColumn();
     if ($docName === false) error('Document not found.', 404);
+
+    if (docsDocumentNameTaken($docName, $folderId, $id)) {
+        error("A file named \"{$docName}\" already exists in the destination folder.", 409);
+    }
 
     $destName = 'Documents';
     if ($folderId !== null) {
