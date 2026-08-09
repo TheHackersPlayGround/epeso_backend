@@ -143,17 +143,6 @@ function efYearOrNull($v)
     return ($y >= 1900 && $y <= 2200) ? $y : null;
 }
 
-// Form month strings are "YYYY-MM" (or "Present"/empty). Normalize to a real
-// date or null. Also accepts a full "YYYY-MM-DD".
-function efMonthToDate($v)
-{
-    $s = is_string($v) ? trim($v) : '';
-    if ($s === '' || strtolower($s) === 'present') return null;
-    if (preg_match('/^\d{4}-\d{2}$/', $s)) return $s . '-01';
-    if (preg_match('/^\d{4}-\d{2}-\d{2}$/', $s)) return $s;
-    return null;
-}
-
 // A plain YYYY-MM-DD or null.
 function efDateOrNull($v)
 {

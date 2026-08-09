@@ -1,2 +1,0 @@
-<?php
-// Industries lookup (Maintenance)
