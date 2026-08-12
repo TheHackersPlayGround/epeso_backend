@@ -1195,9 +1195,32 @@ function employmentDeleteApplicant($id)
     json(['status' => 'ok', 'message' => 'Applicant moved to recycle bin.']);
 }
 
+// Counts of placement/referral history for an EF applicant. Both tables'
+// beneficiary_service_id FK has no ON DELETE action (defaults to RESTRICT in
+// Postgres), so a purge would otherwise fail with a raw FK-violation error —
+// used to warn the user before permanently deleting that history too.
+function efApplicantHistoryCounts($bid)
+{
+    $pdo = db();
+    $bsStmt = $pdo->prepare("SELECT beneficiary_service_id FROM beneficiary_services WHERE beneficiary_id = :id AND service_id = :sid LIMIT 1");
+    $bsStmt->execute([':id' => $bid, ':sid' => efServiceId()]);
+    $bsId = $bsStmt->fetchColumn();
+    if ($bsId === false) return ['placements' => 0, 'referrals' => 0];
+    $bsId = (int) $bsId;
+
+    $pl = $pdo->prepare("SELECT COUNT(*) FROM employment_facilitation_placements WHERE beneficiary_service_id = :id");
+    $pl->execute([':id' => $bsId]);
+    $rf = $pdo->prepare("SELECT COUNT(*) FROM employment_facilitation_referrals WHERE beneficiary_service_id = :id");
+    $rf->execute([':id' => $bsId]);
+
+    return ['placements' => (int) $pl->fetchColumn(), 'referrals' => (int) $rf->fetchColumn()];
+}
+
 // Permanently remove an applicant and the entire beneficiary spine (uploaded
 // files, resume sub-tables, service enrollment). Used by the recycle bin's
 // permanent-delete action; not reachable except for an already soft-deleted row.
+// Callers should confirm history counts via efApplicantHistoryCounts() first
+// (see efPurgeRecord) — this always cascades once it's actually called.
 function employmentHardDeleteApplicant($bid)
 {
     $pdo = db();
@@ -1208,7 +1231,13 @@ function employmentHardDeleteApplicant($bid)
         $bsStmt->execute([':id' => $bid, ':sid' => efServiceId()]);
         $bsId = $bsStmt->fetchColumn();
         if ($bsId !== false) {
-            $pdo->prepare("DELETE FROM employment_facilitation_profiles WHERE beneficiary_service_id = :id")->execute([':id' => (int) $bsId]);
+            $bsId = (int) $bsId;
+            // placement_promotions cascades automatically (ON DELETE CASCADE).
+            // Placements must go before referrals: placements.referral_id is
+            // ON DELETE RESTRICT against employment_facilitation_referrals.
+            $pdo->prepare("DELETE FROM employment_facilitation_placements WHERE beneficiary_service_id = :id")->execute([':id' => $bsId]);
+            $pdo->prepare("DELETE FROM employment_facilitation_referrals WHERE beneficiary_service_id = :id")->execute([':id' => $bsId]);
+            $pdo->prepare("DELETE FROM employment_facilitation_profiles WHERE beneficiary_service_id = :id")->execute([':id' => $bsId]);
         }
         employmentUnlinkDocs($pdo, $bid); // unlink all document files first
         foreach (['educations', 'trainings', 'eligibilities', 'licenses', 'work_experiences', 'job_preferences', 'languages', 'skills', 'beneficiary_classifications', 'disabilities', 'attached_documents'] as $t) {
@@ -2449,7 +2478,9 @@ function efRecycleMap()
     ];
 }
 
-// Read + validate { recordType, id } from the request body. Returns [type, id].
+// Read + validate { recordType, id } from the request body. Returns [type, id, body]
+// — the decoded body is returned too so callers needing extra fields (e.g.
+// purgeRecord's "force") don't have to re-read php://input a second time.
 function efRecycleTarget()
 {
     $d    = body();
@@ -2457,7 +2488,7 @@ function efRecycleTarget()
     $id   = isset($d['id']) && is_numeric($d['id']) ? (int) $d['id'] : null;
     if (!isset(efRecycleMap()[$type])) error('Invalid record type.', 422);
     if (!$id) error('Invalid record id.', 422);
-    return [$type, $id];
+    return [$type, $id, $d];
 }
 
 // GET /api/employment/listDeleted
@@ -2557,18 +2588,34 @@ function efRestoreRecord()
     json(['status' => 'ok', 'message' => 'Record restored.']);
 }
 
-// POST /api/employment/purgeRecord  { recordType, id }  — permanent delete.
+// POST /api/employment/purgeRecord  { recordType, id, force? }  — permanent delete.
 // Only acts on records already in the recycle bin (deleted_at IS NOT NULL).
+// For applicants with placement/referral history: blocked with a 409 (detail:
+// {code:'has_history', placements, referrals}) unless force=true is passed —
+// the frontend re-submits with force after the user confirms a specific
+// "this will also delete N placements / M referrals" warning.
 function efPurgeRecord()
 {
-    [$type, $id] = efRecycleTarget();
+    [$type, $id, $body] = efRecycleTarget();
     [$table, $pk] = efRecycleMap()[$type];
 
     $chk = db()->prepare("SELECT 1 FROM {$table} WHERE {$pk} = :id AND deleted_at IS NOT NULL");
     $chk->execute([':id' => $id]);
     if (!$chk->fetchColumn()) error('Record not found in recycle bin.', 404);
 
-    if ($type === 'applicant')    employmentHardDeleteApplicant($id);
+    if ($type === 'applicant') {
+        if (empty($body['force'])) {
+            $counts = efApplicantHistoryCounts($id);
+            if ($counts['placements'] > 0 || $counts['referrals'] > 0) {
+                error(
+                    'This applicant has placement/referral history that will also be permanently deleted.',
+                    409,
+                    ['code' => 'has_history', 'placements' => $counts['placements'], 'referrals' => $counts['referrals']]
+                );
+            }
+        }
+        employmentHardDeleteApplicant($id);
+    }
     elseif ($type === 'employer') employmentHardDeleteEmployer($id);
     else                          employmentHardDeleteReferral($id);
 
