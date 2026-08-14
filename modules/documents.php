@@ -368,7 +368,9 @@ function docsRecycleMap()
     ];
 }
 
-// Read + validate { recordType, id } from the request body. Returns [type, id].
+// Read + validate { recordType, id } from the request body. Returns [type, id, body]
+// — the decoded body is returned too so callers needing extra fields (e.g.
+// purgeRecord's "force") don't have to re-read php://input a second time.
 function docsRecycleTarget()
 {
     $d    = body();
@@ -376,7 +378,20 @@ function docsRecycleTarget()
     $id   = isset($d['id']) && is_numeric($d['id']) ? (int) $d['id'] : null;
     if (!isset(docsRecycleMap()[$type])) error('Invalid record type.', 422);
     if (!$id) error('Invalid record id.', 422);
-    return [$type, $id];
+    return [$type, $id, $d];
+}
+
+// How many document_library rows still reference this folder, regardless of
+// deleted_at. docsDeleteFolder's guard already guarantees zero *active* files
+// at soft-delete time, so any count here is entirely leftover recycle-bin
+// files — document_library.folder_id has no ON DELETE action (defaults to
+// RESTRICT), so purging the folder while these still point at it would
+// otherwise fail with a raw FK violation.
+function docsFolderFileCount($folderId)
+{
+    $s = db()->prepare("SELECT COUNT(*) FROM document_library WHERE folder_id = :id");
+    $s->execute([':id' => $folderId]);
+    return (int) $s->fetchColumn();
 }
 
 function docsListDeleted()
@@ -478,9 +493,14 @@ function docsRestoreRecord()
 }
 
 // Only acts on records already in the recycle bin (deleted_at IS NOT NULL).
+// For folders that still have files parked in them (soft-deleted files whose
+// folder_id was never cleared — see docsFolderFileCount): blocked with a 409
+// (detail: {code:'has_files', count}) unless force=true is passed. The
+// frontend re-submits with force after the user confirms a specific
+// "this will also delete N file(s)" warning.
 function docsPurgeRecord()
 {
-    [$type, $id] = docsRecycleTarget();
+    [$type, $id, $body] = docsRecycleTarget();
     [$table, $pk] = docsRecycleMap()[$type];
     $name = docsRecordName($type, $id);
 
@@ -491,9 +511,24 @@ function docsPurgeRecord()
     if ($type === 'documentsDocument') {
         docsHardDeleteDocument($id);
     } else {
-        // Folders were already blocked from being soft-deleted while still
-        // containing files/subfolders (see docsDeleteFolder's in-use guard),
-        // so a plain row delete here is safe — no cascade cleanup needed.
+        // Subfolders clean up on their own (folders.parent_folder_id is ON
+        // DELETE CASCADE) — only leftover recycle-bin files need handling.
+        if (empty($body['force'])) {
+            $fileCount = docsFolderFileCount($id);
+            if ($fileCount > 0) {
+                error(
+                    'This folder still has files sitting in the Recycle Bin that will also be permanently deleted.',
+                    409,
+                    ['code' => 'has_files', 'count' => $fileCount]
+                );
+            }
+        } else {
+            $docs = db()->prepare("SELECT document_id FROM document_library WHERE folder_id = :id");
+            $docs->execute([':id' => $id]);
+            foreach ($docs->fetchAll(PDO::FETCH_COLUMN) as $docId) {
+                docsHardDeleteDocument((int) $docId);
+            }
+        }
         db()->prepare("DELETE FROM folders WHERE folder_id = :id")->execute([':id' => $id]);
     }
     $label = $type === 'documentsFolder' ? 'folder' : 'document';
