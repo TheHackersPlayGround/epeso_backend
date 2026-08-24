@@ -1,5 +1,5 @@
 <?php
-// GIP: profiles (beneficiary spine) + batches
+// GIP: profiles (beneficiary spine) + workplaces
 
 include_once __DIR__ . '/../core/helpers.php';
 include_once __DIR__ . '/../core/guard.php';
@@ -8,18 +8,19 @@ include_once __DIR__ . '/../core/activity_log.php';
 function handle($action, $id, $method)
 {
     switch ($action) {
-        case 'listBatches':       requirePermission('gip-maintenance','Viewer'); return gipListBatches();
-        case 'createBatch':       requirePermission('gip-maintenance','Editor'); return gipCreateBatch();
-        case 'updateBatch':       requirePermission('gip-maintenance','Editor'); return gipUpdateBatch($id);
-        case 'deleteBatch':       requirePermission('gip-maintenance','Editor'); return gipDeleteBatch($id);
-        case 'updateBatchStatus': requirePermission('gip-maintenance','Editor'); return gipUpdateBatchStatus($id);
+        case 'listWorkplaces':       requirePermission('gip-maintenance','Viewer'); return gipListWorkplaces();
+        case 'createWorkplace':      requirePermission('gip-maintenance','Editor'); return gipCreateWorkplace();
+        case 'updateWorkplace':      requirePermission('gip-maintenance','Editor'); return gipUpdateWorkplace($id);
+        case 'deleteWorkplace':      requirePermission('gip-maintenance','Editor'); return gipDeleteWorkplace($id);
         case 'listProfiles':      requirePermission('gip','Viewer'); return gipListProfiles();
         case 'getProfile':        requirePermission('gip','Viewer'); return gipGetProfile($id);
         case 'createProfile':     requirePermission('gip','Editor'); return gipCreateProfile();
         case 'updateProfile':     requirePermission('gip','Editor'); return gipUpdateProfile($id);
         case 'deleteProfile':     requirePermission('gip','Editor'); return gipDeleteProfile($id);
-        case 'assignBatch':       requirePermission('gip','Editor'); return gipAssignBatch();
-        case 'unassignBatch':     requirePermission('gip','Editor'); return gipUnassignBatch();
+        case 'assignWorkplace':   requirePermission('gip','Editor'); return gipAssignWorkplace();
+        case 'unassignWorkplace': requirePermission('gip','Editor'); return gipUnassignWorkplace();
+        case 'completeAssignment':requirePermission('gip','Editor'); return gipCompleteAssignment();
+        case 'reopenAssignment':  requirePermission('gip','Editor'); return gipReopenAssignment();
         case 'listDeleted':       requirePermission('gip','Viewer'); return gipListDeleted();
         case 'restoreRecord':     requirePermission('gip','Editor'); return gipRestoreRecord();
         case 'purgeRecord':       requirePermission('gip','Editor'); return gipPurgeRecord();
@@ -114,9 +115,9 @@ function gipValidClassifications() {
             'Women','Senior Citizen','Returning OFW','Other','Indigenous People'];
 }
 
-// gip_batches.funding_source is a single free-text column; the frontend shows
-// a fixed dropdown + an "Others" free-text field. Split/join here so editing a
-// batch round-trips correctly without a second DB column.
+// gip_workplaces.funding_source is a single free-text column; the frontend
+// shows a fixed dropdown + an "Others" free-text field. Split/join here so
+// editing a workplace round-trips correctly without a second DB column.
 function gipFundingSourceOptions() {
     return ['DOLE', 'Local Government Unit (LGU)', 'Private / CSR'];
 }
@@ -143,205 +144,125 @@ function gipFormatBytes($bytes) {
     return round($bytes / pow(1024, $i), 2) . ' ' . $units[$i];
 }
 
-// ─── Batches ──────────────────────────────────────────────────────────────────
+// ─── Workplaces ─────────────────────────────────────────────────────────────
 
-function gipListBatches() {
+function gipListWorkplaces() {
     $s = db()->query(
-        "SELECT b.*, (SELECT COUNT(*) FROM gip_profiles gp WHERE gp.batch_id = b.batch_id) AS assigned_count
-         FROM gip_batches b
-         WHERE b.deleted_at IS NULL
-         ORDER BY b.created_at DESC, b.batch_id DESC"
+        "SELECT w.*, (SELECT COUNT(*) FROM gip_profiles gp WHERE gp.workplace_id = w.workplace_id AND gp.status = 'Active') AS active_count
+         FROM gip_workplaces w
+         WHERE w.deleted_at IS NULL
+         ORDER BY w.created_at DESC, w.workplace_id DESC"
     );
-    json(['status' => 'ok', 'data' => array_map('gipFormatBatch', $s->fetchAll())]);
+    json(['status' => 'ok', 'data' => array_map('gipFormatWorkplace', $s->fetchAll())]);
 }
 
-function gipGetBatchById($id) {
+function gipGetWorkplaceById($id) {
     $s = db()->prepare(
-        "SELECT b.*, (SELECT COUNT(*) FROM gip_profiles gp WHERE gp.batch_id = b.batch_id) AS assigned_count
-         FROM gip_batches b WHERE b.batch_id = :id"
+        "SELECT w.*, (SELECT COUNT(*) FROM gip_profiles gp WHERE gp.workplace_id = w.workplace_id AND gp.status = 'Active') AS active_count
+         FROM gip_workplaces w WHERE w.workplace_id = :id"
     );
     $s->execute([':id' => $id]);
     $r = $s->fetch();
-    return $r ? gipFormatBatch($r) : null;
+    return $r ? gipFormatWorkplace($r) : null;
 }
 
-function gipFormatBatch($r) {
+// A workplace is a permanent, reusable directory entry (like EF's Employer) —
+// it has no status and no capacity limit of its own. assignedCount is purely
+// informational (how many applicants are currently Active there).
+function gipFormatWorkplace($r) {
     [$funding, $fundingOther] = gipSplitFunding($r['funding_source'] ?? '');
     return [
-        'id'                 => (int) $r['batch_id'],
-        'batchName'          => $r['batch_name'],
+        'id'                 => (int) $r['workplace_id'],
+        'workplaceName'      => $r['workplace_name'],
         'description'        => $r['description'] ?? '',
-        'assignedOffice'     => $r['assigned_office'],
         'deploymentLocation' => $r['deployment_location'] ?? '',
         'coordinator'        => $r['coordinator'],
         'supervisor'         => $r['supervisor'] ?? '',
-        'slots'              => (string) $r['slot_count'],
-        'assignedCount'      => (int) $r['assigned_count'],
+        'assignedCount'      => (int) $r['active_count'],
         'fundingSource'      => $funding,
         'fundingSourceOther' => $fundingOther,
-        'startDate'          => $r['start_date'],
-        'endDate'            => $r['end_date'],
         'allowance'          => $r['monthly_allowance'] !== null ? (string) $r['monthly_allowance'] : '',
-        'status'             => $r['status'],
-        'documents'          => gipFetchBatchDocuments((int) $r['batch_id']),
+        'documents'          => gipFetchWorkplaceDocuments((int) $r['workplace_id']),
     ];
 }
 
-function gipValidateBatchInput($d) {
-    $name = trim($d['batchName'] ?? '');
-    if ($name === '') error('Batch name is required.', 422);
-    $office = trim($d['assignedOffice'] ?? '');
+function gipValidateWorkplaceInput($d) {
+    $name = trim($d['workplaceName'] ?? '');
+    if ($name === '') error('Workplace/office name is required.', 422);
     $loc    = trim($d['deploymentLocation'] ?? '');
     $sup    = trim($d['supervisor'] ?? '');
-    if ($office === '') error('Assigned office is required.', 422);
     if ($loc === '')    error('Deployment location is required.', 422);
     if ($sup === '')    error('Supervisor is required.', 422);
-    $slots = gipIntOrNull($d['slots'] ?? '');
-    if ($slots === null || $slots < 0) error('A valid number of slots is required.', 422);
-    $start = gipDate($d['startDate'] ?? '');
-    $end   = gipDate($d['endDate'] ?? '');
-    if (!$start) error('Start date is required.', 422);
-    if (!$end)   error('End date is required.', 422);
-    if ($end < $start) error('End date cannot be before start date.', 422);
     $funding = gipJoinFunding($d['fundingSource'] ?? '', $d['fundingSourceOther'] ?? '');
     if ($funding === '') error('Funding source is required.', 422);
-    return [$name, $office, $loc, $sup, $slots, $start, $end, $funding];
+    return [$name, $loc, $sup, $funding];
 }
 
-// Applies the side effects of a batch status transition: stamps/clears
-// gip_batches.completed_at and cascades gip_profiles.status for its interns.
-// Shared by gipCreateBatch/gipUpdateBatch (full-form save) and
-// gipUpdateBatchStatus (quick status wizard) so both paths stay in sync —
-// completed_at reflects the moment the batch was *actually* marked done, not
-// its (mutable, originally-planned) end_date, since the real internship
-// period can run past end_date (e.g. absences extending it).
-function gipCascadeBatchStatus($pdo, $id, $prevStatus, $newStatus) {
-    if ($newStatus === 'Completed' && $prevStatus !== 'Completed') {
-        $pdo->prepare("UPDATE gip_batches SET completed_at=now() WHERE batch_id=:id")->execute([':id' => $id]);
-        $pdo->prepare("UPDATE gip_profiles SET status='Completed', updated_at=now() WHERE batch_id=:id AND status='Active'")->execute([':id' => $id]);
-    } elseif ($prevStatus === 'Completed' && $newStatus !== 'Completed') {
-        // Reopening: clear the stale completion timestamp and reactivate its
-        // interns, backfilling batch_assigned_at if it was never set.
-        $pdo->prepare("UPDATE gip_batches SET completed_at=NULL WHERE batch_id=:id")->execute([':id' => $id]);
-        $pdo->prepare("UPDATE gip_profiles SET status='Active', batch_assigned_at=COALESCE(batch_assigned_at, now()), updated_at=now() WHERE batch_id=:id AND status='Completed'")->execute([':id' => $id]);
-    }
-}
-
-function gipCreateBatch() {
+function gipCreateWorkplace() {
     $uid = requireLogin();
     $d = body();
-    [$name, $office, $loc, $sup, $slots, $start, $end, $funding] = gipValidateBatchInput($d);
-
-    $valid  = ['Planned', 'Ongoing', 'Completed'];
-    $status = in_array($d['status'] ?? '', $valid, true) ? $d['status'] : 'Planned';
+    [$name, $loc, $sup, $funding] = gipValidateWorkplaceInput($d);
     $allowance = is_numeric($d['allowance'] ?? null) ? (float) $d['allowance'] : null;
 
-    $pdo = db();
-    $s = $pdo->prepare(
-        "INSERT INTO gip_batches(batch_name,description,assigned_office,deployment_location,coordinator,supervisor,slot_count,funding_source,start_date,end_date,monthly_allowance,status,created_at,updated_at)
-         VALUES(:name,:desc,:office,:loc,:coord,:sup,:slots,:funding,:start,:end,:allow,:status,now(),now()) RETURNING batch_id"
+    $s = db()->prepare(
+        "INSERT INTO gip_workplaces(workplace_name,description,deployment_location,coordinator,supervisor,funding_source,monthly_allowance,created_at,updated_at)
+         VALUES(:name,:desc,:loc,:coord,:sup,:funding,:allow,now(),now()) RETURNING workplace_id"
     );
-    $s->execute([':name'=>$name,':desc'=>gipNullStr($d['description']??''),':office'=>$office,':loc'=>$loc,':coord'=>gipNullStr($d['coordinator']??''),':sup'=>$sup,':slots'=>$slots,':funding'=>$funding,':start'=>$start,':end'=>$end,':allow'=>$allowance,':status'=>$status]);
+    $s->execute([':name'=>$name,':desc'=>gipNullStr($d['description']??''),':loc'=>$loc,':coord'=>gipNullStr($d['coordinator']??''),':sup'=>$sup,':funding'=>$funding,':allow'=>$allowance]);
     $id = (int) $s->fetchColumn();
 
-    // A batch can only ever be created as Planned via the UI, but guard the
-    // (API-only) edge case of creating one already Completed.
-    gipCascadeBatchStatus($pdo, $id, null, $status);
-
-    gipSyncBatchDocuments($pdo, $id, $uid, $d['documents'] ?? []);
-    logActivity($uid, 'Create Batch', 'gip-maintenance', "Created batch: {$name}");
-    json(['status' => 'ok', 'message' => 'Batch created.', 'data' => gipGetBatchById($id)]);
+    gipSyncWorkplaceDocuments(db(), $id, $uid, $d['documents'] ?? []);
+    logActivity($uid, 'Create Workplace', 'gip-maintenance', "Created workplace: {$name}");
+    json(['status' => 'ok', 'message' => 'Workplace created.', 'data' => gipGetWorkplaceById($id)]);
 }
 
-function gipUpdateBatch($id) {
-    if (!is_numeric($id)) error('Invalid batch id.', 422);
+function gipUpdateWorkplace($id) {
+    if (!is_numeric($id)) error('Invalid workplace id.', 422);
     $id  = (int) $id;
     $uid = requireLogin();
     $d = body();
-    [$name, $office, $loc, $sup, $slots, $start, $end, $funding] = gipValidateBatchInput($d);
-
-    $valid  = ['Planned', 'Ongoing', 'Completed'];
-    $status = in_array($d['status'] ?? '', $valid, true) ? $d['status'] : 'Planned';
+    [$name, $loc, $sup, $funding] = gipValidateWorkplaceInput($d);
     $allowance = is_numeric($d['allowance'] ?? null) ? (float) $d['allowance'] : null;
 
-    $pdo = db();
-    $curS = $pdo->prepare("SELECT status FROM gip_batches WHERE batch_id=:id");
+    $curS = db()->prepare("SELECT 1 FROM gip_workplaces WHERE workplace_id=:id");
     $curS->execute([':id' => $id]);
-    $prev = $curS->fetchColumn();
-    if ($prev === false) error('Batch not found.', 404);
+    if (!$curS->fetchColumn()) error('Workplace not found.', 404);
 
-    try {
-        $pdo->beginTransaction();
-        $pdo->prepare(
-            "UPDATE gip_batches SET batch_name=:name,description=:desc,assigned_office=:office,deployment_location=:loc,coordinator=:coord,supervisor=:sup,slot_count=:slots,funding_source=:funding,start_date=:start,end_date=:end,monthly_allowance=:allow,status=:status,updated_at=now() WHERE batch_id=:id"
-        )->execute([':name'=>$name,':desc'=>gipNullStr($d['description']??''),':office'=>$office,':loc'=>$loc,':coord'=>gipNullStr($d['coordinator']??''),':sup'=>$sup,':slots'=>$slots,':funding'=>$funding,':start'=>$start,':end'=>$end,':allow'=>$allowance,':status'=>$status,':id'=>$id]);
+    db()->prepare(
+        "UPDATE gip_workplaces SET workplace_name=:name,description=:desc,deployment_location=:loc,coordinator=:coord,supervisor=:sup,funding_source=:funding,monthly_allowance=:allow,updated_at=now() WHERE workplace_id=:id"
+    )->execute([':name'=>$name,':desc'=>gipNullStr($d['description']??''),':loc'=>$loc,':coord'=>gipNullStr($d['coordinator']??''),':sup'=>$sup,':funding'=>$funding,':allow'=>$allowance,':id'=>$id]);
 
-        gipCascadeBatchStatus($pdo, $id, $prev, $status);
-        $pdo->commit();
-    } catch (Throwable $e) {
-        if ($pdo->inTransaction()) $pdo->rollBack();
-        error('Failed to update batch: ' . $e->getMessage(), 500);
-    }
-
-    gipSyncBatchDocuments($pdo, $id, $uid, $d['documents'] ?? []);
-    logActivity($uid, 'Update Batch', 'gip-maintenance', "Updated batch: {$name}");
-    json(['status' => 'ok', 'message' => 'Batch updated.', 'data' => gipGetBatchById($id)]);
+    gipSyncWorkplaceDocuments(db(), $id, $uid, $d['documents'] ?? []);
+    logActivity($uid, 'Update Workplace', 'gip-maintenance', "Updated workplace: {$name}");
+    json(['status' => 'ok', 'message' => 'Workplace updated.', 'data' => gipGetWorkplaceById($id)]);
 }
 
-function gipUpdateBatchStatus($id) {
-    if (!is_numeric($id)) error('Invalid batch id.', 422);
-    $id = (int) $id;
-    $d  = body();
-    $valid  = ['Planned', 'Ongoing', 'Completed'];
-    $status = in_array($d['status'] ?? '', $valid, true) ? $d['status'] : null;
-    if (!$status) error('Valid status required.', 422);
-
-    $curS = db()->prepare("SELECT status, batch_name FROM gip_batches WHERE batch_id=:id");
-    $curS->execute([':id' => $id]);
-    $curRow = $curS->fetch();
-    if (!$curRow) error('Batch not found.', 404);
-    $prev = $curRow['status'];
-
-    $pdo = db();
-    try {
-        $pdo->beginTransaction();
-        $pdo->prepare("UPDATE gip_batches SET status=:s, updated_at=now() WHERE batch_id=:id")->execute([':s' => $status, ':id' => $id]);
-        gipCascadeBatchStatus($pdo, $id, $prev, $status);
-        $pdo->commit();
-    } catch (Throwable $e) {
-        if ($pdo->inTransaction()) $pdo->rollBack();
-        error('Failed to update batch status: ' . $e->getMessage(), 500);
-    }
-    logActivity(currentUserId(), 'Update Batch Status', 'gip-maintenance', "Set batch '{$curRow['batch_name']}' status to {$status}");
-    json(['status' => 'ok', 'message' => 'Status updated.', 'data' => gipGetBatchById($id)]);
-}
-
-function gipDeleteBatch($id) {
-    if (!is_numeric($id)) error('Invalid batch id.', 422);
+function gipDeleteWorkplace($id) {
+    if (!is_numeric($id)) error('Invalid workplace id.', 422);
     $id = (int) $id;
 
-    // gip_profiles.batch_id is the only record that an internship happened
+    // gip_profiles.workplace_id is the only record that an internship happened
     // (no participants junction table like CDSP) — block deletion outright
     // rather than nulling profiles out to allow it.
-    $cntS = db()->prepare("SELECT COUNT(*) FROM gip_profiles WHERE batch_id=:id");
+    $cntS = db()->prepare("SELECT COUNT(*) FROM gip_profiles WHERE workplace_id=:id");
     $cntS->execute([':id' => $id]);
     $cnt = (int) $cntS->fetchColumn();
     if ($cnt > 0) {
-        error("Cannot delete: {$cnt} applicant" . ($cnt === 1 ? '' : 's') . " linked to this batch (current or past interns).", 409);
+        error("Cannot delete: {$cnt} applicant" . ($cnt === 1 ? '' : 's') . " linked to this workplace (current or past interns).", 409);
     }
 
-    $nameS = db()->prepare("SELECT batch_name FROM gip_batches WHERE batch_id=:id AND deleted_at IS NULL");
+    $nameS = db()->prepare("SELECT workplace_name FROM gip_workplaces WHERE workplace_id=:id AND deleted_at IS NULL");
     $nameS->execute([':id' => $id]);
     $name = $nameS->fetchColumn();
-    if ($name === false) error('Batch not found.', 404);
+    if ($name === false) error('Workplace not found.', 404);
 
-    // Soft delete only -- files/document rows stay intact so a restored batch
-    // still has its attachments. They're only actually removed at purge time
-    // (gipHardDeleteBatch), which is when documents.gip_batch_id's ON DELETE
-    // CASCADE actually fires.
-    db()->prepare("UPDATE gip_batches SET deleted_at=now(), deleted_by=:uid WHERE batch_id=:id")->execute([':uid' => currentUserId(), ':id' => $id]);
-    logActivity(currentUserId(), 'Delete Batch', 'gip-maintenance', "Deleted batch: {$name}");
-    json(['status' => 'ok', 'message' => 'Batch deleted.']);
+    // Soft delete only -- files/document rows stay intact so a restored
+    // workplace still has its attachments. They're only actually removed at
+    // purge time (gipHardDeleteWorkplace), which is when
+    // attached_documents.gip_workplace_id's ON DELETE CASCADE actually fires.
+    db()->prepare("UPDATE gip_workplaces SET deleted_at=now(), deleted_by=:uid WHERE workplace_id=:id")->execute([':uid' => currentUserId(), ':id' => $id]);
+    logActivity(currentUserId(), 'Delete Workplace', 'gip-maintenance', "Deleted workplace: {$name}");
+    json(['status' => 'ok', 'message' => 'Workplace deleted.']);
 }
 
 // ─── Profiles ─────────────────────────────────────────────────────────────────
@@ -402,20 +323,22 @@ function gipBuildProfile($bid) {
         if ($row['classification'] === 'Other') { $classificationOther = $row['classification_other'] ?? ''; break; }
     }
 
-    // gip_profiles.batch_id is a single direct FK (no assignment-history table),
-    // so we can only ever surface a 0-or-1-entry "history" from the live link.
+    // gip_profiles.workplace_id is a single direct FK (no assignment-history
+    // table), so we can only ever surface a 0-or-1-entry "history" from the
+    // live link. Dates are the applicant's own (workplace_assigned_at /
+    // workplace_completed_at) -- the workplace itself no longer has a period.
     $assignmentHistory = [];
-    $batchId = isset($gp['batch_id']) ? $gp['batch_id'] : null;
-    if ($batchId) {
-        $batchS = db()->prepare("SELECT batch_id, batch_name, status, completed_at FROM gip_batches WHERE batch_id=:id");
-        $batchS->execute([':id' => $batchId]);
-        $batch = $batchS->fetch();
-        if ($batch) {
+    $workplaceId = isset($gp['workplace_id']) ? $gp['workplace_id'] : null;
+    if ($workplaceId) {
+        $wpS = db()->prepare("SELECT workplace_id, workplace_name FROM gip_workplaces WHERE workplace_id=:id");
+        $wpS->execute([':id' => $workplaceId]);
+        $wp = $wpS->fetch();
+        if ($wp) {
             $assignmentHistory[] = [
-                'batchId'       => (int) $batch['batch_id'],
-                'batchName'     => $batch['batch_name'],
-                'assignedDate'  => $gp['batch_assigned_at'] ?? '',
-                'completedDate' => ($batch['status'] === 'Completed') ? ($batch['completed_at'] ?? '') : null,
+                'workplaceId'   => (int) $wp['workplace_id'],
+                'workplaceName' => $wp['workplace_name'],
+                'assignedDate'  => $gp['workplace_assigned_at'] ?? '',
+                'completedDate' => ($gp['status'] === 'Completed') ? ($gp['workplace_completed_at'] ?? '') : null,
             ];
         }
     }
@@ -452,7 +375,7 @@ function gipBuildProfile($bid) {
         'strand'                  => $gp['strand'] ?? '',
         'yearLevel'               => $gp['year_level'] ?? '',
         'yearGraduated'           => isset($gp['year_graduated']) && $gp['year_graduated'] !== null ? (string) $gp['year_graduated'] : '',
-        'assignedBatchId'         => $batchId ? (int) $batchId : null,
+        'assignedWorkplaceId'     => $workplaceId ? (int) $workplaceId : null,
         'assignmentHistory'       => $assignmentHistory,
         'attachedDocuments'       => gipFetchSavedDocuments($bid),
         'dateApplicationReceived' => $b['date_applied'] ?? '',
@@ -591,18 +514,18 @@ function gipDeleteProfile($id) {
     $bid = (int) $id;
     $uid = requireLogin();
 
-    // Cannot delete an applicant currently interning in an active batch —
+    // Cannot delete an applicant currently interning at an active workplace —
     // same lock spirit as EF's referral/placement guard. Unassign first.
     $chk = db()->prepare(
-        "SELECT gp.batch_id, gp.status
+        "SELECT gp.workplace_id, gp.status
          FROM gip_profiles gp
          JOIN beneficiary_services bs ON bs.beneficiary_service_id = gp.beneficiary_service_id
          WHERE bs.beneficiary_id = :bid AND bs.service_id = :sid"
     );
     $chk->execute([':bid' => $bid, ':sid' => gipServiceId()]);
     $row = $chk->fetch();
-    if ($row && $row['batch_id'] && $row['status'] === 'Active') {
-        error('This applicant cannot be deleted because they are currently assigned to a batch. Unassign them first (only possible while the batch is still Planned), or wait until it is marked Completed.', 409);
+    if ($row && $row['workplace_id'] && $row['status'] === 'Ongoing') {
+        error('This applicant cannot be deleted because they are currently assigned to a workplace/office. Unassign them first, or mark their internship as completed.', 409);
     }
 
     $nameS = db()->prepare("SELECT first_name, last_name FROM beneficiaries WHERE beneficiary_id=:id");
@@ -614,15 +537,13 @@ function gipDeleteProfile($id) {
     json(['status' => 'ok', 'message' => 'Applicant moved to recycle bin.']);
 }
 
-// ─── Assign / Unassign batch ──────────────────────────────────────────────────
+// ─── Assign / Unassign / Complete workplace ────────────────────────────────────
+// A workplace is a reusable directory entry (like EF's Employer) — capacity
+// is the only gate on assignment, not a workplace-level status. Each
+// applicant's own status/dates track their individual engagement there.
 
-function gipAssignBatch() {
-    requireLogin();
-    $d = body();
-    $bid     = gipIntOrNull($d['applicantId'] ?? '');
-    $batchId = gipIntOrNull($d['batchId'] ?? '');
-    if (!$bid || !$batchId) error('applicantId and batchId are required.', 422);
-
+// Resolves an applicant's gip_profile_id from their beneficiary id, or 404s.
+function gipProfileIdFor($bid) {
     $bsS = db()->prepare(
         "SELECT bs.beneficiary_service_id FROM beneficiary_services bs
          WHERE bs.beneficiary_id=:bid AND bs.service_id=:sid ORDER BY bs.beneficiary_service_id DESC LIMIT 1"
@@ -631,73 +552,93 @@ function gipAssignBatch() {
     $bsId = $bsS->fetchColumn();
     if (!$bsId) error('GIP profile not found.', 404);
 
-    $gpS = db()->prepare("SELECT gip_profile_id FROM gip_profiles WHERE beneficiary_service_id=:id");
+    $gpS = db()->prepare("SELECT gip_profile_id, workplace_id, status FROM gip_profiles WHERE beneficiary_service_id=:id");
     $gpS->execute([':id' => (int) $bsId]);
-    $gpId = $gpS->fetchColumn();
-    if (!$gpId) error('GIP profile not found.', 404);
-    $gpId = (int) $gpId;
-
-    // Same rule as unassign: once the applicant's current batch has moved past
-    // Planned, there's no history table to fall back on — batch_id is the only
-    // record that assignment ever happened, so reassigning would erase it.
-    $curS = db()->prepare(
-        "SELECT gb.status FROM gip_profiles gp
-         LEFT JOIN gip_batches gb ON gb.batch_id = gp.batch_id
-         WHERE gp.gip_profile_id = :gpid AND gp.batch_id IS NOT NULL"
-    );
-    $curS->execute([':gpid' => $gpId]);
-    $curBatchStatus = $curS->fetchColumn();
-    if ($curBatchStatus !== false && $curBatchStatus !== 'Planned') {
-        error('This applicant is already assigned to a batch that is no longer Planned — reassigning would erase the only record of that assignment.', 409);
-    }
-
-    $batchS = db()->prepare("SELECT status, slot_count FROM gip_batches WHERE batch_id=:id AND deleted_at IS NULL");
-    $batchS->execute([':id' => $batchId]);
-    $batch = $batchS->fetch();
-    if (!$batch) error('Batch not found.', 404);
-    if ($batch['status'] !== 'Planned') error('Only Planned batches can be assigned.', 409);
-
-    $cntS = db()->prepare("SELECT COUNT(*) FROM gip_profiles WHERE batch_id=:id AND gip_profile_id != :gid");
-    $cntS->execute([':id' => $batchId, ':gid' => $gpId]);
-    $current = (int) $cntS->fetchColumn();
-    if ($current >= (int) $batch['slot_count']) {
-        error("This batch is already at full capacity ({$current}/{$batch['slot_count']}).", 409);
-    }
-
-    db()->prepare("UPDATE gip_profiles SET batch_id=:b, status='Active', batch_assigned_at=now(), updated_at=now() WHERE gip_profile_id=:gid")
-        ->execute([':b' => $batchId, ':gid' => $gpId]);
-    json(['status' => 'ok', 'message' => 'Applicant assigned to batch.']);
+    $gp = $gpS->fetch();
+    if (!$gp) error('GIP profile not found.', 404);
+    return $gp;
 }
 
-function gipUnassignBatch() {
+function gipAssignWorkplace() {
+    requireLogin();
+    $d = body();
+    $bid         = gipIntOrNull($d['applicantId'] ?? '');
+    $workplaceId = gipIntOrNull($d['workplaceId'] ?? '');
+    if (!$bid || !$workplaceId) error('applicantId and workplaceId are required.', 422);
+
+    $gp = gipProfileIdFor($bid);
+    $gpId = (int) $gp['gip_profile_id'];
+
+    // Can't assign someone who's already actively interning somewhere —
+    // unassign or complete that engagement first.
+    if ($gp['workplace_id'] && $gp['status'] === 'Ongoing') {
+        error('This applicant is already assigned to a workplace/office. Unassign them or mark their current internship completed first.', 409);
+    }
+
+    $wpS = db()->prepare("SELECT 1 FROM gip_workplaces WHERE workplace_id=:id AND deleted_at IS NULL");
+    $wpS->execute([':id' => $workplaceId]);
+    if (!$wpS->fetchColumn()) error('Workplace not found.', 404);
+
+    db()->prepare("UPDATE gip_profiles SET workplace_id=:w, status='Ongoing', workplace_assigned_at=now(), workplace_completed_at=NULL, updated_at=now() WHERE gip_profile_id=:gid")
+        ->execute([':w' => $workplaceId, ':gid' => $gpId]);
+    json(['status' => 'ok', 'message' => 'Applicant assigned to workplace.']);
+}
+
+function gipUnassignWorkplace() {
     requireLogin();
     $d = body();
     $bid = gipIntOrNull($d['applicantId'] ?? '');
     if (!$bid) error('applicantId is required.', 422);
 
-    $row = db()->prepare(
-        "SELECT gp.gip_profile_id, gb.status AS batch_status
-         FROM gip_profiles gp
-         JOIN beneficiary_services bs ON bs.beneficiary_service_id = gp.beneficiary_service_id
-         LEFT JOIN gip_batches gb ON gb.batch_id = gp.batch_id
-         WHERE bs.beneficiary_id=:bid AND bs.service_id=:sid
-         ORDER BY gp.gip_profile_id DESC LIMIT 1"
-    );
-    $row->execute([':bid' => $bid, ':sid' => gipServiceId()]);
-    $r = $row->fetch();
-    if (!$r || !$r['gip_profile_id']) error('GIP profile not found.', 404);
+    $gp = gipProfileIdFor($bid);
+    if (!$gp['workplace_id']) error('This applicant is not currently assigned to a workplace/office.', 409);
 
-    // gip_profiles.batch_id is the only place an assignment is recorded (no
-    // separate history table) — once the batch has moved past Planned
-    // (Ongoing or Completed), unassigning would silently erase the only
-    // record that this applicant was ever part of it.
-    if ($r['batch_status'] !== 'Planned') {
-        error('This batch is no longer Planned — unassigning would erase the only record of this assignment.', 409);
+    // Only while still Ongoing — once completed, the assignment is history
+    // and should stay on record rather than being unassigned away.
+    if ($gp['status'] !== 'Ongoing') {
+        error('This assignment is already completed and cannot be unassigned — it stays on record.', 409);
     }
 
-    db()->prepare("UPDATE gip_profiles SET batch_id=NULL, status='Inactive', batch_assigned_at=NULL, updated_at=now() WHERE gip_profile_id=:gid")
-        ->execute([':gid' => (int) $r['gip_profile_id']]);
-    json(['status' => 'ok', 'message' => 'Applicant unassigned from batch.']);
+    db()->prepare("UPDATE gip_profiles SET workplace_id=NULL, status='Inactive', workplace_assigned_at=NULL, updated_at=now() WHERE gip_profile_id=:gid")
+        ->execute([':gid' => (int) $gp['gip_profile_id']]);
+    json(['status' => 'ok', 'message' => 'Applicant unassigned from workplace.']);
+}
+
+// Marks one applicant's own engagement at their current workplace as
+// Completed — does not touch anyone else assigned there. Frees their slot
+// for a new applicant.
+function gipCompleteAssignment() {
+    requireLogin();
+    $d = body();
+    $bid = gipIntOrNull($d['applicantId'] ?? '');
+    if (!$bid) error('applicantId is required.', 422);
+
+    $gp = gipProfileIdFor($bid);
+    if (!$gp['workplace_id'] || $gp['status'] !== 'Ongoing') {
+        error('This applicant has no active workplace/office assignment to complete.', 409);
+    }
+
+    db()->prepare("UPDATE gip_profiles SET status='Completed', workplace_completed_at=now(), updated_at=now() WHERE gip_profile_id=:gid")
+        ->execute([':gid' => (int) $gp['gip_profile_id']]);
+    json(['status' => 'ok', 'message' => 'Applicant marked as completed.']);
+}
+
+// Reopens a previously-completed engagement back to Ongoing, e.g. if it was
+// marked complete by mistake.
+function gipReopenAssignment() {
+    requireLogin();
+    $d = body();
+    $bid = gipIntOrNull($d['applicantId'] ?? '');
+    if (!$bid) error('applicantId is required.', 422);
+
+    $gp = gipProfileIdFor($bid);
+    if (!$gp['workplace_id'] || $gp['status'] !== 'Completed') {
+        error('This applicant has no completed workplace/office assignment to reopen.', 409);
+    }
+
+    db()->prepare("UPDATE gip_profiles SET status='Ongoing', workplace_completed_at=NULL, updated_at=now() WHERE gip_profile_id=:gid")
+        ->execute([':gid' => (int) $gp['gip_profile_id']]);
+    json(['status' => 'ok', 'message' => 'Assignment reopened.']);
 }
 
 // ─── Documents (applicant) ────────────────────────────────────────────────────
@@ -772,11 +713,12 @@ function gipFetchSavedDocuments($bid) {
     }, $s->fetchAll());
 }
 
-// ─── Documents (batch) ────────────────────────────────────────────────────────
-// Batch files aren't tied to a beneficiary, so they key off documents.gip_batch_id
-// instead (nullable FK, ON DELETE CASCADE) — same shared table, same pattern.
+// ─── Documents (workplace) ─────────────────────────────────────────────────────
+// Workplace files aren't tied to a beneficiary, so they key off
+// attached_documents.gip_workplace_id instead (nullable FK, ON DELETE
+// CASCADE) — same shared table, same pattern.
 
-function gipSyncBatchDocuments($pdo, $batchId, $uid, $docsPayload) {
+function gipSyncWorkplaceDocuments($pdo, $workplaceId, $uid, $docsPayload) {
     $docs = is_array($docsPayload) ? $docsPayload : [];
 
     $keep = [];
@@ -787,8 +729,8 @@ function gipSyncBatchDocuments($pdo, $batchId, $uid, $docsPayload) {
         }
     }
 
-    $sel = $pdo->prepare("SELECT document_id, file_path FROM attached_documents WHERE gip_batch_id=:bid");
-    $sel->execute([':bid' => $batchId]);
+    $sel = $pdo->prepare("SELECT document_id, file_path FROM attached_documents WHERE gip_workplace_id=:wid");
+    $sel->execute([':wid' => $workplaceId]);
     foreach ($sel->fetchAll() as $row) {
         if (!in_array((int) $row['document_id'], $keep, true)) {
             $abs = __DIR__ . '/../' . $row['file_path'];
@@ -798,8 +740,8 @@ function gipSyncBatchDocuments($pdo, $batchId, $uid, $docsPayload) {
     }
 
     $ins = $pdo->prepare(
-        "INSERT INTO attached_documents(gip_batch_id,document_source,document_type,title,file_name,file_path,file_size,mime_type,uploaded_by)
-         VALUES(:bid,'GIP Batch',NULL,:title,:fname,:fpath,:size,:mime,:uid)"
+        "INSERT INTO attached_documents(gip_workplace_id,document_source,document_type,title,file_name,file_path,file_size,mime_type,uploaded_by)
+         VALUES(:wid,'GIP Workplace',NULL,:title,:fname,:fpath,:size,:mime,:uid)"
     );
     foreach ($docs as $doc) {
         $dataUrl = $doc['dataUrl'] ?? '';
@@ -809,23 +751,23 @@ function gipSyncBatchDocuments($pdo, $batchId, $uid, $docsPayload) {
 
         $origName = (string) ($doc['fileName'] ?? 'file');
         $ext      = pathinfo($origName, PATHINFO_EXTENSION) ?: 'bin';
-        $stored   = 'gip_batch_' . $batchId . '_' . time() . '_' . mt_rand(1000, 9999) . '.' . $ext;
+        $stored   = 'gip_workplace_' . $workplaceId . '_' . time() . '_' . mt_rand(1000, 9999) . '.' . $ext;
         if (file_put_contents(__DIR__ . '/../uploads/' . $stored, $binary) === false) continue;
 
         $ins->execute([
-            ':bid' => $batchId, ':title' => $origName,
+            ':wid' => $workplaceId, ':title' => $origName,
             ':fname' => $origName, ':fpath' => 'uploads/' . $stored,
             ':size' => strlen($binary), ':mime' => $m[1], ':uid' => $uid,
         ]);
     }
 }
 
-function gipFetchBatchDocuments($batchId) {
+function gipFetchWorkplaceDocuments($workplaceId) {
     $s = db()->prepare(
         "SELECT document_id, title, file_name, file_path, file_size
-         FROM attached_documents WHERE gip_batch_id=:bid ORDER BY document_id"
+         FROM attached_documents WHERE gip_workplace_id=:wid ORDER BY document_id"
     );
-    $s->execute([':bid' => $batchId]);
+    $s->execute([':wid' => $workplaceId]);
     return array_map(function ($r) {
         return [
             'id'       => (string) $r['document_id'],
@@ -845,8 +787,8 @@ function gipFetchBatchDocuments($batchId) {
 // recordType -> [table, primary-key column]. Only one type for GIP today.
 function gipRecycleMap() {
     return [
-        'gipApplicant' => ['beneficiaries', 'beneficiary_id'],
-        'gipBatch'     => ['gip_batches', 'batch_id'],
+        'gipApplicant'  => ['beneficiaries', 'beneficiary_id'],
+        'gipWorkplace'  => ['gip_workplaces', 'workplace_id'],
     ];
 }
 
@@ -885,20 +827,20 @@ function gipListDeleted() {
         ];
     }, $s->fetchAll());
 
-    $batchS = db()->prepare(
-        "SELECT b.batch_id AS id, b.batch_name AS name, b.deleted_at, u.username AS deleted_by
-         FROM gip_batches b
-         LEFT JOIN users u ON u.user_id = b.deleted_by
-         WHERE b.deleted_at IS NOT NULL"
+    $wpS = db()->prepare(
+        "SELECT w.workplace_id AS id, w.workplace_name AS name, w.deleted_at, u.username AS deleted_by
+         FROM gip_workplaces w
+         LEFT JOIN users u ON u.user_id = w.deleted_by
+         WHERE w.deleted_at IS NOT NULL"
     );
-    $batchS->execute();
-    foreach ($batchS->fetchAll() as $r) {
+    $wpS->execute();
+    foreach ($wpS->fetchAll() as $r) {
         $items[] = [
-            'recordType'  => 'gipBatch',
+            'recordType'  => 'gipWorkplace',
             'id'          => (int) $r['id'],
             'name'        => $r['name'],
-            'module'      => 'GIP Batches',
-            'description' => 'Government Internship Program batch',
+            'module'      => 'GIP Workplaces',
+            'description' => 'Government Internship Program workplace/office',
             'deletedBy'   => $r['deleted_by'] ?? '',
             'deletedAt'   => $r['deleted_at'],
         ];
@@ -933,25 +875,26 @@ function gipPurgeRecord() {
     if ($type === 'gipApplicant') {
         gipHardDeleteApplicant($id);
     } else {
-        gipHardDeleteBatch($id);
+        gipHardDeleteWorkplace($id);
     }
     logActivity(currentUserId(), 'Purge Record', 'gip', "Permanently deleted {$type} #{$id}");
     json(['status' => 'ok', 'message' => 'Record permanently deleted.']);
 }
 
-// Permanently remove a GIP batch and its uploaded files. Only reachable for an
-// already soft-deleted batch, which gipDeleteBatch's in-use guard already
-// guaranteed has zero linked profiles -- no cascade cleanup needed there.
-function gipHardDeleteBatch($id) {
-    $docs = db()->prepare("SELECT file_path FROM attached_documents WHERE gip_batch_id=:id");
+// Permanently remove a GIP workplace and its uploaded files. Only reachable
+// for an already soft-deleted workplace, which gipDeleteWorkplace's in-use
+// guard already guaranteed has zero linked profiles -- no cascade cleanup
+// needed there.
+function gipHardDeleteWorkplace($id) {
+    $docs = db()->prepare("SELECT file_path FROM attached_documents WHERE gip_workplace_id=:id");
     $docs->execute([':id' => $id]);
     foreach ($docs->fetchAll(PDO::FETCH_COLUMN) as $path) {
         $abs = __DIR__ . '/../' . $path;
         if (is_file($abs)) @unlink($abs);
     }
-    // documents.gip_batch_id is ON DELETE CASCADE, so this also removes the
-    // document rows themselves.
-    db()->prepare("DELETE FROM gip_batches WHERE batch_id=:id")->execute([':id' => $id]);
+    // attached_documents.gip_workplace_id is ON DELETE CASCADE, so this also
+    // removes the document rows themselves.
+    db()->prepare("DELETE FROM gip_workplaces WHERE workplace_id=:id")->execute([':id' => $id]);
 }
 
 // Permanently remove a GIP applicant and its GIP-specific data (uploaded

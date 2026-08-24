@@ -38,8 +38,11 @@ function reportPrograms()
             'activityTable' => 'vacancies', 'activityDateCol' => 'created_at'],
         'cdsp' => ['label' => 'CDSP', 'services' => ['CDSP'],
             'activityTable' => 'cdsp_activities', 'activityDateCol' => 'activity_date'],
+        // gip_workplaces is now a reusable directory (no period of its own,
+        // like EF's employers/vacancies split) -- "activities conducted"
+        // counts new workplaces added in the period, via created_at.
         'gip' => ['label' => 'GIP', 'services' => ['GIP'],
-            'activityTable' => 'gip_batches', 'activityDateCol' => 'start_date'],
+            'activityTable' => 'gip_workplaces', 'activityDateCol' => 'created_at'],
         'spes' => ['label' => 'SPES', 'services' => ['SPES'],
             'activityTable' => 'spes_batches', 'activityDateCol' => 'program_start_date'],
         'skills-training' => ['label' => 'Skills Training', 'services' => ['SKILLS'],
