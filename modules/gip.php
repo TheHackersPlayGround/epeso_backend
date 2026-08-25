@@ -20,7 +20,6 @@ function handle($action, $id, $method)
         case 'assignWorkplace':   requirePermission('gip','Editor'); return gipAssignWorkplace();
         case 'unassignWorkplace': requirePermission('gip','Editor'); return gipUnassignWorkplace();
         case 'completeAssignment':requirePermission('gip','Editor'); return gipCompleteAssignment();
-        case 'reopenAssignment':  requirePermission('gip','Editor'); return gipReopenAssignment();
         case 'listDeleted':       requirePermission('gip','Viewer'); return gipListDeleted();
         case 'restoreRecord':     requirePermission('gip','Editor'); return gipRestoreRecord();
         case 'purgeRecord':       requirePermission('gip','Editor'); return gipPurgeRecord();
@@ -148,7 +147,7 @@ function gipFormatBytes($bytes) {
 
 function gipListWorkplaces() {
     $s = db()->query(
-        "SELECT w.*, (SELECT COUNT(*) FROM gip_profiles gp WHERE gp.workplace_id = w.workplace_id AND gp.status = 'Active') AS active_count
+        "SELECT w.*, (SELECT COUNT(*) FROM gip_profiles gp WHERE gp.workplace_id = w.workplace_id AND gp.status = 'Ongoing') AS active_count
          FROM gip_workplaces w
          WHERE w.deleted_at IS NULL
          ORDER BY w.created_at DESC, w.workplace_id DESC"
@@ -158,7 +157,7 @@ function gipListWorkplaces() {
 
 function gipGetWorkplaceById($id) {
     $s = db()->prepare(
-        "SELECT w.*, (SELECT COUNT(*) FROM gip_profiles gp WHERE gp.workplace_id = w.workplace_id AND gp.status = 'Active') AS active_count
+        "SELECT w.*, (SELECT COUNT(*) FROM gip_profiles gp WHERE gp.workplace_id = w.workplace_id AND gp.status = 'Ongoing') AS active_count
          FROM gip_workplaces w WHERE w.workplace_id = :id"
     );
     $s->execute([':id' => $id]);
@@ -605,8 +604,9 @@ function gipUnassignWorkplace() {
 }
 
 // Marks one applicant's own engagement at their current workplace as
-// Completed — does not touch anyone else assigned there. Frees their slot
-// for a new applicant.
+// Completed — does not touch anyone else assigned there. This is final: a
+// GIP applicant only ever goes through the program once, so unlike an
+// assignment, there is deliberately no way to reopen a completed one.
 function gipCompleteAssignment() {
     requireLogin();
     $d = body();
@@ -621,24 +621,6 @@ function gipCompleteAssignment() {
     db()->prepare("UPDATE gip_profiles SET status='Completed', workplace_completed_at=now(), updated_at=now() WHERE gip_profile_id=:gid")
         ->execute([':gid' => (int) $gp['gip_profile_id']]);
     json(['status' => 'ok', 'message' => 'Applicant marked as completed.']);
-}
-
-// Reopens a previously-completed engagement back to Ongoing, e.g. if it was
-// marked complete by mistake.
-function gipReopenAssignment() {
-    requireLogin();
-    $d = body();
-    $bid = gipIntOrNull($d['applicantId'] ?? '');
-    if (!$bid) error('applicantId is required.', 422);
-
-    $gp = gipProfileIdFor($bid);
-    if (!$gp['workplace_id'] || $gp['status'] !== 'Completed') {
-        error('This applicant has no completed workplace/office assignment to reopen.', 409);
-    }
-
-    db()->prepare("UPDATE gip_profiles SET status='Ongoing', workplace_completed_at=NULL, updated_at=now() WHERE gip_profile_id=:gid")
-        ->execute([':gid' => (int) $gp['gip_profile_id']]);
-    json(['status' => 'ok', 'message' => 'Assignment reopened.']);
 }
 
 // ─── Documents (applicant) ────────────────────────────────────────────────────
