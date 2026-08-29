@@ -23,6 +23,7 @@ function handle($action, $id, $method)
         case 'deleteBackup':   requireAdmin(); return backupDelete($id);
         case 'restoreBackup':  requireAdmin(); return backupRestore($id);
         case 'restoreUpload':  requireAdmin(); return backupRestoreUpload();
+        case 'restoreProgress': requireAdmin(); return backupRestoreProgress();
         default: error("Unknown Backup action: {$action}", 404);
     }
 }
@@ -32,6 +33,40 @@ function handle($action, $id, $method)
 function backupDir()
 {
     return __DIR__ . '/../backups/';
+}
+
+// A restore runs as a single blocking request (it may take a while for a
+// large database), so there's no in-band way for that same response to also
+// stream out progress. Instead it writes its current step to this file as it
+// goes, and the frontend polls restoreProgress() (a separate, fast request)
+// on an interval while the restore request is in flight to show a real
+// progress bar rather than a fake time-based animation. Single-admin tool --
+// one fixed filename is fine, no need to key it per-restore.
+function backupProgressPath()
+{
+    return backupDir() . '.restore_progress.json';
+}
+
+function backupWriteProgress($step, $total, $label, $done = false, $error = null)
+{
+    $payload = ['step' => $step, 'total' => $total, 'label' => $label, 'done' => $done, 'error' => $error];
+    @file_put_contents(backupProgressPath(), json_encode($payload));
+}
+
+// GET /api/backup/restoreProgress -- polled by the frontend during a restore.
+function backupRestoreProgress()
+{
+    $path = backupProgressPath();
+    if (!is_file($path)) {
+        json(['status' => 'ok', 'data' => ['step' => 0, 'total' => 1, 'label' => '', 'done' => true, 'error' => null]]);
+        return;
+    }
+    $data = json_decode((string) file_get_contents($path), true);
+    if (!is_array($data)) {
+        json(['status' => 'ok', 'data' => ['step' => 0, 'total' => 1, 'label' => '', 'done' => true, 'error' => null]]);
+        return;
+    }
+    json(['status' => 'ok', 'data' => $data]);
 }
 
 // Not on PATH, so pg_dump must be invoked by full path — differs per
@@ -380,21 +415,27 @@ function backupRestore($name)
         error('psql was not found on this server. Contact your system administrator.', 500);
     }
 
+    $isZip = str_ends_with(strtolower($name), '.zip');
+    $totalSteps = $isZip ? 6 : 4;
+    $step = 0;
+
     $uid = currentUserId();
+    backupWriteProgress(++$step, $totalSteps, 'Creating safety backup of current data...');
     [$safetyName, $safetySize] = backupCreateSnapshot();
     logActivity($uid, 'Create Backup', 'security', "Automatic safety backup before restore: {$safetyName} ({$safetySize})");
 
-    $isZip = str_ends_with(strtolower($name), '.zip');
     $tmpDir = null;
     $sqlPath = $path;
     $uploadsExtractDir = null;
 
     if ($isZip) {
+        backupWriteProgress(++$step, $totalSteps, 'Extracting backup archive...');
         $tmpDir = sys_get_temp_dir() . '/peso_restore_' . uniqid();
         mkdir($tmpDir, 0777, true);
         $zip = new ZipArchive();
         if ($zip->open($path) !== true) {
             backupClearDirContents($tmpDir); @rmdir($tmpDir);
+            backupWriteProgress($step, $totalSteps, 'Failed', true, 'Failed to open the backup archive.');
             error('Failed to open the backup archive.', 500);
         }
         $zip->extractTo($tmpDir);
@@ -403,6 +444,7 @@ function backupRestore($name)
         $sqlMatches = glob($tmpDir . '/PESO_DB_Backup_*.sql');
         if (empty($sqlMatches)) {
             backupClearDirContents($tmpDir); @rmdir($tmpDir);
+            backupWriteProgress($step, $totalSteps, 'Failed', true, 'This backup archive does not contain a database dump.');
             error('This backup archive does not contain a database dump.', 422);
         }
         $sqlPath = $sqlMatches[0];
@@ -414,20 +456,25 @@ function backupRestore($name)
     // Drop and recreate the schema so the dump restores to exactly the
     // backup's state -- anything created/changed since (tables, columns,
     // enum values) is wiped, matching "use that backup file instead".
+    backupWriteProgress(++$step, $totalSteps, 'Resetting database schema...');
     [$dropCode, $dropErr] = backupRunPsql('-c ' . escapeshellarg('DROP SCHEMA public CASCADE; CREATE SCHEMA public; GRANT ALL ON SCHEMA public TO public;'));
     if ($dropCode !== 0) {
         if ($tmpDir) { backupClearDirContents($tmpDir); @rmdir($tmpDir); }
+        backupWriteProgress($step, $totalSteps, 'Failed', true, "Restore failed while resetting the database: {$dropErr}");
         error("Restore failed while resetting the database: {$dropErr}\n\nA safety backup was taken first: {$safetyName}. Restore that to recover.", 500);
     }
 
+    backupWriteProgress(++$step, $totalSteps, 'Restoring database...');
     [$restoreCode, $restoreErr] = backupRunPsql('-f ' . escapeshellarg($sqlPath));
     if ($restoreCode !== 0) {
         if ($tmpDir) { backupClearDirContents($tmpDir); @rmdir($tmpDir); }
+        backupWriteProgress($step, $totalSteps, 'Failed', true, "Restore failed while loading the backup: {$restoreErr}");
         error("Restore failed while loading the backup: {$restoreErr}\n\nA safety backup was taken first: {$safetyName}. Restore that to recover.", 500);
     }
 
     $uploadsRestored = false;
     if ($uploadsExtractDir) {
+        backupWriteProgress(++$step, $totalSteps, 'Restoring uploaded files...');
         $config = include __DIR__ . '/../config.php';
         backupClearDirContents($config['upload_dir']);
         backupCopyDirRecursive($uploadsExtractDir, $config['upload_dir']);
@@ -437,6 +484,7 @@ function backupRestore($name)
     if ($tmpDir) { backupClearDirContents($tmpDir); @rmdir($tmpDir); }
 
     logActivity($uid, 'Restore Backup', 'security', "Restored system from backup: {$name}" . ($uploadsRestored ? ' (database + uploaded files)' : ' (database only -- this backup had no bundled uploads)') . ". Safety backup taken first: {$safetyName}");
+    backupWriteProgress($totalSteps, $totalSteps, 'Restore complete.', true);
     json([
         'status'  => 'ok',
         'message' => 'Restore complete.',
