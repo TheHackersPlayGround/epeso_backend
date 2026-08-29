@@ -41,6 +41,8 @@ function handle($action, $id, $method)
         case 'addParticipant':           requirePermission('skills-maintenance','Editor'); return stAddParticipant();
         case 'removeParticipant':        requirePermission('skills-maintenance','Editor'); return stRemoveParticipant();
         case 'updateAttendance':         requirePermission('skills-maintenance','Editor'); return stUpdateAttendance();
+        case 'listTrainingHistory':      requirePermission('skills','Viewer'); return stListTrainingHistory($id);
+        case 'agingReport':              requirePermission('skills','Viewer'); return stAgingReport();
 
         case 'listQualifications':       requirePermission('skills','Viewer'); return stListQualifications();
         case 'listPurposes':             requirePermission('skills','Viewer'); return stListPurposes();
@@ -172,6 +174,11 @@ function stFormatActivity($r) {
         'facilitator'   => $r['facilitator'] ?? '',
         'participants'  => isset($r['participant_count']) ? (int)$r['participant_count'] : null,
         'assignedCount' => isset($r['assigned_count']) ? (int)$r['assigned_count'] : 0,
+        // Only meaningful once a training is actually Completed -- attended is
+        // still mostly NULL for a Planned/Ongoing training, so these come back
+        // as 0/0 until then rather than a real present/absent split.
+        'presentCount'  => isset($r['present_count']) ? (int)$r['present_count'] : 0,
+        'absentCount'   => isset($r['absent_count']) ? (int)$r['absent_count'] : 0,
         'status'        => $r['status'],
     ];
 }
@@ -180,7 +187,9 @@ function stListActivities() {
     $s = db()->query(
         "SELECT a.activity_id, a.batch_id, b.batch_name, a.activity_title, a.description,
                 a.activity_date, a.venue, a.facilitator, a.participant_count, a.status,
-                (SELECT COUNT(*) FROM skills_training_activity_participants p WHERE p.activity_id = a.activity_id) AS assigned_count
+                (SELECT COUNT(*) FROM skills_training_activity_participants p WHERE p.activity_id = a.activity_id) AS assigned_count,
+                (SELECT COUNT(*) FROM skills_training_activity_participants p WHERE p.activity_id = a.activity_id AND p.attended = true) AS present_count,
+                (SELECT COUNT(*) FROM skills_training_activity_participants p WHERE p.activity_id = a.activity_id AND p.attended = false) AS absent_count
          FROM skills_training_activities a
          JOIN skills_training_batches b ON b.batch_id = a.batch_id
          WHERE a.deleted_at IS NULL
@@ -193,7 +202,9 @@ function stGetActivityById($id) {
     $s = db()->prepare(
         "SELECT a.activity_id, a.batch_id, b.batch_name, a.activity_title, a.description,
                 a.activity_date, a.venue, a.facilitator, a.participant_count, a.status,
-                (SELECT COUNT(*) FROM skills_training_activity_participants p WHERE p.activity_id = a.activity_id) AS assigned_count
+                (SELECT COUNT(*) FROM skills_training_activity_participants p WHERE p.activity_id = a.activity_id) AS assigned_count,
+                (SELECT COUNT(*) FROM skills_training_activity_participants p WHERE p.activity_id = a.activity_id AND p.attended = true) AS present_count,
+                (SELECT COUNT(*) FROM skills_training_activity_participants p WHERE p.activity_id = a.activity_id AND p.attended = false) AS absent_count
          FROM skills_training_activities a
          JOIN skills_training_batches b ON b.batch_id = a.batch_id
          WHERE a.activity_id = :id"
@@ -237,10 +248,17 @@ function stUpdateActivity($id) {
     $valid  = ['Planned', 'Ongoing', 'Completed', 'Cancelled'];
     $status = in_array($d['status'] ?? '', $valid, true) ? $d['status'] : 'Planned';
 
+    $prevS = db()->prepare("SELECT status FROM skills_training_activities WHERE activity_id=:id");
+    $prevS->execute([':id' => $id]);
+    $prevStatus = $prevS->fetchColumn();
+    // Only stamp completed_at on the actual Planned/Ongoing -> Completed transition,
+    // so re-saving an already-completed training doesn't keep bumping its completion date.
+    $completedAt = ($status === 'Completed' && $prevStatus !== 'Completed') ? ',completed_at=now()' : '';
+
     db()->prepare(
         "UPDATE skills_training_activities
          SET batch_id=:bid, activity_title=:t, description=:desc, activity_date=:date,
-             venue=:venue, facilitator=:fac, participant_count=:pc, status=:st, updated_at=now()
+             venue=:venue, facilitator=:fac, participant_count=:pc, status=:st, updated_at=now(){$completedAt}
          WHERE activity_id=:id"
     )->execute([
         ':bid' => $batchId, ':t' => trim($d['title']), ':desc' => stNullStr($d['description'] ?? ''),
@@ -258,7 +276,8 @@ function stUpdateActivityStatus($id) {
     $valid  = ['Planned', 'Ongoing', 'Completed', 'Cancelled'];
     $status = in_array($d['status'] ?? '', $valid, true) ? $d['status'] : null;
     if (!$status) error('Valid status required.', 422);
-    db()->prepare("UPDATE skills_training_activities SET status=:s,updated_at=now() WHERE activity_id=:id")
+    $completedAt = $status === 'Completed' ? ',completed_at=now()' : '';
+    db()->prepare("UPDATE skills_training_activities SET status=:s,updated_at=now(){$completedAt} WHERE activity_id=:id")
         ->execute([':s' => $status, ':id' => (int)$id]);
     $titleS = db()->prepare("SELECT activity_title FROM skills_training_activities WHERE activity_id=:id");
     $titleS->execute([':id' => (int)$id]);
@@ -319,6 +338,84 @@ function stUpdateAttendance() {
     json(['status' => 'ok', 'message' => 'Attendance updated.']);
 }
 
+// Every training a beneficiary has ever been assigned to (PESO allows availing
+// more than one), newest first -- stAddParticipant no longer deletes prior rows,
+// so this is the full record, not just the current/active one.
+function stListTrainingHistory($bsId) {
+    if (!is_numeric($bsId)) error('Invalid beneficiary service id.', 422);
+    $s = db()->prepare(
+        "SELECT a.activity_id, a.activity_title, a.activity_date, a.status, a.completed_at, b.batch_name, p.attended
+         FROM skills_training_activity_participants p
+         JOIN skills_training_activities a ON a.activity_id = p.activity_id
+         JOIN skills_training_batches b ON b.batch_id = a.batch_id
+         WHERE p.beneficiary_service_id = :bsid
+         ORDER BY a.activity_date DESC, a.activity_id DESC"
+    );
+    $s->execute([':bsid' => (int)$bsId]);
+    $out = array_map(function($r) {
+        return [
+            'activityId'    => (int)$r['activity_id'],
+            'activityTitle' => $r['activity_title'],
+            'batchName'     => $r['batch_name'],
+            'activityDate'  => $r['activity_date'],
+            'status'        => $r['status'],
+            'completedDate' => $r['status'] === 'Completed' ? ($r['completed_at'] ?? $r['activity_date']) : null,
+            'attended'      => $r['attended'] === null ? null : (bool)$r['attended'],
+        ];
+    }, $s->fetchAll());
+    json(['status' => 'ok', 'data' => $out]);
+}
+
+// Aging: for every beneficiary who has genuinely finished at least one training
+// (status Completed AND attended -- same rule used everywhere else in this file),
+// how long since their most recent completion, and whether a job placement has
+// been recorded since. One row per beneficiary_service_id, using LATERAL joins
+// (not a plain JOIN+DISTINCT ON) so picking "their latest completed training"
+// and "their latest job placement" independently can't cross-multiply into
+// duplicate/mismatched rows when someone has more than one of either.
+function stAgingReport() {
+    $s = db()->prepare(
+        "SELECT bs.beneficiary_service_id, b.last_name, b.first_name, b.middle_name, b.sex,
+                lc.activity_title AS last_completed_title, lc.completed_date,
+                jp.job_title, jp.employer, jp.date_hired
+         FROM beneficiary_services bs
+         JOIN beneficiaries b ON b.beneficiary_id = bs.beneficiary_id
+         JOIN LATERAL (
+             SELECT a.activity_title, COALESCE(a.completed_at, a.activity_date)::date AS completed_date
+             FROM skills_training_activity_participants p
+             JOIN skills_training_activities a ON a.activity_id = p.activity_id
+             WHERE p.beneficiary_service_id = bs.beneficiary_service_id
+               AND a.status = 'Completed' AND p.attended = true
+             ORDER BY a.completed_at DESC NULLS LAST, a.activity_date DESC, a.activity_id DESC
+             LIMIT 1
+         ) lc ON true
+         LEFT JOIN LATERAL (
+             SELECT job_title, employer, date_hired
+             FROM job_placements
+             WHERE beneficiary_service_id = bs.beneficiary_service_id AND deleted_at IS NULL
+             ORDER BY date_hired DESC
+             LIMIT 1
+         ) jp ON true
+         WHERE bs.service_id = :sid AND b.deleted_at IS NULL
+         ORDER BY lc.completed_date DESC"
+    );
+    $s->execute([':sid' => stServiceId()]);
+    $out = array_map(function($r) {
+        return [
+            'beneficiaryServiceId'       => (int)$r['beneficiary_service_id'],
+            'name'                       => trim($r['last_name'] . ', ' . $r['first_name'] . ' ' . ($r['middle_name'] ?? '')),
+            'sex'                        => $r['sex'] ?? '',
+            'lastCompletedTrainingTitle' => $r['last_completed_title'],
+            'completedDate'              => $r['completed_date'],
+            'placed'                     => $r['date_hired'] !== null,
+            'jobTitle'                   => $r['job_title'],
+            'employer'                   => $r['employer'],
+            'dateHired'                  => $r['date_hired'],
+        ];
+    }, $s->fetchAll());
+    json(['status' => 'ok', 'data' => $out]);
+}
+
 function stAddParticipant() {
     $d = body();
     $actId = stIntOrNull($d['activityId'] ?? '');
@@ -344,9 +441,10 @@ function stAddParticipant() {
     $pdo = db();
     $pdo->beginTransaction();
     try {
-        // A profile can only be actively assigned to one training at a time --
-        // clear any prior assignment first (re-assign replaces, doesn't stack).
-        $pdo->prepare("DELETE FROM skills_training_activity_participants WHERE beneficiary_service_id=:b")->execute([':b' => $bsId]);
+        // A profile keeps every past assignment as history (PESO allows availing
+        // more than one training) -- only the current/active one is ever removed
+        // (see stRemoveParticipant), so re-assigning just adds a new row rather
+        // than deleting the old one. batch_id tracks whichever training is current.
         $pdo->prepare("INSERT INTO skills_training_activity_participants(activity_id,beneficiary_service_id,attended) VALUES(:a,:b,NULL)")->execute([':a' => $actId, ':b' => $bsId]);
         $pdo->prepare("UPDATE skills_training_profiles SET batch_id=:bid, updated_at=now() WHERE beneficiary_service_id=:b")->execute([':bid' => $act['batch_id'], ':b' => $bsId]);
         $pdo->commit();
@@ -525,7 +623,7 @@ function stBuildProfile($bid) {
     }
 
     $assignS = db()->prepare(
-        "SELECT a.activity_id, a.activity_title, a.status
+        "SELECT a.activity_id, a.activity_title, a.status, p.attended
          FROM skills_training_activity_participants p
          JOIN skills_training_activities a ON a.activity_id = p.activity_id
          WHERE p.beneficiary_service_id = :bsid
@@ -533,6 +631,37 @@ function stBuildProfile($bid) {
     );
     $assignS->execute([':bsid' => $bsId]);
     $assigned = $assignS->fetch();
+    // A training marked Completed only counts as completed for beneficiaries who
+    // actually attended -- someone marked absent (or never marked) should not be
+    // eligible for Record Job Placement or completion-based reporting.
+    $assignedStatus = null;
+    if ($assigned) {
+        $assignedStatus = ($assigned['status'] === 'Completed' && !(bool)$assigned['attended'])
+            ? 'Absent'
+            : $assigned['status'];
+    }
+
+    // PESO wants staff warned (not blocked) when re-assigning someone within 6
+    // months of a training they actually finished -- only a genuine completion
+    // (status Completed AND attended) starts this clock, same rule as Absent
+    // above, so a training they skipped never counts against them.
+    $lastCompS = db()->prepare(
+        "SELECT a.activity_title, a.completed_at, a.activity_date
+         FROM skills_training_activity_participants p
+         JOIN skills_training_activities a ON a.activity_id = p.activity_id
+         WHERE p.beneficiary_service_id = :bsid AND a.status = 'Completed' AND p.attended = true
+         ORDER BY a.completed_at DESC NULLS LAST, a.activity_date DESC, a.activity_id DESC
+         LIMIT 1"
+    );
+    $lastCompS->execute([':bsid' => $bsId]);
+    $lastCompleted = $lastCompS->fetch();
+
+    // Same "has a job placement been recorded" check the Aging Report uses --
+    // powers the Skills Training list's own Aging filter (0-1/1-3/3-6/6+ months),
+    // so a placed beneficiary is correctly excluded from every bucket there too.
+    $placedS = db()->prepare("SELECT EXISTS(SELECT 1 FROM job_placements WHERE beneficiary_service_id = :bsid AND deleted_at IS NULL) AS placed");
+    $placedS->execute([':bsid' => $bsId]);
+    $placed = (bool)$placedS->fetchColumn();
 
     $age = 0;
     if (!empty($b['birth_date'])) {
@@ -564,7 +693,10 @@ function stBuildProfile($bid) {
         'purposeOther'            => $purposeOther,
         'assignedTrainingId'      => $assigned ? (int)$assigned['activity_id'] : null,
         'assignedTrainingTitle'   => $assigned ? $assigned['activity_title'] : '',
-        'assignedTrainingStatus'  => $assigned ? $assigned['status'] : null,
+        'assignedTrainingStatus'  => $assignedStatus,
+        'lastCompletedTrainingTitle' => $lastCompleted ? $lastCompleted['activity_title'] : '',
+        'lastCompletedDate'          => $lastCompleted ? ($lastCompleted['completed_at'] ?? $lastCompleted['activity_date']) : null,
+        'placed'                     => $placed,
         'dateApplicationReceived' => $b['date_applied'] ?? '',
         'receivedBy'              => $b['received_by'] ?? '',
         'status'                  => $b['application_status'] ?? 'Waitlisted',
