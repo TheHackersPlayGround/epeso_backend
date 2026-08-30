@@ -851,8 +851,28 @@ function gipRecycleTarget() {
     return [$type, $id];
 }
 
+// A human-readable name for an activity log line -- "#9" means nothing to
+// whoever reads it later; the applicant's actual name (or workplace name)
+// does. Must be looked up BEFORE the record is hard-deleted.
+function gipRecordName($type, $id) {
+    if ($type === 'gipApplicant') {
+        $s = db()->prepare(
+            "SELECT CONCAT(last_name, ', ', first_name,
+                    CASE WHEN middle_name IS NOT NULL THEN ' ' || LEFT(middle_name, 1) || '.' ELSE '' END)
+             FROM beneficiaries WHERE beneficiary_id = :id"
+        );
+    } else {
+        $s = db()->prepare("SELECT workplace_name FROM gip_workplaces WHERE workplace_id = :id");
+    }
+    $s->execute([':id' => $id]);
+    $name = $s->fetchColumn();
+    return $name !== false ? $name : "#{$id}";
+}
+
 // GET /api/gip/listDeleted
 function gipListDeleted() {
+    gipPurgeExpired();
+
     $s = db()->prepare(
         "SELECT b.beneficiary_id AS id,
                 CONCAT(b.last_name, ', ', b.first_name,
@@ -903,12 +923,25 @@ function gipRestoreRecord() {
     [$type, $id] = gipRecycleTarget();
     [$table, $pk] = gipRecycleMap()[$type];
 
+    $name = gipRecordName($type, $id);
     $stmt = db()->prepare("UPDATE {$table} SET deleted_at = NULL, deleted_by = NULL WHERE {$pk} = :id AND deleted_at IS NOT NULL");
     $stmt->execute([':id' => $id]);
     if ($stmt->rowCount() === 0) error('Record not found in recycle bin.', 404);
 
-    logActivity(currentUserId(), 'Restore Record', 'gip', "Restored {$type} #{$id} from recycle bin");
+    logActivity(currentUserId(), 'Restore Record', 'gip', "Restored \"{$name}\" from recycle bin");
     json(['status' => 'ok', 'message' => 'Record restored.']);
+}
+
+// Single place that knows how to actually hard-delete each recordType --
+// shared by gipPurgeRecord() (one record, explicit admin action) and
+// gipPurgeExpired() (bulk, automatic 30-day retention purge) so there's
+// never a second, drifting copy of this dispatch.
+function gipHardDeleteByType($type, $id) {
+    if ($type === 'gipApplicant') {
+        gipHardDeleteApplicant($id);
+    } else {
+        gipHardDeleteWorkplace($id);
+    }
 }
 
 // POST /api/gip/purgeRecord  { recordType, id }  — permanent delete.
@@ -921,13 +954,54 @@ function gipPurgeRecord() {
     $chk->execute([':id' => $id]);
     if (!$chk->fetchColumn()) error('Record not found in recycle bin.', 404);
 
-    if ($type === 'gipApplicant') {
-        gipHardDeleteApplicant($id);
-    } else {
-        gipHardDeleteWorkplace($id);
-    }
-    logActivity(currentUserId(), 'Purge Record', 'gip', "Permanently deleted {$type} #{$id}");
+    $name = gipRecordName($type, $id);
+    gipHardDeleteByType($type, $id);
+    logActivity(currentUserId(), 'Purge Record', 'gip', "Permanently deleted \"{$name}\"");
     json(['status' => 'ok', 'message' => 'Record permanently deleted.']);
+}
+
+// Auto-purges anything past the recycle bin's retention window (see
+// RECYCLE_BIN_RETENTION_DAYS in core/helpers.php). Called from
+// gipListDeleted() so simply viewing the recycle bin enforces the "N days
+// left" countdown the UI already shows -- that display was cosmetic only
+// until this existed.
+function gipPurgeExpired() {
+    $uid = currentUserId();
+
+    // Applicants: beneficiaries.deleted_at is a SHARED column (one row per
+    // person, not per-service) -- an unscoped query here would let GIP's
+    // sweep pick up and hard-delete someone who actually belongs to a
+    // different module (wrong cleanup function, wrong log attribution, and
+    // a real risk of FK/orphan issues since gipHardDeleteApplicant()
+    // assumes GIP-specific rows exist). Scoped exactly like gipListDeleted().
+    $appS = db()->prepare(
+        "SELECT b.beneficiary_id AS id
+         FROM beneficiaries b
+         JOIN beneficiary_services bs ON bs.beneficiary_id = b.beneficiary_id AND bs.service_id = :sid
+         WHERE b.deleted_at IS NOT NULL AND b.deleted_at < now() - make_interval(days => :days)"
+    );
+    $appS->execute([':sid' => gipServiceId(), ':days' => RECYCLE_BIN_RETENTION_DAYS]);
+    foreach ($appS->fetchAll(PDO::FETCH_COLUMN) as $id) {
+        $id = (int) $id;
+        $name = gipRecordName('gipApplicant', $id);
+        gipHardDeleteApplicant($id);
+        logActivity($uid, 'Auto-Purge Record', 'gip', "Automatically purged \"{$name}\" after " . RECYCLE_BIN_RETENTION_DAYS . "-day recycle bin retention");
+    }
+
+    // Workplaces: a standalone module-specific table, no cross-module
+    // ambiguity -- safe to use the plain recycle-map-driven query.
+    [$wpTable, $wpPk] = gipRecycleMap()['gipWorkplace'];
+    $wpS = db()->prepare(
+        "SELECT {$wpPk} AS id FROM {$wpTable}
+         WHERE deleted_at IS NOT NULL AND deleted_at < now() - make_interval(days => :days)"
+    );
+    $wpS->execute([':days' => RECYCLE_BIN_RETENTION_DAYS]);
+    foreach ($wpS->fetchAll(PDO::FETCH_COLUMN) as $id) {
+        $id = (int) $id;
+        $name = gipRecordName('gipWorkplace', $id);
+        gipHardDeleteWorkplace($id);
+        logActivity($uid, 'Auto-Purge Record', 'gip', "Automatically purged \"{$name}\" after " . RECYCLE_BIN_RETENTION_DAYS . "-day recycle bin retention");
+    }
 }
 
 // Permanently remove a GIP workplace and its uploaded files. Only reachable

@@ -927,8 +927,27 @@ function cdspRecycleTarget() {
     return [$type, $id];
 }
 
+// A human-readable name for an activity log line -- "#9" means nothing to
+// whoever reads it later; the applicant's actual name (or activity title)
+// does. Must be looked up BEFORE the record is hard-deleted.
+function cdspRecordName($type, $id) {
+    if ($type === 'cdspApplicant') {
+        $s = db()->prepare(
+            "SELECT CONCAT(last_name, ', ', first_name,
+                    CASE WHEN middle_name IS NOT NULL THEN ' ' || LEFT(middle_name, 1) || '.' ELSE '' END)
+             FROM beneficiaries WHERE beneficiary_id = :id"
+        );
+    } else {
+        $s = db()->prepare("SELECT activity_title FROM cdsp_activities WHERE activity_id = :id");
+    }
+    $s->execute([':id' => $id]);
+    $name = $s->fetchColumn();
+    return $name !== false ? $name : "#{$id}";
+}
+
 // GET /api/cdsp/listDeleted
 function cdspListDeleted() {
+    cdspPurgeExpired();
     $pid = cdspParentServiceId();
 
     $s = db()->prepare(
@@ -982,12 +1001,28 @@ function cdspRestoreRecord() {
     [$type, $id] = cdspRecycleTarget();
     [$table, $pk] = cdspRecycleMap()[$type];
 
+    $name = cdspRecordName($type, $id);
     $stmt = db()->prepare("UPDATE {$table} SET deleted_at = NULL, deleted_by = NULL WHERE {$pk} = :id AND deleted_at IS NOT NULL");
     $stmt->execute([':id' => $id]);
     if ($stmt->rowCount() === 0) error('Record not found in recycle bin.', 404);
 
-    logActivity(currentUserId(), 'Restore Record', 'cdsp', "Restored {$type} #{$id} from recycle bin");
+    logActivity(currentUserId(), 'Restore Record', 'cdsp', "Restored \"{$name}\" from recycle bin");
     json(['status' => 'ok', 'message' => 'Record restored.']);
+}
+
+// Single place that knows how to actually hard-delete each recordType --
+// shared by cdspPurgeRecord() (one record, explicit admin action) and
+// cdspPurgeExpired() (bulk, automatic 30-day retention purge) so there's
+// never a second, drifting copy of this dispatch.
+function cdspHardDeleteByType($type, $id, $table, $pk) {
+    if ($type === 'cdspApplicant') {
+        cdspHardDeleteApplicant($id);
+    } else {
+        // Activities were already blocked from being soft-deleted while still
+        // referenced (see cdspDeleteActivity's in-use guard), so a plain row
+        // delete here is safe — no cascade needed.
+        db()->prepare("DELETE FROM {$table} WHERE {$pk} = :id")->execute([':id' => $id]);
+    }
 }
 
 // POST /api/cdsp/purgeRecord  { recordType, id }  — permanent delete.
@@ -1000,16 +1035,56 @@ function cdspPurgeRecord() {
     $chk->execute([':id' => $id]);
     if (!$chk->fetchColumn()) error('Record not found in recycle bin.', 404);
 
-    if ($type === 'cdspApplicant') {
-        cdspHardDeleteApplicant($id);
-    } else {
-        // Activities were already blocked from being soft-deleted while still
-        // referenced (see cdspDeleteActivity's in-use guard), so a plain row
-        // delete here is safe — no cascade needed.
-        db()->prepare("DELETE FROM {$table} WHERE {$pk} = :id")->execute([':id' => $id]);
-    }
-    logActivity(currentUserId(), 'Purge Record', 'cdsp', "Permanently deleted {$type} #{$id}");
+    $name = cdspRecordName($type, $id);
+    cdspHardDeleteByType($type, $id, $table, $pk);
+    logActivity(currentUserId(), 'Purge Record', 'cdsp', "Permanently deleted \"{$name}\"");
     json(['status' => 'ok', 'message' => 'Record permanently deleted.']);
+}
+
+// Auto-purges anything past the recycle bin's retention window (see
+// RECYCLE_BIN_RETENTION_DAYS in core/helpers.php). Called from
+// cdspListDeleted() so simply viewing the recycle bin enforces the "N days
+// left" countdown the UI already shows -- that display was cosmetic only
+// until this existed.
+function cdspPurgeExpired() {
+    $uid = currentUserId();
+
+    // Applicants: beneficiaries.deleted_at is a SHARED column (one row per
+    // person, not per-service) -- an unscoped query here would let CDSP's
+    // sweep pick up and hard-delete someone who actually belongs to a
+    // different module. Scoped exactly like cdspListDeleted() (via
+    // services.parent_service_id, since CDSP has sub-services like
+    // CDSP-CC/CDSP-PEC/CDSP-LEGS rather than one flat service_id).
+    $pid = cdspParentServiceId();
+    $appS = db()->prepare(
+        "SELECT b.beneficiary_id AS id
+         FROM beneficiaries b
+         JOIN beneficiary_services bs ON bs.beneficiary_id = b.beneficiary_id
+         JOIN services sv ON sv.service_id = bs.service_id AND sv.parent_service_id = :pid
+         WHERE b.deleted_at IS NOT NULL AND b.deleted_at < now() - make_interval(days => :days)"
+    );
+    $appS->execute([':pid' => $pid, ':days' => RECYCLE_BIN_RETENTION_DAYS]);
+    foreach ($appS->fetchAll(PDO::FETCH_COLUMN) as $id) {
+        $id = (int) $id;
+        $name = cdspRecordName('cdspApplicant', $id);
+        cdspHardDeleteApplicant($id);
+        logActivity($uid, 'Auto-Purge Record', 'cdsp', "Automatically purged \"{$name}\" after " . RECYCLE_BIN_RETENTION_DAYS . "-day recycle bin retention");
+    }
+
+    // Activities: a standalone module-specific table, no cross-module
+    // ambiguity -- safe to use the plain recycle-map-driven query.
+    [$actTable, $actPk] = cdspRecycleMap()['cdspActivity'];
+    $actS = db()->prepare(
+        "SELECT {$actPk} AS id FROM {$actTable}
+         WHERE deleted_at IS NOT NULL AND deleted_at < now() - make_interval(days => :days)"
+    );
+    $actS->execute([':days' => RECYCLE_BIN_RETENTION_DAYS]);
+    foreach ($actS->fetchAll(PDO::FETCH_COLUMN) as $id) {
+        $id = (int) $id;
+        $name = cdspRecordName('cdspActivity', $id);
+        cdspHardDeleteByType('cdspActivity', $id, $actTable, $actPk);
+        logActivity($uid, 'Auto-Purge Record', 'cdsp', "Automatically purged \"{$name}\" after " . RECYCLE_BIN_RETENTION_DAYS . "-day recycle bin retention");
+    }
 }
 
 // Permanently remove a CDSP applicant and its CDSP-specific data (profile row,

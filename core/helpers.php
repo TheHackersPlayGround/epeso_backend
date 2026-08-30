@@ -1,6 +1,17 @@
 <?php
 // Input validation, enum-cast, pagination
 
+// Recycle bin retention: a soft-deleted record older than this is
+// auto-purged the next time anyone loads the recycle bin (each module's
+// {prefix}PurgeExpired(), called from {prefix}ListDeleted() -- see e.g.
+// gip.php). Mirrors the "N days left" countdown already shown in
+// src/pages/security/ActivityLogsTab.tsx's getDaysRemaining() -- that
+// display was previously cosmetic only; this is what makes it real. Keep
+// both numbers in sync if this ever changes.
+if (!defined('RECYCLE_BIN_RETENTION_DAYS')) {
+    define('RECYCLE_BIN_RETENTION_DAYS', 30);
+}
+
 // Resolve a report's reporting window from the query string. Explicit
 // ?from=&to= wins; otherwise falls back to ?year=&month= (a single calendar
 // month), defaulting to the current month. Also returns the prior-period

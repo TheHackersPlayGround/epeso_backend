@@ -2491,11 +2491,42 @@ function efRecycleTarget()
     return [$type, $id, $d];
 }
 
+// A human-readable name for an activity log line -- "#9" means nothing to
+// whoever reads it later; the applicant's/employer's actual name (or, for a
+// referral, who it was for and where) does. Must be looked up BEFORE the
+// record is hard-deleted.
+function efRecordName($type, $id)
+{
+    if ($type === 'applicant') {
+        $s = db()->prepare(
+            "SELECT CONCAT(last_name, ', ', first_name,
+                    CASE WHEN middle_name IS NOT NULL THEN ' ' || LEFT(middle_name, 1) || '.' ELSE '' END)
+             FROM beneficiaries WHERE beneficiary_id = :id"
+        );
+    } elseif ($type === 'employer') {
+        $s = db()->prepare("SELECT company_name FROM employers WHERE employer_id = :id");
+    } else {
+        $s = db()->prepare(
+            "SELECT CONCAT(b.last_name, ', ', b.first_name, ' -> ', e.company_name, ' (', v.job_title, ')')
+             FROM employment_facilitation_referrals r
+             JOIN beneficiary_services bs ON bs.beneficiary_service_id = r.beneficiary_service_id
+             JOIN beneficiaries b ON b.beneficiary_id = bs.beneficiary_id
+             JOIN vacancies v ON v.vacancy_id = r.vacancy_id
+             JOIN employers e ON e.employer_id = v.employer_id
+             WHERE r.referral_id = :id"
+        );
+    }
+    $s->execute([':id' => $id]);
+    $name = $s->fetchColumn();
+    return $name !== false ? $name : "#{$id}";
+}
+
 // GET /api/employment/listDeleted
 // Every soft-deleted EF record in the shape the recycle bin UI expects:
 //   { recordType, id, name, module, description, deletedBy, deletedAt }
 function efListDeleted()
 {
+    efPurgeExpired();
     $items = [];
 
     // Applicants (soft-deleted beneficiaries enrolled in EF).
@@ -2580,11 +2611,12 @@ function efRestoreRecord()
     [$type, $id] = efRecycleTarget();
     [$table, $pk] = efRecycleMap()[$type];
 
+    $name = efRecordName($type, $id);
     $stmt = db()->prepare("UPDATE {$table} SET deleted_at = NULL, deleted_by = NULL WHERE {$pk} = :id AND deleted_at IS NOT NULL");
     $stmt->execute([':id' => $id]);
     if ($stmt->rowCount() === 0) error('Record not found in recycle bin.', 404);
 
-    logActivity(currentUserId(), 'Restore Record', 'employment', "Restored {$type} #{$id} from recycle bin");
+    logActivity(currentUserId(), 'Restore Record', 'employment', "Restored \"{$name}\" from recycle bin");
     json(['status' => 'ok', 'message' => 'Record restored.']);
 }
 
@@ -2594,6 +2626,17 @@ function efRestoreRecord()
 // {code:'has_history', placements, referrals}) unless force=true is passed —
 // the frontend re-submits with force after the user confirms a specific
 // "this will also delete N placements / M referrals" warning.
+// Single place that knows how to actually hard-delete each recordType --
+// shared by efPurgeRecord() (one record, explicit admin action) and
+// efPurgeExpired() (bulk, automatic 30-day retention purge) so there's
+// never a second, drifting copy of this dispatch.
+function efHardDeleteByType($type, $id)
+{
+    if ($type === 'applicant')     employmentHardDeleteApplicant($id);
+    elseif ($type === 'employer')  employmentHardDeleteEmployer($id);
+    else                            employmentHardDeleteReferral($id);
+}
+
 function efPurgeRecord()
 {
     [$type, $id, $body] = efRecycleTarget();
@@ -2603,22 +2646,73 @@ function efPurgeRecord()
     $chk->execute([':id' => $id]);
     if (!$chk->fetchColumn()) error('Record not found in recycle bin.', 404);
 
-    if ($type === 'applicant') {
-        if (empty($body['force'])) {
-            $counts = efApplicantHistoryCounts($id);
-            if ($counts['placements'] > 0 || $counts['referrals'] > 0) {
-                error(
-                    'This applicant has placement/referral history that will also be permanently deleted.',
-                    409,
-                    ['code' => 'has_history', 'placements' => $counts['placements'], 'referrals' => $counts['referrals']]
-                );
-            }
+    if ($type === 'applicant' && empty($body['force'])) {
+        $counts = efApplicantHistoryCounts($id);
+        if ($counts['placements'] > 0 || $counts['referrals'] > 0) {
+            error(
+                'This applicant has placement/referral history that will also be permanently deleted.',
+                409,
+                ['code' => 'has_history', 'placements' => $counts['placements'], 'referrals' => $counts['referrals']]
+            );
         }
-        employmentHardDeleteApplicant($id);
     }
-    elseif ($type === 'employer') employmentHardDeleteEmployer($id);
-    else                          employmentHardDeleteReferral($id);
+    $name = efRecordName($type, $id);
+    efHardDeleteByType($type, $id);
 
-    logActivity(currentUserId(), 'Purge Record', 'employment', "Permanently deleted {$type} #{$id}");
+    logActivity(currentUserId(), 'Purge Record', 'employment', "Permanently deleted \"{$name}\"");
     json(['status' => 'ok', 'message' => 'Record permanently deleted.']);
+}
+
+// Auto-purges anything past the recycle bin's retention window (see
+// RECYCLE_BIN_RETENTION_DAYS in core/helpers.php). Called from
+// efListDeleted() so simply viewing the recycle bin enforces the "N days
+// left" countdown the UI already shows -- that display was cosmetic only
+// until this existed.
+//
+// An applicant with placement/referral history is deliberately SKIPPED here
+// rather than force-deleted through the same guard efPurgeRecord() enforces
+// for a manual purge -- destroying that history should stay a conscious
+// admin action (via the explicit "force" confirmation), never something
+// that happens silently in the background. It simply stays in the recycle
+// bin past its nominal 30 days until an admin reviews it.
+function efPurgeExpired()
+{
+    $uid = currentUserId();
+
+    // Applicants: beneficiaries.deleted_at is a SHARED column (one row per
+    // person, not per-service) -- an unscoped query here would let EF's
+    // sweep pick up and hard-delete someone who actually belongs to a
+    // different module. Scoped exactly like efListDeleted().
+    $appS = db()->prepare(
+        "SELECT b.beneficiary_id AS id
+         FROM beneficiaries b
+         JOIN beneficiary_services bs ON bs.beneficiary_id = b.beneficiary_id AND bs.service_id = :sid
+         WHERE b.deleted_at IS NOT NULL AND b.deleted_at < now() - make_interval(days => :days)"
+    );
+    $appS->execute([':sid' => efServiceId(), ':days' => RECYCLE_BIN_RETENTION_DAYS]);
+    foreach ($appS->fetchAll(PDO::FETCH_COLUMN) as $id) {
+        $id = (int) $id;
+        $counts = efApplicantHistoryCounts($id);
+        if ($counts['placements'] > 0 || $counts['referrals'] > 0) continue; // see efPurgeRecord()'s force guard
+        $name = efRecordName('applicant', $id);
+        efHardDeleteByType('applicant', $id);
+        logActivity($uid, 'Auto-Purge Record', 'employment', "Automatically purged \"{$name}\" after " . RECYCLE_BIN_RETENTION_DAYS . "-day recycle bin retention");
+    }
+
+    // Employers and referrals: standalone module-specific tables, no
+    // cross-module ambiguity -- safe to use the plain recycle-map-driven query.
+    foreach (['employer', 'referral'] as $type) {
+        [$table, $pk] = efRecycleMap()[$type];
+        $s = db()->prepare(
+            "SELECT {$pk} AS id FROM {$table}
+             WHERE deleted_at IS NOT NULL AND deleted_at < now() - make_interval(days => :days)"
+        );
+        $s->execute([':days' => RECYCLE_BIN_RETENTION_DAYS]);
+        foreach ($s->fetchAll(PDO::FETCH_COLUMN) as $id) {
+            $id = (int) $id;
+            $name = efRecordName($type, $id);
+            efHardDeleteByType($type, $id);
+            logActivity($uid, 'Auto-Purge Record', 'employment', "Automatically purged \"{$name}\" after " . RECYCLE_BIN_RETENTION_DAYS . "-day recycle bin retention");
+        }
+    }
 }

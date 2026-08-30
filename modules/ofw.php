@@ -550,6 +550,20 @@ function ofwRecycleTarget() {
     return [$type, $id];
 }
 
+// A human-readable name for an activity log line -- "#9" means nothing to
+// whoever reads it later; the applicant's actual name does. Must be looked
+// up BEFORE the record is hard-deleted.
+function ofwRecordName($id) {
+    $s = db()->prepare(
+        "SELECT CONCAT(last_name, ', ', first_name,
+                CASE WHEN middle_name IS NOT NULL THEN ' ' || LEFT(middle_name, 1) || '.' ELSE '' END)
+         FROM beneficiaries WHERE beneficiary_id = :id"
+    );
+    $s->execute([':id' => $id]);
+    $name = $s->fetchColumn();
+    return $name !== false ? $name : "#{$id}";
+}
+
 function ofwListDeleted() {
     $s = db()->prepare(
         "SELECT b.beneficiary_id AS id,
@@ -575,10 +589,11 @@ function ofwListDeleted() {
 function ofwRestoreRecord() {
     [$type, $id] = ofwRecycleTarget();
     [$table, $pk] = ofwRecycleMap()[$type];
+    $name = ofwRecordName($id);
     $stmt = db()->prepare("UPDATE {$table} SET deleted_at = NULL, deleted_by = NULL WHERE {$pk} = :id AND deleted_at IS NOT NULL");
     $stmt->execute([':id' => $id]);
     if ($stmt->rowCount() === 0) error('Record not found in recycle bin.', 404);
-    logActivity(currentUserId(), 'Restore Record', 'ofw', "Restored {$type} #{$id} from recycle bin");
+    logActivity(currentUserId(), 'Restore Record', 'ofw', "Restored \"{$name}\" from recycle bin");
     json(['status' => 'ok', 'message' => 'Record restored.']);
 }
 
@@ -588,9 +603,42 @@ function ofwPurgeRecord() {
     $chk = db()->prepare("SELECT 1 FROM {$table} WHERE {$pk} = :id AND deleted_at IS NOT NULL");
     $chk->execute([':id' => $id]);
     if (!$chk->fetchColumn()) error('Record not found in recycle bin.', 404);
+    $name = ofwRecordName($id);
     ofwHardDeleteApplicant($id);
-    logActivity(currentUserId(), 'Purge Record', 'ofw', "Permanently deleted {$type} #{$id}");
+    logActivity(currentUserId(), 'Purge Record', 'ofw', "Permanently deleted \"{$name}\"");
     json(['status' => 'ok', 'message' => 'Record permanently deleted.']);
+}
+
+// Auto-purges anything past the recycle bin's retention window (see
+// RECYCLE_BIN_RETENTION_DAYS in core/helpers.php). Called from
+// ofwListDeleted() so simply viewing the recycle bin enforces the "N days
+// left" countdown the UI already shows -- that display was cosmetic only
+// until this existed.
+// Auto-purges anything past the recycle bin's retention window (see
+// RECYCLE_BIN_RETENTION_DAYS in core/helpers.php). Called from
+// ofwListDeleted() so simply viewing the recycle bin enforces the "N days
+// left" countdown the UI already shows -- that display was cosmetic only
+// until this existed.
+//
+// beneficiaries.deleted_at is a SHARED column (one row per person, not
+// per-service) -- an unscoped query would pick up EVERY soft-deleted
+// beneficiary system-wide, regardless of which module they actually
+// belong to. Scoped exactly like ofwListDeleted().
+function ofwPurgeExpired() {
+    $uid = currentUserId();
+    $s = db()->prepare(
+        "SELECT b.beneficiary_id AS id
+         FROM beneficiaries b
+         JOIN beneficiary_services bs ON bs.beneficiary_id = b.beneficiary_id AND bs.service_id = :sid
+         WHERE b.deleted_at IS NOT NULL AND b.deleted_at < now() - make_interval(days => :days)"
+    );
+    $s->execute([':sid' => ofwServiceId(), ':days' => RECYCLE_BIN_RETENTION_DAYS]);
+    foreach ($s->fetchAll(PDO::FETCH_COLUMN) as $id) {
+        $id = (int) $id;
+        $name = ofwRecordName($id);
+        ofwHardDeleteApplicant($id);
+        logActivity($uid, 'Auto-Purge Record', 'ofw', "Automatically purged \"{$name}\" after " . RECYCLE_BIN_RETENTION_DAYS . "-day recycle bin retention");
+    }
 }
 
 function ofwHardDeleteApplicant($bid) {

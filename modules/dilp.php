@@ -777,7 +777,26 @@ function dilpRecycleTarget() {
     return [$type, $id];
 }
 
+// A human-readable name for an activity log line -- "#9" means nothing to
+// whoever reads it later; the applicant's actual name (or project name)
+// does. Must be looked up BEFORE the record is hard-deleted.
+function dilpRecordName($type, $id) {
+    if ($type === 'dilpApplicant') {
+        $s = db()->prepare(
+            "SELECT CONCAT(last_name, ', ', first_name,
+                    CASE WHEN middle_name IS NOT NULL THEN ' ' || LEFT(middle_name, 1) || '.' ELSE '' END)
+             FROM beneficiaries WHERE beneficiary_id = :id"
+        );
+    } else {
+        $s = db()->prepare("SELECT project_name FROM dilp_projects WHERE dilp_project_id = :id");
+    }
+    $s->execute([':id' => $id]);
+    $name = $s->fetchColumn();
+    return $name !== false ? $name : "#{$id}";
+}
+
 function dilpListDeleted() {
+    dilpPurgeExpired();
     $s = db()->prepare(
         "SELECT b.beneficiary_id AS id,
                 CONCAT(b.last_name, ', ', b.first_name,
@@ -827,12 +846,25 @@ function dilpRestoreRecord() {
     [$type, $id] = dilpRecycleTarget();
     [$table, $pk] = dilpRecycleMap()[$type];
 
+    $name = dilpRecordName($type, $id);
     $stmt = db()->prepare("UPDATE {$table} SET deleted_at = NULL, deleted_by = NULL WHERE {$pk} = :id AND deleted_at IS NOT NULL");
     $stmt->execute([':id' => $id]);
     if ($stmt->rowCount() === 0) error('Record not found in recycle bin.', 404);
 
-    logActivity(currentUserId(), 'Restore Record', 'livelihood', "Restored {$type} #{$id} from recycle bin");
+    logActivity(currentUserId(), 'Restore Record', 'livelihood', "Restored \"{$name}\" from recycle bin");
     json(['status' => 'ok', 'message' => 'Record restored.']);
+}
+
+// Single place that knows how to actually hard-delete each recordType --
+// shared by dilpPurgeRecord() (one record, explicit admin action) and
+// dilpPurgeExpired() (bulk, automatic 30-day retention purge) so there's
+// never a second, drifting copy of this dispatch.
+function dilpHardDeleteByType($type, $id) {
+    if ($type === 'dilpApplicant') {
+        dilpHardDeleteApplicant($id);
+    } else {
+        dilpHardDeleteProject($id);
+    }
 }
 
 function dilpPurgeRecord() {
@@ -843,13 +875,52 @@ function dilpPurgeRecord() {
     $chk->execute([':id' => $id]);
     if (!$chk->fetchColumn()) error('Record not found in recycle bin.', 404);
 
-    if ($type === 'dilpApplicant') {
-        dilpHardDeleteApplicant($id);
-    } else {
-        dilpHardDeleteProject($id);
-    }
-    logActivity(currentUserId(), 'Purge Record', 'livelihood', "Permanently deleted {$type} #{$id}");
+    $name = dilpRecordName($type, $id);
+    dilpHardDeleteByType($type, $id);
+    logActivity(currentUserId(), 'Purge Record', 'livelihood', "Permanently deleted \"{$name}\"");
     json(['status' => 'ok', 'message' => 'Record permanently deleted.']);
+}
+
+// Auto-purges anything past the recycle bin's retention window (see
+// RECYCLE_BIN_RETENTION_DAYS in core/helpers.php). Called from
+// dilpListDeleted() so simply viewing the recycle bin enforces the "N days
+// left" countdown the UI already shows -- that display was cosmetic only
+// until this existed.
+function dilpPurgeExpired() {
+    $uid = currentUserId();
+
+    // Applicants: beneficiaries.deleted_at is a SHARED column (one row per
+    // person, not per-service) -- an unscoped query here would let DILP's
+    // sweep pick up and hard-delete someone who actually belongs to a
+    // different module. Scoped exactly like dilpListDeleted().
+    $appS = db()->prepare(
+        "SELECT b.beneficiary_id AS id
+         FROM beneficiaries b
+         JOIN beneficiary_services bs ON bs.beneficiary_id = b.beneficiary_id AND bs.service_id = :sid
+         WHERE b.deleted_at IS NOT NULL AND b.deleted_at < now() - make_interval(days => :days)"
+    );
+    $appS->execute([':sid' => dilpServiceId(), ':days' => RECYCLE_BIN_RETENTION_DAYS]);
+    foreach ($appS->fetchAll(PDO::FETCH_COLUMN) as $id) {
+        $id = (int) $id;
+        $name = dilpRecordName('dilpApplicant', $id);
+        dilpHardDeleteByType('dilpApplicant', $id);
+        logActivity($uid, 'Auto-Purge Record', 'livelihood', "Automatically purged \"{$name}\" after " . RECYCLE_BIN_RETENTION_DAYS . "-day recycle bin retention");
+    }
+
+    // Projects: a standalone module-specific table, no cross-module
+    // ambiguity -- safe to use the plain recycle-map-driven query.
+    [$projTable, $projPk] = dilpRecycleMap()['dilpProject'];
+    $projS = db()->prepare(
+        "SELECT {$projPk} AS id FROM {$projTable}
+         WHERE deleted_at IS NOT NULL AND deleted_at < now() - make_interval(days => :days)"
+    );
+    $projS->execute([':days' => RECYCLE_BIN_RETENTION_DAYS]);
+    foreach ($projS->fetchAll(PDO::FETCH_COLUMN) as $id) {
+        $id = (int) $id;
+        $name = dilpRecordName('dilpProject', $id);
+        dilpHardDeleteByType('dilpProject', $id);
+        logActivity($uid, 'Auto-Purge Record', 'livelihood', "Automatically purged \"{$name}\" after " . RECYCLE_BIN_RETENTION_DAYS . "-day recycle bin retention");
+    }
 }
 
 // Permanently remove a DILP project and its uploaded files. Only reachable

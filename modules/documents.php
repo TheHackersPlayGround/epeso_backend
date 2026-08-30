@@ -396,6 +396,7 @@ function docsFolderFileCount($folderId)
 
 function docsListDeleted()
 {
+    docsPurgeExpired();
     $items = [];
 
     // Origin context (which folder it'll reappear in on restore) is more
@@ -498,6 +499,15 @@ function docsRestoreRecord()
 // (detail: {code:'has_files', count}) unless force=true is passed. The
 // frontend re-submits with force after the user confirms a specific
 // "this will also delete N file(s)" warning.
+// Hard-deletes a folder, assuming any leftover recycle-bin files inside it
+// have already been dealt with by the caller (either confirmed via "force",
+// or found to have none). Subfolders clean up on their own
+// (folders.parent_folder_id is ON DELETE CASCADE).
+function docsHardDeleteFolder($id)
+{
+    db()->prepare("DELETE FROM folders WHERE folder_id = :id")->execute([':id' => $id]);
+}
+
 function docsPurgeRecord()
 {
     [$type, $id, $body] = docsRecycleTarget();
@@ -511,8 +521,6 @@ function docsPurgeRecord()
     if ($type === 'documentsDocument') {
         docsHardDeleteDocument($id);
     } else {
-        // Subfolders clean up on their own (folders.parent_folder_id is ON
-        // DELETE CASCADE) — only leftover recycle-bin files need handling.
         if (empty($body['force'])) {
             $fileCount = docsFolderFileCount($id);
             if ($fileCount > 0) {
@@ -529,11 +537,49 @@ function docsPurgeRecord()
                 docsHardDeleteDocument((int) $docId);
             }
         }
-        db()->prepare("DELETE FROM folders WHERE folder_id = :id")->execute([':id' => $id]);
+        docsHardDeleteFolder($id);
     }
     $label = $type === 'documentsFolder' ? 'folder' : 'document';
     logActivity(currentUserId(), 'Purge Record', 'documents', "Permanently deleted {$label} \"{$name}\"");
     json(['status' => 'ok', 'message' => 'Record permanently deleted.']);
+}
+
+// Auto-purges anything past the recycle bin's retention window (see
+// RECYCLE_BIN_RETENTION_DAYS in core/helpers.php). Called from
+// docsListDeleted() so simply viewing the recycle bin enforces the "N days
+// left" countdown the UI already shows -- that display was cosmetic only
+// until this existed.
+//
+// A folder that still has leftover recycle-bin files inside it is
+// deliberately SKIPPED, exactly like docsPurgeRecord()'s force guard for a
+// manual purge -- destroying those files too should stay a conscious admin
+// action, never something that happens silently in the background. It
+// simply stays in the recycle bin past its nominal 30 days until an admin
+// reviews it (likely because those files are also individually expired and
+// will be purged in their own right, after which the folder becomes
+// purgeable on the next sweep).
+function docsPurgeExpired()
+{
+    $uid = currentUserId();
+    foreach (docsRecycleMap() as $type => [$table, $pk]) {
+        $s = db()->prepare(
+            "SELECT {$pk} AS id FROM {$table}
+             WHERE deleted_at IS NOT NULL AND deleted_at < now() - make_interval(days => :days)"
+        );
+        $s->execute([':days' => RECYCLE_BIN_RETENTION_DAYS]);
+        foreach ($s->fetchAll(PDO::FETCH_COLUMN) as $id) {
+            $id = (int) $id;
+            if ($type === 'documentsFolder' && docsFolderFileCount($id) > 0) continue;
+            $name = docsRecordName($type, $id);
+            if ($type === 'documentsDocument') {
+                docsHardDeleteDocument($id);
+            } else {
+                docsHardDeleteFolder($id);
+            }
+            $label = $type === 'documentsFolder' ? 'folder' : 'document';
+            logActivity($uid, 'Auto-Purge Record', 'documents', "Automatically purged {$label} \"{$name}\" after " . RECYCLE_BIN_RETENTION_DAYS . "-day recycle bin retention");
+        }
+    }
 }
 
 function docsHardDeleteDocument($id)

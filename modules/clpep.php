@@ -796,7 +796,26 @@ function clpepRecycleTarget() {
     return [$type, $id];
 }
 
+// A human-readable name for an activity log line -- "#9" means nothing to
+// whoever reads it later; the applicant's actual name (or intervention name)
+// does. Must be looked up BEFORE the record is hard-deleted.
+function clpepRecordName($type, $id) {
+    if ($type === 'clpepApplicant') {
+        $s = db()->prepare(
+            "SELECT CONCAT(last_name, ', ', first_name,
+                    CASE WHEN middle_name IS NOT NULL THEN ' ' || LEFT(middle_name, 1) || '.' ELSE '' END)
+             FROM beneficiaries WHERE beneficiary_id = :id"
+        );
+    } else {
+        $s = db()->prepare("SELECT intervention_name FROM clpep_interventions WHERE intervention_id = :id");
+    }
+    $s->execute([':id' => $id]);
+    $name = $s->fetchColumn();
+    return $name !== false ? $name : "#{$id}";
+}
+
 function clpepListDeleted() {
+    clpepPurgeExpired();
     $s = db()->prepare(
         "SELECT b.beneficiary_id AS id,
                 CONCAT(b.last_name, ', ', b.first_name,
@@ -846,12 +865,25 @@ function clpepRestoreRecord() {
     [$type, $id] = clpepRecycleTarget();
     [$table, $pk] = clpepRecycleMap()[$type];
 
+    $name = clpepRecordName($type, $id);
     $stmt = db()->prepare("UPDATE {$table} SET deleted_at = NULL, deleted_by = NULL WHERE {$pk} = :id AND deleted_at IS NOT NULL");
     $stmt->execute([':id' => $id]);
     if ($stmt->rowCount() === 0) error('Record not found in recycle bin.', 404);
 
-    logActivity(currentUserId(), 'Restore Record', 'livelihood', "Restored {$type} #{$id} from recycle bin");
+    logActivity(currentUserId(), 'Restore Record', 'livelihood', "Restored \"{$name}\" from recycle bin");
     json(['status' => 'ok', 'message' => 'Record restored.']);
+}
+
+// Single place that knows how to actually hard-delete each recordType --
+// shared by clpepPurgeRecord() (one record, explicit admin action) and
+// clpepPurgeExpired() (bulk, automatic 30-day retention purge) so there's
+// never a second, drifting copy of this dispatch.
+function clpepHardDeleteByType($type, $id) {
+    if ($type === 'clpepApplicant') {
+        clpepHardDeleteApplicant($id);
+    } else {
+        clpepHardDeleteIntervention($id);
+    }
 }
 
 function clpepPurgeRecord() {
@@ -862,13 +894,52 @@ function clpepPurgeRecord() {
     $chk->execute([':id' => $id]);
     if (!$chk->fetchColumn()) error('Record not found in recycle bin.', 404);
 
-    if ($type === 'clpepApplicant') {
-        clpepHardDeleteApplicant($id);
-    } else {
-        clpepHardDeleteIntervention($id);
-    }
-    logActivity(currentUserId(), 'Purge Record', 'livelihood', "Permanently deleted {$type} #{$id}");
+    $name = clpepRecordName($type, $id);
+    clpepHardDeleteByType($type, $id);
+    logActivity(currentUserId(), 'Purge Record', 'livelihood', "Permanently deleted \"{$name}\"");
     json(['status' => 'ok', 'message' => 'Record permanently deleted.']);
+}
+
+// Auto-purges anything past the recycle bin's retention window (see
+// RECYCLE_BIN_RETENTION_DAYS in core/helpers.php). Called from
+// clpepListDeleted() so simply viewing the recycle bin enforces the "N days
+// left" countdown the UI already shows -- that display was cosmetic only
+// until this existed.
+function clpepPurgeExpired() {
+    $uid = currentUserId();
+
+    // Applicants: beneficiaries.deleted_at is a SHARED column (one row per
+    // person, not per-service) -- an unscoped query here would let CLPEP's
+    // sweep pick up and hard-delete someone who actually belongs to a
+    // different module. Scoped exactly like clpepListDeleted().
+    $appS = db()->prepare(
+        "SELECT b.beneficiary_id AS id
+         FROM beneficiaries b
+         JOIN beneficiary_services bs ON bs.beneficiary_id = b.beneficiary_id AND bs.service_id = :sid
+         WHERE b.deleted_at IS NOT NULL AND b.deleted_at < now() - make_interval(days => :days)"
+    );
+    $appS->execute([':sid' => clpepServiceId(), ':days' => RECYCLE_BIN_RETENTION_DAYS]);
+    foreach ($appS->fetchAll(PDO::FETCH_COLUMN) as $id) {
+        $id = (int) $id;
+        $name = clpepRecordName('clpepApplicant', $id);
+        clpepHardDeleteByType('clpepApplicant', $id);
+        logActivity($uid, 'Auto-Purge Record', 'livelihood', "Automatically purged \"{$name}\" after " . RECYCLE_BIN_RETENTION_DAYS . "-day recycle bin retention");
+    }
+
+    // Interventions: a standalone module-specific table, no cross-module
+    // ambiguity -- safe to use the plain recycle-map-driven query.
+    [$ivTable, $ivPk] = clpepRecycleMap()['clpepIntervention'];
+    $ivS = db()->prepare(
+        "SELECT {$ivPk} AS id FROM {$ivTable}
+         WHERE deleted_at IS NOT NULL AND deleted_at < now() - make_interval(days => :days)"
+    );
+    $ivS->execute([':days' => RECYCLE_BIN_RETENTION_DAYS]);
+    foreach ($ivS->fetchAll(PDO::FETCH_COLUMN) as $id) {
+        $id = (int) $id;
+        $name = clpepRecordName('clpepIntervention', $id);
+        clpepHardDeleteByType('clpepIntervention', $id);
+        logActivity($uid, 'Auto-Purge Record', 'livelihood', "Automatically purged \"{$name}\" after " . RECYCLE_BIN_RETENTION_DAYS . "-day recycle bin retention");
+    }
 }
 
 // Permanently remove a CLPEP intervention and its uploaded files. Only

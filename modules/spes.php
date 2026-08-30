@@ -825,8 +825,27 @@ function spesRecycleTarget() {
     return [$type, $id];
 }
 
+// A human-readable name for an activity log line -- "#9" means nothing to
+// whoever reads it later; the applicant's actual name (or batch name) does.
+// Must be looked up BEFORE the record is hard-deleted.
+function spesRecordName($type, $id) {
+    if ($type === 'spesApplicant') {
+        $s = db()->prepare(
+            "SELECT CONCAT(last_name, ', ', first_name,
+                    CASE WHEN middle_name IS NOT NULL THEN ' ' || LEFT(middle_name, 1) || '.' ELSE '' END)
+             FROM beneficiaries WHERE beneficiary_id = :id"
+        );
+    } else {
+        $s = db()->prepare("SELECT batch_name FROM spes_batches WHERE batch_id = :id");
+    }
+    $s->execute([':id' => $id]);
+    $name = $s->fetchColumn();
+    return $name !== false ? $name : "#{$id}";
+}
+
 // GET /api/spes/listDeleted
 function spesListDeleted() {
+    spesPurgeExpired();
     $s = db()->prepare(
         "SELECT b.beneficiary_id AS id,
                 CONCAT(b.last_name, ', ', b.first_name,
@@ -877,16 +896,29 @@ function spesRestoreRecord() {
     [$type, $id] = spesRecycleTarget();
     [$table, $pk] = spesRecycleMap()[$type];
 
+    $name = spesRecordName($type, $id);
     $stmt = db()->prepare("UPDATE {$table} SET deleted_at = NULL, deleted_by = NULL WHERE {$pk} = :id AND deleted_at IS NOT NULL");
     $stmt->execute([':id' => $id]);
     if ($stmt->rowCount() === 0) error('Record not found in recycle bin.', 404);
 
-    logActivity(currentUserId(), 'Restore Record', 'spes', "Restored {$type} #{$id} from recycle bin");
+    logActivity(currentUserId(), 'Restore Record', 'spes', "Restored \"{$name}\" from recycle bin");
     json(['status' => 'ok', 'message' => 'Record restored.']);
 }
 
 // POST /api/spes/purgeRecord  { recordType, id }  — permanent delete.
 // Only acts on records already in the recycle bin (deleted_at IS NOT NULL).
+// Single place that knows how to actually hard-delete each recordType --
+// shared by spesPurgeRecord() (one record, explicit admin action) and
+// spesPurgeExpired() (bulk, automatic 30-day retention purge) so there's
+// never a second, drifting copy of this dispatch.
+function spesHardDeleteByType($type, $id) {
+    if ($type === 'spesApplicant') {
+        spesHardDeleteApplicant($id);
+    } else {
+        spesHardDeleteBatch($id);
+    }
+}
+
 function spesPurgeRecord() {
     [$type, $id] = spesRecycleTarget();
     [$table, $pk] = spesRecycleMap()[$type];
@@ -895,13 +927,52 @@ function spesPurgeRecord() {
     $chk->execute([':id' => $id]);
     if (!$chk->fetchColumn()) error('Record not found in recycle bin.', 404);
 
-    if ($type === 'spesApplicant') {
-        spesHardDeleteApplicant($id);
-    } else {
-        spesHardDeleteBatch($id);
-    }
-    logActivity(currentUserId(), 'Purge Record', 'spes', "Permanently deleted {$type} #{$id}");
+    $name = spesRecordName($type, $id);
+    spesHardDeleteByType($type, $id);
+    logActivity(currentUserId(), 'Purge Record', 'spes', "Permanently deleted \"{$name}\"");
     json(['status' => 'ok', 'message' => 'Record permanently deleted.']);
+}
+
+// Auto-purges anything past the recycle bin's retention window (see
+// RECYCLE_BIN_RETENTION_DAYS in core/helpers.php). Called from
+// spesListDeleted() so simply viewing the recycle bin enforces the "N days
+// left" countdown the UI already shows -- that display was cosmetic only
+// until this existed.
+function spesPurgeExpired() {
+    $uid = currentUserId();
+
+    // Applicants: beneficiaries.deleted_at is a SHARED column (one row per
+    // person, not per-service) -- an unscoped query here would let SPES's
+    // sweep pick up and hard-delete someone who actually belongs to a
+    // different module. Scoped exactly like spesListDeleted().
+    $appS = db()->prepare(
+        "SELECT b.beneficiary_id AS id
+         FROM beneficiaries b
+         JOIN beneficiary_services bs ON bs.beneficiary_id = b.beneficiary_id AND bs.service_id = :sid
+         WHERE b.deleted_at IS NOT NULL AND b.deleted_at < now() - make_interval(days => :days)"
+    );
+    $appS->execute([':sid' => spesServiceId(), ':days' => RECYCLE_BIN_RETENTION_DAYS]);
+    foreach ($appS->fetchAll(PDO::FETCH_COLUMN) as $id) {
+        $id = (int) $id;
+        $name = spesRecordName('spesApplicant', $id);
+        spesHardDeleteByType('spesApplicant', $id);
+        logActivity($uid, 'Auto-Purge Record', 'spes', "Automatically purged \"{$name}\" after " . RECYCLE_BIN_RETENTION_DAYS . "-day recycle bin retention");
+    }
+
+    // Batches: a standalone module-specific table, no cross-module
+    // ambiguity -- safe to use the plain recycle-map-driven query.
+    [$batchTable, $batchPk] = spesRecycleMap()['spesBatch'];
+    $batchS = db()->prepare(
+        "SELECT {$batchPk} AS id FROM {$batchTable}
+         WHERE deleted_at IS NOT NULL AND deleted_at < now() - make_interval(days => :days)"
+    );
+    $batchS->execute([':days' => RECYCLE_BIN_RETENTION_DAYS]);
+    foreach ($batchS->fetchAll(PDO::FETCH_COLUMN) as $id) {
+        $id = (int) $id;
+        $name = spesRecordName('spesBatch', $id);
+        spesHardDeleteByType('spesBatch', $id);
+        logActivity($uid, 'Auto-Purge Record', 'spes', "Automatically purged \"{$name}\" after " . RECYCLE_BIN_RETENTION_DAYS . "-day recycle bin retention");
+    }
 }
 
 // Permanently remove a SPES batch and its uploaded files. Only reachable for
