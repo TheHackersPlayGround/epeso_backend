@@ -276,7 +276,13 @@ function stUpdateActivityStatus($id) {
     $valid  = ['Planned', 'Ongoing', 'Completed', 'Cancelled'];
     $status = in_array($d['status'] ?? '', $valid, true) ? $d['status'] : null;
     if (!$status) error('Valid status required.', 422);
-    $completedAt = $status === 'Completed' ? ',completed_at=now()' : '';
+    $prevS = db()->prepare("SELECT status FROM skills_training_activities WHERE activity_id=:id");
+    $prevS->execute([':id' => (int)$id]);
+    $prevStatus = $prevS->fetchColumn();
+    // Only stamp completed_at on the actual Planned/Ongoing -> Completed transition
+    // (matches stUpdateActivity's guard) -- otherwise reopening a training and
+    // marking it Completed again resets everyone's aging clock to "just now".
+    $completedAt = ($status === 'Completed' && $prevStatus !== 'Completed') ? ',completed_at=now()' : '';
     db()->prepare("UPDATE skills_training_activities SET status=:s,updated_at=now(){$completedAt} WHERE activity_id=:id")
         ->execute([':s' => $status, ':id' => (int)$id]);
     $titleS = db()->prepare("SELECT activity_title FROM skills_training_activities WHERE activity_id=:id");
@@ -377,7 +383,11 @@ function stAgingReport() {
     $s = db()->prepare(
         "SELECT bs.beneficiary_service_id, b.last_name, b.first_name, b.middle_name, b.sex,
                 lc.activity_title AS last_completed_title, lc.completed_date,
-                jp.job_title, jp.employer, jp.date_hired
+                jp.job_title, jp.employer, jp.date_hired,
+                (SELECT COUNT(*) FROM skills_training_activity_participants p2
+                 JOIN skills_training_activities a2 ON a2.activity_id = p2.activity_id
+                 WHERE p2.beneficiary_service_id = bs.beneficiary_service_id
+                   AND a2.status = 'Completed' AND p2.attended = true) AS trainings_completed
          FROM beneficiary_services bs
          JOIN beneficiaries b ON b.beneficiary_id = bs.beneficiary_id
          JOIN LATERAL (
@@ -405,6 +415,7 @@ function stAgingReport() {
             'beneficiaryServiceId'       => (int)$r['beneficiary_service_id'],
             'name'                       => trim($r['last_name'] . ', ' . $r['first_name'] . ' ' . ($r['middle_name'] ?? '')),
             'sex'                        => $r['sex'] ?? '',
+            'trainingsCompleted'         => (int)$r['trainings_completed'],
             'lastCompletedTrainingTitle' => $r['last_completed_title'],
             'completedDate'              => $r['completed_date'],
             'placed'                     => $r['date_hired'] !== null,

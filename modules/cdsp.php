@@ -18,6 +18,7 @@ function handle($action, $id, $method)
         case 'addParticipant':           requirePermission('cdsp-maintenance','Editor'); return cdspAddParticipant();
         case 'removeParticipant':        requirePermission('cdsp-maintenance','Editor'); return cdspRemoveParticipant();
         case 'updateAttendance':         requirePermission('cdsp-maintenance','Editor'); return cdspUpdateAttendance();
+        case 'agingReport':              requirePermission('cdsp','Viewer'); return cdspAgingReport();
         case 'listProfiles':             requirePermission('cdsp','Viewer'); return cdspListProfiles();
         case 'getProfile':               requirePermission('cdsp','Viewer'); return cdspGetProfile($id);
         case 'createProfile':            requirePermission('cdsp','Editor'); return cdspCreateProfile();
@@ -320,7 +321,13 @@ function cdspUpdateActivityStatus($id) {
     $valid  = ['Planned', 'Ongoing', 'Completed'];
     $status = in_array($d['status'] ?? '', $valid, true) ? $d['status'] : null;
     if (!$status) error('Valid status required.', 422);
-    $completedAt = $status === 'Completed' ? ',completed_at=now()' : '';
+    $prevS = db()->prepare("SELECT status FROM cdsp_activities WHERE activity_id=:id");
+    $prevS->execute([':id' => (int)$id]);
+    $prevStatus = $prevS->fetchColumn();
+    // Only stamp completed_at on the actual Planned/Ongoing -> Completed transition
+    // (matches cdspUpdateActivity's guard) -- otherwise reopening an activity and
+    // marking it Completed again resets everyone's aging clock to "just now".
+    $completedAt = ($status === 'Completed' && $prevStatus !== 'Completed') ? ',completed_at=now()' : '';
     db()->prepare("UPDATE cdsp_activities SET status=:s,updated_at=now(){$completedAt} WHERE activity_id=:id")->execute([':s'=>$status,':id'=>(int)$id]);
     $title = db()->prepare("SELECT activity_title FROM cdsp_activities WHERE activity_id=:id");
     $title->execute([':id'=>(int)$id]);
@@ -389,10 +396,27 @@ function cdspAddParticipant() {
     $bsId  = cdspIntOrNull($d['beneficiaryServiceId'] ?? '');
     if (!$actId || !$bsId) error('activityId and beneficiaryServiceId required.', 422);
 
-    $capS = db()->prepare("SELECT participant_count FROM cdsp_activities WHERE activity_id=:a AND deleted_at IS NULL");
+    $capS = db()->prepare("SELECT participant_count, service_id FROM cdsp_activities WHERE activity_id=:a AND deleted_at IS NULL");
     $capS->execute([':a'=>$actId]);
     $capRow = $capS->fetch();
     if ($capRow === false) error('Activity not found.', 404);
+
+    // The activity picker UI only ever shows activities matching the
+    // beneficiary's own sub-service (Career Coaching / Pre-Employment
+    // Coaching / Labor Employment for Graduating Students), but that's a
+    // frontend filter only -- re-check here so a mismatched assignment
+    // can't slip in through any other caller. Without this, a beneficiary
+    // could end up with a completed activity under a different sub-service
+    // than they're enrolled in, which the Aging Report's sub-service
+    // breakdown assumes can't happen.
+    $bsvcS = db()->prepare("SELECT service_id FROM beneficiary_services WHERE beneficiary_service_id=:b");
+    $bsvcS->execute([':b'=>$bsId]);
+    $bsServiceId = $bsvcS->fetchColumn();
+    if ($bsServiceId === false) error('Beneficiary service record not found.', 404);
+    if ((int)$bsServiceId !== (int)$capRow['service_id']) {
+        error('This activity belongs to a different CDSP sub-service than the one this applicant is enrolled under.', 409);
+    }
+
     $cap = $capRow['participant_count'];
     if ($cap !== null) {
         $cntS = db()->prepare(
@@ -439,6 +463,75 @@ function cdspUpdateAttendance() {
     db()->prepare("UPDATE cdsp_activity_participants SET attended=:att WHERE activity_id=:a AND beneficiary_service_id=:b")
         ->execute([':att'=>$d['attended'] ? 'true' : 'false',':a'=>$actId,':b'=>$bsId]);
     json(['status' => 'ok', 'message' => 'Attendance updated.']);
+}
+
+// Aging: for every beneficiary who has genuinely finished at least one CDSP
+// activity (status Completed AND attended -- same rule used everywhere else
+// in this file), how long since their most recent completion, and whether a
+// job placement has been recorded since. Unlike Skills Training, CDSP has
+// sub-services (Career Coaching / Pre-Employment Coaching / Labor Employment
+// for Graduating Students), so each row also carries which one the
+// beneficiary is enrolled under, for the report's by-sub-service breakdown.
+// One row per beneficiary_service_id, using LATERAL joins (not a plain
+// JOIN+DISTINCT ON) so picking "their latest completed activity" and "their
+// latest job placement" independently can't cross-multiply into duplicate/
+// mismatched rows when someone has more than one of either.
+function cdspAgingReport() {
+    // sub_service is resolved from lc.service_id (the sub-service of the
+    // activity actually shown as "last completed"), NOT from the
+    // beneficiary's current beneficiary_services.service_id -- those can
+    // disagree once someone has completed activities under one sub-service
+    // and later been (re)enrolled under another, and showing mismatched
+    // sub-service/activity pairs would be misleading.
+    $s = db()->prepare(
+        "SELECT bs.beneficiary_service_id, b.last_name, b.first_name, b.middle_name, b.sex,
+                svc.service_name AS sub_service,
+                lc.activity_title AS last_completed_title, lc.completed_date,
+                jp.job_title, jp.employer, jp.date_hired,
+                (SELECT COUNT(*) FROM cdsp_activity_participants cap2
+                 JOIN cdsp_activities ca2 ON ca2.activity_id = cap2.activity_id
+                 WHERE cap2.beneficiary_service_id = bs.beneficiary_service_id
+                   AND ca2.status = 'Completed' AND cap2.attended = true) AS activities_completed
+         FROM beneficiary_services bs
+         JOIN beneficiaries b ON b.beneficiary_id = bs.beneficiary_id
+         JOIN services sv ON sv.service_id = bs.service_id
+         JOIN LATERAL (
+             SELECT ca.activity_title, ca.service_id, COALESCE(ca.completed_at, ca.activity_date)::date AS completed_date
+             FROM cdsp_activity_participants cap
+             JOIN cdsp_activities ca ON ca.activity_id = cap.activity_id
+             WHERE cap.beneficiary_service_id = bs.beneficiary_service_id
+               AND ca.status = 'Completed' AND cap.attended = true
+             ORDER BY ca.completed_at DESC NULLS LAST, ca.activity_date DESC, ca.activity_id DESC
+             LIMIT 1
+         ) lc ON true
+         JOIN services svc ON svc.service_id = lc.service_id
+         LEFT JOIN LATERAL (
+             SELECT job_title, employer, date_hired
+             FROM job_placements
+             WHERE beneficiary_service_id = bs.beneficiary_service_id AND deleted_at IS NULL
+             ORDER BY date_hired DESC
+             LIMIT 1
+         ) jp ON true
+         WHERE sv.parent_service_id = :pid AND b.deleted_at IS NULL
+         ORDER BY lc.completed_date DESC"
+    );
+    $s->execute([':pid' => cdspParentServiceId()]);
+    $out = array_map(function($r) {
+        return [
+            'beneficiaryServiceId'       => (int)$r['beneficiary_service_id'],
+            'name'                       => trim($r['last_name'] . ', ' . $r['first_name'] . ' ' . ($r['middle_name'] ?? '')),
+            'sex'                        => $r['sex'] ?? '',
+            'subService'                 => $r['sub_service'],
+            'activitiesCompleted'        => (int)$r['activities_completed'],
+            'lastCompletedActivityTitle' => $r['last_completed_title'],
+            'completedDate'              => $r['completed_date'],
+            'placed'                     => $r['date_hired'] !== null,
+            'jobTitle'                   => $r['job_title'],
+            'employer'                   => $r['employer'],
+            'dateHired'                  => $r['date_hired'],
+        ];
+    }, $s->fetchAll());
+    json(['status' => 'ok', 'data' => $out]);
 }
 
 // ─── Profiles ─────────────────────────────────────────────────────────────────
@@ -504,7 +597,7 @@ function cdspBuildProfile($bid) {
 
     $partS = db()->prepare(
         "SELECT cap.activity_id, ca.activity_title, ca.status AS activity_status, ca.activity_date,
-                cap.date_assigned, ca.completed_at
+                cap.date_assigned, ca.completed_at, cap.attended
          FROM cdsp_activity_participants cap
          JOIN cdsp_activities ca ON ca.activity_id = cap.activity_id
          WHERE cap.beneficiary_service_id = :bsid
@@ -520,6 +613,7 @@ function cdspBuildProfile($bid) {
             'activityTitle' => $p['activity_title'],
             'assignedDate'  => $p['date_assigned'] ?? $p['activity_date'] ?? '',
             'completedDate' => ($p['activity_status'] === 'Completed') ? ($p['completed_at'] ?? $p['activity_date'] ?? '') : null,
+            'attended'      => $p['attended'] === null ? null : (bool)$p['attended'],
         ];
     }
 
@@ -528,6 +622,38 @@ function cdspBuildProfile($bid) {
         if ($p['activity_status'] !== 'Completed') { $currentAct = $p; break; }
     }
     if (!$currentAct && !empty($participants)) $currentAct = end($participants);
+
+    // An activity marked Completed only counts as completed for beneficiaries who
+    // actually attended -- someone marked absent (or never marked) should not be
+    // eligible for Record Job Placement or completion-based reporting. Mirrors
+    // the identical rule in skills_training.php's stBuildProfile.
+    $currentActStatus = null;
+    if ($currentAct) {
+        $currentActStatus = ($currentAct['activity_status'] === 'Completed' && !(bool)$currentAct['attended'])
+            ? 'Absent'
+            : $currentAct['activity_status'];
+    }
+
+    // PESO wants staff warned (not blocked) when re-assigning someone within 6
+    // months of an activity they actually finished -- only a genuine completion
+    // (status Completed AND attended) starts this clock, same rule as above, so
+    // an activity they skipped never counts against them.
+    $lastCompS = db()->prepare(
+        "SELECT ca.activity_title, ca.completed_at, ca.activity_date
+         FROM cdsp_activity_participants cap
+         JOIN cdsp_activities ca ON ca.activity_id = cap.activity_id
+         WHERE cap.beneficiary_service_id = :bsid AND ca.status = 'Completed' AND cap.attended = true
+         ORDER BY ca.completed_at DESC NULLS LAST, ca.activity_date DESC, ca.activity_id DESC
+         LIMIT 1"
+    );
+    $lastCompS->execute([':bsid' => $bsId]);
+    $lastCompleted = $lastCompS->fetch();
+
+    // Same "has a job placement been recorded" check the Skills Training Aging
+    // Report uses -- powers CDSP's own Aging filter/report the same way.
+    $placedS = db()->prepare("SELECT EXISTS(SELECT 1 FROM job_placements WHERE beneficiary_service_id = :bsid AND deleted_at IS NULL) AS placed");
+    $placedS->execute([':bsid' => $bsId]);
+    $placed = (bool)$placedS->fetchColumn();
 
     $age = 0;
     if (!empty($b['birth_date'])) {
@@ -568,6 +694,10 @@ function cdspBuildProfile($bid) {
         'serviceAvailed'          => $b['service_availed'] ?? '',
         'assignedActivity'        => $currentAct ? $currentAct['activity_title'] : '',
         'assignedActivityId'      => $currentAct ? (int)$currentAct['activity_id'] : null,
+        'assignedActivityStatus'  => $currentActStatus,
+        'lastCompletedActivityTitle' => $lastCompleted ? $lastCompleted['activity_title'] : '',
+        'lastCompletedDate'          => $lastCompleted ? ($lastCompleted['completed_at'] ?? $lastCompleted['activity_date']) : null,
+        'placed'                     => $placed,
         'assignmentHistory'       => $history,
         'dateApplicationReceived' => $b['date_applied'] ?? '',
         'receivedBy'              => $b['received_by'] ?? '',

@@ -20,6 +20,7 @@ function handle($action, $id, $method)
         case 'assignWorkplace':   requirePermission('gip','Editor'); return gipAssignWorkplace();
         case 'unassignWorkplace': requirePermission('gip','Editor'); return gipUnassignWorkplace();
         case 'completeAssignment':requirePermission('gip','Editor'); return gipCompleteAssignment();
+        case 'agingReport':       requirePermission('gip','Viewer'); return gipAgingReport();
         case 'listDeleted':       requirePermission('gip','Viewer'); return gipListDeleted();
         case 'restoreRecord':     requirePermission('gip','Editor'); return gipRestoreRecord();
         case 'purgeRecord':       requirePermission('gip','Editor'); return gipPurgeRecord();
@@ -347,6 +348,18 @@ function gipBuildProfile($bid) {
         $age = (new DateTime($b['birth_date']))->diff(new DateTime('today'))->y;
     }
 
+    // Aging fields -- only meaningful once this one-shot internship is
+    // Completed. Unlike Skills Training/CDSP there's no LATERAL "pick the
+    // latest of several" needed: gip_profiles holds at most one completed
+    // engagement ever, so it's read straight off this same row.
+    $lastCompletedDate = ($gp['status'] ?? null) === 'Completed' ? ($gp['workplace_completed_at'] ?? null) : null;
+    $placed = false;
+    if ($lastCompletedDate) {
+        $plS = db()->prepare("SELECT 1 FROM job_placements WHERE beneficiary_service_id=:id AND deleted_at IS NULL LIMIT 1");
+        $plS->execute([':id' => $bsId]);
+        $placed = (bool) $plS->fetchColumn();
+    }
+
     return [
         'id'                      => $bid,
         'gipProfileId'            => isset($gp['gip_profile_id']) ? (int) $gp['gip_profile_id'] : null,
@@ -376,6 +389,9 @@ function gipBuildProfile($bid) {
         'yearGraduated'           => isset($gp['year_graduated']) && $gp['year_graduated'] !== null ? (string) $gp['year_graduated'] : '',
         'assignedWorkplaceId'     => $workplaceId ? (int) $workplaceId : null,
         'assignmentHistory'       => $assignmentHistory,
+        'lastCompletedWorkplaceTitle' => ($gp['status'] ?? null) === 'Completed' ? ($assignmentHistory[0]['workplaceName'] ?? null) : null,
+        'lastCompletedDate'       => $lastCompletedDate,
+        'placed'                  => $placed,
         'attachedDocuments'       => gipFetchSavedDocuments($bid),
         'dateApplicationReceived' => $b['date_applied'] ?? '',
         'receivedBy'              => $b['received_by'] ?? '',
@@ -536,6 +552,48 @@ function gipDeleteProfile($id) {
     json(['status' => 'ok', 'message' => 'Applicant moved to recycle bin.']);
 }
 
+// Aging: for every applicant who has completed their (one-time) GIP
+// internship, how long since completion, and whether a job placement has
+// been recorded since. Unlike Skills Training/CDSP there's no participant-
+// history table to pick "the latest of several" from -- gip_profiles holds
+// at most one completed engagement per beneficiary, ever, so this is a
+// plain join rather than a LATERAL one.
+function gipAgingReport() {
+    $s = db()->prepare(
+        "SELECT bs.beneficiary_service_id, b.last_name, b.first_name, b.middle_name, b.sex,
+                w.workplace_name, gp.workplace_completed_at::date AS completed_date,
+                jp.job_title, jp.employer, jp.date_hired
+         FROM gip_profiles gp
+         JOIN beneficiary_services bs ON bs.beneficiary_service_id = gp.beneficiary_service_id
+         JOIN beneficiaries b ON b.beneficiary_id = bs.beneficiary_id
+         LEFT JOIN gip_workplaces w ON w.workplace_id = gp.workplace_id
+         LEFT JOIN LATERAL (
+             SELECT job_title, employer, date_hired
+             FROM job_placements
+             WHERE beneficiary_service_id = bs.beneficiary_service_id AND deleted_at IS NULL
+             ORDER BY date_hired DESC
+             LIMIT 1
+         ) jp ON true
+         WHERE bs.service_id = :sid AND gp.status = 'Completed' AND b.deleted_at IS NULL
+         ORDER BY gp.workplace_completed_at DESC"
+    );
+    $s->execute([':sid' => gipServiceId()]);
+    $out = array_map(function($r) {
+        return [
+            'beneficiaryServiceId'        => (int)$r['beneficiary_service_id'],
+            'name'                        => trim($r['last_name'] . ', ' . $r['first_name'] . ' ' . ($r['middle_name'] ?? '')),
+            'sex'                         => $r['sex'] ?? '',
+            'lastCompletedWorkplaceTitle' => $r['workplace_name'] ?? '',
+            'completedDate'               => $r['completed_date'],
+            'placed'                      => $r['date_hired'] !== null,
+            'jobTitle'                    => $r['job_title'],
+            'employer'                    => $r['employer'],
+            'dateHired'                   => $r['date_hired'],
+        ];
+    }, $s->fetchAll());
+    json(['status' => 'ok', 'data' => $out]);
+}
+
 // ─── Assign / Unassign / Complete workplace ────────────────────────────────────
 // A workplace is a reusable directory entry (like EF's Employer) — capacity
 // is the only gate on assignment, not a workplace-level status. Each
@@ -569,9 +627,18 @@ function gipAssignWorkplace() {
     $gpId = (int) $gp['gip_profile_id'];
 
     // Can't assign someone who's already actively interning somewhere —
-    // unassign or complete that engagement first.
-    if ($gp['workplace_id'] && $gp['status'] === 'Ongoing') {
+    // unassign that engagement first. And, since gipCompleteAssignment()
+    // is deliberately final ("a GIP applicant only ever goes through the
+    // program once"), a Completed applicant can't be reassigned either —
+    // gip_profiles has no participant-history table like Skills Training/
+    // CDSP, only a single workplace_id + one pair of assignment/completion
+    // dates, so reassigning after Completed would silently overwrite (and
+    // lose) the record of their finished internship.
+    if ($gp['status'] === 'Ongoing') {
         error('This applicant is already assigned to a workplace/office. Unassign them or mark their current internship completed first.', 409);
+    }
+    if ($gp['status'] === 'Completed') {
+        error('This applicant has already completed a GIP internship and cannot be reassigned — the program is one-time only.', 409);
     }
 
     $wpS = db()->prepare("SELECT 1 FROM gip_workplaces WHERE workplace_id=:id AND deleted_at IS NULL");
