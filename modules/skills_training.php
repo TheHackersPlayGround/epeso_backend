@@ -13,9 +13,10 @@
 //  - skills_training_profiles.application_status (Accepted/Waitlisted) is a
 //    real, manually-set stored column (migration 038), reusing the shared
 //    application_status_enum already used by spes_profiles -- not derived.
-//  - Attendance (skills_training_activity_participants.attended) is intentionally
-//    NOT exposed here yet (deferred per product decision) -- rows are inserted
-//    with attended=NULL and never toggled by any endpoint below.
+//  - Attendance (skills_training_activity_participants.attended) is tracked via
+//    stUpdateAttendance() below -- rows are inserted with attended=NULL and stay
+//    that way until staff mark it, and a Completed training only counts as a
+//    genuine completion (for Aging/job-placement eligibility) when attended=true.
 //  - skills_training_profiles.batch_id is kept in sync with whichever activity's
 //    batch the applicant is currently assigned to (denormalized convenience column
 //    already on the table), cleared back to NULL on unassign.
@@ -633,15 +634,28 @@ function stBuildProfile($bid) {
         else { $purposeOfTraining[] = $row['purpose_name']; }
     }
 
+    // Pulls every training this person has ever been part of, oldest to newest
+    // by SCHEDULED date, then walks backwards to find their real current one
+    // (the most recent that isn't Completed yet) -- sorting by activity_id
+    // alone would pick whichever training happens to have been CREATED most
+    // recently, which isn't necessarily the one they're actually in now (e.g.
+    // reassigned into an older, still-Planned training after a newer one).
+    // Mirrors cdspBuildProfile()'s identical $currentAct logic.
     $assignS = db()->prepare(
         "SELECT a.activity_id, a.activity_title, a.status, p.attended
          FROM skills_training_activity_participants p
          JOIN skills_training_activities a ON a.activity_id = p.activity_id
          WHERE p.beneficiary_service_id = :bsid
-         ORDER BY p.activity_id DESC LIMIT 1"
+         ORDER BY a.activity_date ASC, a.activity_id ASC"
     );
     $assignS->execute([':bsid' => $bsId]);
-    $assigned = $assignS->fetch();
+    $allAssignments = $assignS->fetchAll();
+
+    $assigned = null;
+    foreach (array_reverse($allAssignments) as $row) {
+        if ($row['status'] !== 'Completed') { $assigned = $row; break; }
+    }
+    if (!$assigned && !empty($allAssignments)) $assigned = end($allAssignments);
     // A training marked Completed only counts as completed for beneficiaries who
     // actually attended -- someone marked absent (or never marked) should not be
     // eligible for Record Job Placement or completion-based reporting.
