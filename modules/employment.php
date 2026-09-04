@@ -1811,11 +1811,13 @@ function efGetApplicantHistory($id)
 // GET /api/employment/listReferrals — a working list of unresolved referral
 // attempts only. Excludes Hired referrals (those become placements), and also
 // excludes any OTHER referral (Pending/Interviewed/Not Hired) belonging to an
-// applicant who already has a placement on record — once someone's hired
-// (through whichever referral got them there), every earlier attempt for
-// them is resolved history, not something still needing action. The full
-// referral->placement timeline, including these, remains visible via
-// getApplicantHistory.
+// applicant who currently has an ACTIVE placement — once someone's actively
+// hired (through whichever referral got them there), every earlier attempt for
+// them is resolved history, not something still needing action. A past
+// placement that has since ended (Resigned/Terminated/Completed) does NOT
+// suppress a new referral — matches efApplicantReferralState()'s definition
+// of "Hired". The full referral->placement timeline, including resolved
+// entries, remains visible via getApplicantHistory.
 function efListReferrals()
 {
     $stmt = db()->prepare(
@@ -1834,7 +1836,7 @@ function efListReferrals()
          WHERE r.status != 'Hired' AND r.deleted_at IS NULL AND b.deleted_at IS NULL
            AND NOT EXISTS (
                SELECT 1 FROM employment_facilitation_placements p
-               WHERE p.beneficiary_service_id = r.beneficiary_service_id
+               WHERE p.beneficiary_service_id = r.beneficiary_service_id AND p.status = 'Active'
            )
          ORDER BY r.referral_id DESC"
     );
