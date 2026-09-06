@@ -691,20 +691,25 @@ function employmentInsertResumeTables($pdo, $bid, $d)
     );
     $jpType = is_array($d['jobPrefEmploymentType'] ?? null) ? implode(', ', $d['jobPrefEmploymentType']) : '';
     foreach (($d['jobPreferences'] ?? []) as $row) {
-        if (is_array($row) && efNull($row['occupation'] ?? '') !== null) {
-            $local    = efNull($row['localCity'] ?? '');
-            $overseas = efNull($row['overseasCountry'] ?? '');
-            // localCity takes priority when both are somehow present.
-            $loc     = $local ?? $overseas;
-            $locType = $local !== null ? 'Local' : ($overseas !== null ? 'Overseas' : null);
-            $jpInsert->execute([
-                ':bid'     => $bid,
-                ':occ'     => trim($row['occupation']),
-                ':type'    => efNull($jpType),
-                ':loc'     => $loc,
-                ':loctype' => $locType,
-            ]);
-        }
+        if (!is_array($row)) continue;
+        $occupation = efNull($row['occupation'] ?? '');
+        $local      = efNull($row['localCity'] ?? '');
+        $overseas   = efNull($row['overseasCountry'] ?? '');
+        // Keep the row if any of its three fields is filled in — the occupation
+        // input is disabled until an employment type is checked, so a row with
+        // only a city/country typed (and no employment type ticked yet) must
+        // still be persisted instead of being silently dropped.
+        if ($occupation === null && $local === null && $overseas === null) continue;
+        // localCity takes priority when both are somehow present.
+        $loc     = $local ?? $overseas;
+        $locType = $local !== null ? 'Local' : ($overseas !== null ? 'Overseas' : null);
+        $jpInsert->execute([
+            ':bid'     => $bid,
+            ':occ'     => $occupation,
+            ':type'    => efNull($jpType),
+            ':loc'     => $loc,
+            ':loctype' => $locType,
+        ]);
     }
 
     // Languages — only the ones with at least one ability ticked.
