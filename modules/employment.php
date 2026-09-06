@@ -899,13 +899,11 @@ function employmentBuildApplicant($bid)
     }, $docRows->fetchAll());
 
     // ── Rebuild education levels ──
-    $eduBlank = ['schoolName' => '', 'schoolCity' => '', 'schoolProvince' => '', 'course' => '', 'graduated' => '', 'yearGraduated' => '', 'levelReached' => '', 'yearLastAttended' => ''];
+    $eduBlank = ['schoolName' => '', 'course' => '', 'graduated' => '', 'yearGraduated' => '', 'levelReached' => '', 'yearLastAttended' => ''];
     $elem = $eduBlank; $sec = $eduBlank + ['type' => '', 'seniorHighStrand' => '']; $tert = $eduBlank; $grad = [];
     foreach ($educations as $e) {
         $obj = [
             'schoolName'       => $e['school_name'] ?? '',
-            'schoolCity'       => '',
-            'schoolProvince'   => '',
             'course'           => $e['course'] ?? '',
             'graduated'        => $e['graduated'] ? 'Yes' : 'No',
             'yearGraduated'    => $e['year_graduated'] !== null ? (string) $e['year_graduated'] : '',
@@ -1342,7 +1340,6 @@ function efBuildEmployer($row)
         'barangayId'        => $row['barangay_id'] !== null ? (int) $row['barangay_id'] : null,
         'cityId'            => isset($row['city_id']) && $row['city_id'] !== null ? (int) $row['city_id'] : null,
         'provinceId'        => isset($row['province_id']) && $row['province_id'] !== null ? (int) $row['province_id'] : null,
-        'jobOpenings'       => [['jobName' => '', 'slots' => '']],
         'status'            => $row['status'],
         'dateRegistered'    => $row['date_registered'],
         'remarks'           => $row['remarks'] ?? '',
