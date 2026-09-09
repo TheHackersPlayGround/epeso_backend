@@ -117,7 +117,7 @@ function cdspParentServiceId() {
 }
 
 function cdspServiceIdByName($name) {
-    $s = db()->prepare("SELECT service_id FROM services WHERE service_name=:n AND parent_service_id=:p AND deleted_at IS NULL LIMIT 1");
+    $s = db()->prepare("SELECT service_id FROM services WHERE service_name=:n AND parent_service_id=:p LIMIT 1");
     $s->execute([':n' => $name, ':p' => cdspParentServiceId()]);
     $id = $s->fetchColumn();
     return $id !== false ? (int)$id : null;
@@ -211,7 +211,7 @@ function cdspFetchSavedDocuments($bid) {
 // ─── Sub-services ─────────────────────────────────────────────────────────────
 
 function cdspListServices() {
-    $s = db()->prepare("SELECT service_id,service_code,service_name FROM services WHERE parent_service_id=:p AND is_active=true AND deleted_at IS NULL ORDER BY service_id");
+    $s = db()->prepare("SELECT service_id,service_code,service_name FROM services WHERE parent_service_id=:p AND is_active=true ORDER BY service_id");
     $s->execute([':p' => cdspParentServiceId()]);
     $out = array_map(function($r) {
         return ['id' => (int)$r['service_id'], 'code' => $r['service_code'], 'name' => $r['service_name']];
