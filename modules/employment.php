@@ -2182,9 +2182,27 @@ function efDeleteReferral($id)
     $uid = requireLogin();
     if (!is_numeric($id)) error('Invalid referral id.', 422);
 
-    $check = db()->prepare("SELECT 1 FROM employment_facilitation_referrals WHERE referral_id = :id AND deleted_at IS NULL");
+    $check = db()->prepare("SELECT status FROM employment_facilitation_referrals WHERE referral_id = :id AND deleted_at IS NULL");
     $check->execute([':id' => (int) $id]);
-    if (!$check->fetchColumn()) error('Referral not found.', 404);
+    $status = $check->fetchColumn();
+    if ($status === false) error('Referral not found.', 404);
+
+    // A courtesy guard, not a hard rule -- status can be freely changed back to
+    // Pending via updateReferralStatus, so this only stops accidental deletion
+    // of a referral someone's already acted on, not a determined override.
+    if ($status !== 'Pending') {
+        error("Cannot delete: this referral is no longer pending (current status: {$status}). Only pending referrals can be deleted.", 409);
+    }
+
+    // Placements carry a NOT NULL, ON DELETE RESTRICT referral_id, and there is
+    // no way to delete a placement anywhere in the app -- so once a referral
+    // has resulted in a hire, it must stay visible/restorable rather than
+    // disappearing into the recycle bin while its placement remains active.
+    $placementCheck = db()->prepare("SELECT COUNT(*) FROM employment_facilitation_placements WHERE referral_id = :id");
+    $placementCheck->execute([':id' => (int) $id]);
+    if ((int) $placementCheck->fetchColumn() > 0) {
+        error('Cannot delete: this referral resulted in a placement (hire) and cannot be removed while that history exists.', 409);
+    }
 
     try {
         db()->prepare("UPDATE employment_facilitation_referrals SET deleted_at = now(), deleted_by = :uid WHERE referral_id = :id")
