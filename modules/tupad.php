@@ -29,6 +29,7 @@ function handle($action, $id, $method)
         case 'listProfiles':        requirePermission('livelihood','Viewer'); return tupadListProfiles();
         case 'getProfile':          requirePermission('livelihood','Viewer'); return tupadGetProfile($id);
         case 'createProfile':       requirePermission('livelihood','Editor'); return tupadCreateProfile();
+        case 'importProfilesBulk':  requirePermission('livelihood','Editor'); return tupadImportProfilesBulk();
         case 'updateProfile':       requirePermission('livelihood','Editor'); return tupadUpdateProfile($id);
         case 'deleteProfile':       requirePermission('livelihood','Editor'); return tupadDeleteProfile($id);
         case 'assignProject':       requirePermission('livelihood','Editor'); return tupadAssignProject();
@@ -339,62 +340,83 @@ function tupadBuildProfile($bid) {
     ];
 }
 
+// Non-exiting sibling of tupadValidateProfileInput() below: returns an error
+// string (or '' if valid) instead of calling error()/exit, so the bulk
+// import can validate every row and collect all their problems instead of
+// aborting the whole request at the first bad row.
+//
 // Required fields mirror beneficiaries' real NOT NULL columns (sex, birth_date,
 // civil_status, barangay_id) so a bad request 422s cleanly instead of failing
 // as a raw DB constraint violation.
-function tupadValidateProfileInput($d) {
-    if (tupadNullStr($d['firstName'] ?? '') === null) error('First name is required.', 422);
-    if (tupadNullStr($d['lastName'] ?? '') === null)  error('Last name is required.', 422);
-
-    $sex = in_array($d['sex'] ?? '', ['Male', 'Female'], true) ? $d['sex'] : null;
-    if (!$sex) error('Sex is required.', 422);
-
-    $birth = tupadDate($d['birthdate'] ?? '');
-    if (!$birth) error('Birthdate is required.', 422);
-
+function tupadProfileValidationError($d) {
+    if (tupadNullStr($d['firstName'] ?? '') === null) return 'First name is required.';
+    if (tupadNullStr($d['lastName'] ?? '') === null)  return 'Last name is required.';
+    if (!in_array($d['sex'] ?? '', ['Male', 'Female'], true)) return 'Sex is required.';
+    if (!tupadDate($d['birthdate'] ?? '')) return 'Birthdate is required.';
     $validCivil = ['Single', 'Married', 'Widowed', 'Separated', 'Annulled'];
-    $civil = in_array($d['civilStatus'] ?? '', $validCivil, true) ? $d['civilStatus'] : null;
-    if (!$civil) error('Civil status is required.', 422);
-
+    if (!in_array($d['civilStatus'] ?? '', $validCivil, true)) return 'Civil status is required.';
     $bgyId = (!empty($d['barangayId']) && is_numeric($d['barangayId']) && (int) $d['barangayId'] > 0)
              ? (int) $d['barangayId'] : null;
-    if (!$bgyId) error('Barangay is required.', 422);
+    if (!$bgyId) return 'Barangay is required.';
+    return '';
+}
+
+function tupadValidateProfileInput($d) {
+    $err = tupadProfileValidationError($d);
+    if ($err) error($err, 422);
+
+    $sex   = $d['sex'];
+    $birth = tupadDate($d['birthdate'] ?? '');
+    $civil = $d['civilStatus'];
+    $bgyId = (int) $d['barangayId'];
 
     return [$sex, $birth, $civil, $bgyId];
+}
+
+// Insert one profile's full beneficiary spine. Shared by the single-record
+// create and the bulk import.
+function tupadInsertProfileRow($pdo, $uid, $d) {
+    $sex   = $d['sex'];
+    $birth = tupadDate($d['birthdate'] ?? '');
+    $civil = $d['civilStatus'];
+    $bgyId = (int) $d['barangayId'];
+
+    $s = $pdo->prepare(
+        "INSERT INTO beneficiaries(first_name,middle_name,last_name,suffix,sex,birth_date,civil_status,street_address,barangay_id,contact_no,status)
+         VALUES(:fn,:mn,:ln,:sfx,:sex,:bdate,:civil,:street,:bgy,:contact,'Active') RETURNING beneficiary_id"
+    );
+    $s->execute([
+        ':fn' => trim($d['firstName']), ':mn' => tupadNullStr($d['middleName'] ?? ''), ':ln' => trim($d['lastName']),
+        ':sfx' => tupadNullStr($d['nameExtension'] ?? ''), ':sex' => $sex, ':bdate' => $birth, ':civil' => $civil,
+        ':street' => tupadNullStr($d['streetPurok'] ?? ''), ':bgy' => $bgyId,
+        ':contact' => tupadNullStr($d['contactNumber'] ?? ''),
+    ]);
+    $bid = (int) $s->fetchColumn();
+
+    $s2 = $pdo->prepare(
+        "INSERT INTO beneficiary_services(beneficiary_id,service_id,status,date_applied,received_by,remarks) VALUES(:bid,:sid,'Active',:date,:rby,:rmk) RETURNING beneficiary_service_id"
+    );
+    $s2->execute([
+        ':bid' => $bid, ':sid' => tupadServiceId(), ':date' => tupadDate($d['dateApplied'] ?? '') ?? date('Y-m-d'),
+        ':rby' => tupadNullStr($d['receivedBy'] ?? ''), ':rmk' => tupadNullStr($d['remarks'] ?? ''),
+    ]);
+    $bsId = (int) $s2->fetchColumn();
+
+    tupadSyncDocuments($pdo, $bid, $bsId, $uid, $d);
+
+    return $bid;
 }
 
 function tupadCreateProfile() {
     $uid = requireLogin();
     $d = body();
-    [$sex, $birth, $civil, $bgyId] = tupadValidateProfileInput($d);
+    $err = tupadProfileValidationError($d);
+    if ($err) error($err, 422);
 
     $pdo = db();
     try {
         $pdo->beginTransaction();
-
-        $s = $pdo->prepare(
-            "INSERT INTO beneficiaries(first_name,middle_name,last_name,suffix,sex,birth_date,civil_status,street_address,barangay_id,contact_no,status)
-             VALUES(:fn,:mn,:ln,:sfx,:sex,:bdate,:civil,:street,:bgy,:contact,'Active') RETURNING beneficiary_id"
-        );
-        $s->execute([
-            ':fn' => trim($d['firstName']), ':mn' => tupadNullStr($d['middleName'] ?? ''), ':ln' => trim($d['lastName']),
-            ':sfx' => tupadNullStr($d['nameExtension'] ?? ''), ':sex' => $sex, ':bdate' => $birth, ':civil' => $civil,
-            ':street' => tupadNullStr($d['streetPurok'] ?? ''), ':bgy' => $bgyId,
-            ':contact' => tupadNullStr($d['contactNumber'] ?? ''),
-        ]);
-        $bid = (int) $s->fetchColumn();
-
-        $s2 = $pdo->prepare(
-            "INSERT INTO beneficiary_services(beneficiary_id,service_id,status,date_applied,received_by,remarks) VALUES(:bid,:sid,'Active',:date,:rby,:rmk) RETURNING beneficiary_service_id"
-        );
-        $s2->execute([
-            ':bid' => $bid, ':sid' => tupadServiceId(), ':date' => tupadDate($d['dateApplied'] ?? '') ?? date('Y-m-d'),
-            ':rby' => tupadNullStr($d['receivedBy'] ?? ''), ':rmk' => tupadNullStr($d['remarks'] ?? ''),
-        ]);
-        $bsId = (int) $s2->fetchColumn();
-
-        tupadSyncDocuments($pdo, $bid, $bsId, $uid, $d);
-
+        $bid = tupadInsertProfileRow($pdo, $uid, $d);
         $pdo->commit();
     } catch (Throwable $e) {
         if ($pdo->inTransaction()) $pdo->rollBack();
@@ -402,6 +424,47 @@ function tupadCreateProfile() {
     }
     logActivity($uid, 'Create Profile', 'livelihood', "Created beneficiary: " . trim($d['lastName']) . ", " . trim($d['firstName']));
     json(['status' => 'ok', 'message' => 'Profile saved.', 'data' => tupadBuildProfile($bid)]);
+}
+
+// POST /api/tupad/importProfilesBulk   body = { rows: object[] }
+//
+// All-or-nothing bulk import: every row is validated up front, then the
+// whole batch is written inside ONE transaction. If any row fails validation
+// or the insert throws partway through, everything is rolled back.
+function tupadImportProfilesBulk() {
+    $uid  = requireLogin();
+    $body = body();
+    $rows = is_array($body['rows'] ?? null) ? $body['rows'] : [];
+    if (!$rows) error('No rows to import.', 422);
+
+    $errors = [];
+    foreach ($rows as $i => $d) {
+        $err = tupadProfileValidationError($d);
+        if ($err) $errors[] = ['row' => $i, 'error' => $err];
+    }
+    if ($errors) error('Validation failed. No records were imported.', 422, ['errors' => $errors]);
+
+    $pdo = db();
+    $ids = [];
+    try {
+        $pdo->beginTransaction();
+        foreach ($rows as $d) {
+            $ids[] = tupadInsertProfileRow($pdo, $uid, $d);
+        }
+        $pdo->commit();
+    } catch (Throwable $e) {
+        if ($pdo->inTransaction()) $pdo->rollBack();
+        error('Failed to save profiles. No records were imported.', 500, [
+            'failedIndex' => count($ids),
+            'reason'      => 'An unexpected error occurred while saving this record.',
+        ]);
+    }
+
+    foreach ($rows as $d) {
+        logActivity($uid, 'Create Profile', 'livelihood', "Created beneficiary: " . trim($d['lastName']) . ", " . trim($d['firstName']));
+    }
+
+    json(['status' => 'ok', 'message' => 'Profiles saved.', 'data' => ['ids' => $ids, 'count' => count($ids)]]);
 }
 
 function tupadUpdateProfile($id) {

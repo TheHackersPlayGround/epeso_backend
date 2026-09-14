@@ -34,6 +34,7 @@ function handle($action, $id, $method)
         case 'listProfiles':        requirePermission('livelihood','Viewer'); return slpListProfiles();
         case 'getProfile':          requirePermission('livelihood','Viewer'); return slpGetProfile($id);
         case 'createProfile':       requirePermission('livelihood','Editor'); return slpCreateProfile();
+        case 'importProfilesBulk':  requirePermission('livelihood','Editor'); return slpImportProfilesBulk();
         case 'updateProfile':       requirePermission('livelihood','Editor'); return slpUpdateProfile($id);
         case 'deleteProfile':       requirePermission('livelihood','Editor'); return slpDeleteProfile($id);
         case 'assignProject':       requirePermission('livelihood','Editor'); return slpAssignProject();
@@ -430,32 +431,41 @@ function slpBuildProfile($bid) {
     ];
 }
 
+// Non-exiting sibling of slpValidateProfileInput() below: returns an error
+// string (or '' if valid) instead of calling error()/exit, so the bulk
+// import can validate every row and collect all their problems instead of
+// aborting the whole request at the first bad row.
+//
 // Required fields mirror beneficiaries' real NOT NULL columns (sex,
-// birth_date, civil_status, barangay_id). participant_type/eligibility_type/
-// slp_track are NOT NULL on slp_profiles but have no required marker in the
-// UI, so an empty value falls back to a sensible default rather than
-// blocking the save.
-function slpValidateProfileInput($d) {
-    if (slpNullStr($d['firstName'] ?? '') === null) error('First name is required.', 422);
-    if (slpNullStr($d['lastName'] ?? '') === null)  error('Last name is required.', 422);
-
-    $sex = in_array($d['sex'] ?? '', ['Male', 'Female'], true) ? $d['sex'] : null;
-    if (!$sex) error('Sex is required.', 422);
-
-    $birth = slpDate($d['birthdate'] ?? '');
-    if (!$birth) error('Birthdate is required.', 422);
-
+// birth_date, civil_status, barangay_id).
+function slpProfileValidationError($d) {
+    if (slpNullStr($d['firstName'] ?? '') === null) return 'First name is required.';
+    if (slpNullStr($d['lastName'] ?? '') === null)  return 'Last name is required.';
+    if (!in_array($d['sex'] ?? '', ['Male', 'Female'], true)) return 'Sex is required.';
+    if (!slpDate($d['birthdate'] ?? '')) return 'Birthdate is required.';
     // Civil status enum is Single/Married/Widowed/Separated/Divorced -- the
     // form's dropdown currently shows "Annulled" instead of "Divorced",
     // which does not exist as a value; treated as invalid/blank here so it
     // 422s cleanly rather than failing as a raw DB constraint violation.
     $validCivil = ['Single', 'Married', 'Widowed', 'Separated', 'Divorced'];
-    $civil = in_array($d['civilStatus'] ?? '', $validCivil, true) ? $d['civilStatus'] : null;
-    if (!$civil) error('Civil status is required.', 422);
-
+    if (!in_array($d['civilStatus'] ?? '', $validCivil, true)) return 'Civil status is required.';
     $bgyId = (!empty($d['barangayId']) && is_numeric($d['barangayId']) && (int) $d['barangayId'] > 0)
              ? (int) $d['barangayId'] : null;
-    if (!$bgyId) error('Barangay is required.', 422);
+    if (!$bgyId) return 'Barangay is required.';
+    return '';
+}
+
+// participant_type/eligibility_type/slp_track are NOT NULL on slp_profiles
+// but have no required marker in the UI, so an empty value falls back to a
+// sensible default rather than blocking the save.
+function slpValidateProfileInput($d) {
+    $err = slpProfileValidationError($d);
+    if ($err) error($err, 422);
+
+    $sex   = $d['sex'];
+    $birth = slpDate($d['birthdate'] ?? '');
+    $civil = $d['civilStatus'];
+    $bgyId = (int) $d['barangayId'];
 
     $validEligibility = ['Regular', 'Disaster-Affected', 'Area-Based Convergence', 'Walk-In', 'Referral'];
     $eligibility = in_array($d['eligibilityType'] ?? '', $validEligibility, true) ? $d['eligibilityType'] : 'Regular';
@@ -499,54 +509,88 @@ function slpSyncClassifications($pdo, $bid, $d) {
     }
 }
 
+// Insert one profile's full beneficiary spine. Shared by the single-record
+// create and the bulk import. Recomputes the same enum defaults
+// slpValidateProfileInput() does, since that function's tuple return isn't
+// reused here (the bulk import validates via slpProfileValidationError()
+// instead, which doesn't compute these derived defaults).
+function slpInsertProfileRow($pdo, $uid, $d) {
+    $sex   = $d['sex'];
+    $birth = slpDate($d['birthdate'] ?? '');
+    $civil = $d['civilStatus'];
+    $bgyId = (int) $d['barangayId'];
+    $is4Ps = !empty($d['is4PsBeneficiary']);
+
+    $validEligibility = ['Regular', 'Disaster-Affected', 'Area-Based Convergence', 'Walk-In', 'Referral'];
+    $eligibility = in_array($d['eligibilityType'] ?? '', $validEligibility, true) ? $d['eligibilityType'] : 'Regular';
+
+    $validTrack = ['Enterprise - Individual', 'Enterprise - Association', 'Employment'];
+    $track = in_array($d['slpTrack'] ?? '', $validTrack, true) ? $d['slpTrack'] : 'Enterprise - Individual';
+
+    $validSeverity = ['Low', 'Medium', 'High'];
+    $severity = in_array($d['vulnerabilitySeverity'] ?? '', $validSeverity, true) ? $d['vulnerabilitySeverity'] : null;
+
+    $validAssessment = ['Qualified', 'Not Qualified'];
+    $assessment = in_array($d['assessmentResult'] ?? '', $validAssessment, true) ? $d['assessmentResult'] : null;
+
+    $validEdu = ['No Formal Education', 'Elementary Level', 'Elementary Graduate',
+                 'Junior High School Level', 'Junior High School Graduate',
+                 'Senior High School Level', 'Senior High School Graduate',
+                 'Vocational Graduate', 'College Level', 'College Graduate',
+                 "Master's Degree", 'Doctorate Degree', 'Post Graduate'];
+    $edu = in_array($d['educationalAttainment'] ?? '', $validEdu, true) ? $d['educationalAttainment'] : null;
+
+    $s = $pdo->prepare(
+        "INSERT INTO beneficiaries(first_name,middle_name,last_name,suffix,sex,birth_date,civil_status,street_address,barangay_id,contact_no,email,is_4ps_beneficiary,educational_attainment,status)
+         VALUES(:fn,:mn,:ln,:sfx,:sex,:bdate,:civil,:street,:bgy,:contact,:email,:is4ps,:edu,'Active') RETURNING beneficiary_id"
+    );
+    $s->execute([
+        ':fn' => trim($d['firstName']), ':mn' => slpNullStr($d['middleName'] ?? ''), ':ln' => trim($d['lastName']),
+        ':sfx' => slpNullStr($d['nameExtension'] ?? ''), ':sex' => $sex, ':bdate' => $birth, ':civil' => $civil,
+        ':street' => slpNullStr($d['streetPurok'] ?? ''), ':bgy' => $bgyId,
+        ':contact' => slpNullStr($d['contactNumber'] ?? ''), ':email' => slpNullStr($d['email'] ?? ''),
+        ':is4ps' => $is4Ps ? 'true' : 'false', ':edu' => $edu,
+    ]);
+    $bid = (int) $s->fetchColumn();
+
+    $s2 = $pdo->prepare(
+        "INSERT INTO beneficiary_services(beneficiary_id,service_id,status,date_applied,received_by,remarks) VALUES(:bid,:sid,'Active',:date,:rby,:rmk) RETURNING beneficiary_service_id"
+    );
+    $s2->execute([
+        ':bid' => $bid, ':sid' => slpServiceId(), ':date' => slpDate($d['dateApplied'] ?? '') ?? date('Y-m-d'),
+        ':rby' => slpNullStr($d['receivedBy'] ?? ''), ':rmk' => null,
+    ]);
+    $bsId = (int) $s2->fetchColumn();
+
+    $pdo->prepare(
+        "INSERT INTO slp_profiles(beneficiary_service_id,slp_participant_id_no,participant_type,eligibility_type,referring_party,source_of_income,household_monthly_income,vulnerability_score,vulnerability_severity,assessment_result,slp_track,indigenous_group,status,remarks,created_at,updated_at)
+         VALUES(:bsid,:pidno,:ptype,:elig,:refparty,:income,:hhincome,:vscore,:vsev,:assess,:track,:ipgroup,'Inactive',:remarks,now(),now())"
+    )->execute([
+        ':bsid' => $bsId, ':pidno' => slpNullStr($d['slpParticipantIdNumber'] ?? ''),
+        ':ptype' => $is4Ps ? '4Ps' : 'Non-4Ps', ':elig' => $eligibility,
+        ':refparty' => $eligibility === 'Referral' ? slpNullStr($d['referringParty'] ?? '') : null,
+        ':income' => slpNullStr($d['sourceOfIncome'] ?? ''), ':hhincome' => slpMoneyOrNull($d['totalHouseholdMonthlyIncome'] ?? null),
+        ':vscore' => slpNumOrNull($d['householdVulnerabilityScore'] ?? null), ':vsev' => $severity, ':assess' => $assessment,
+        ':track' => $track, ':ipgroup' => in_array('Indigenous People (IP)', is_array($d['sector'] ?? null) ? $d['sector'] : [], true) ? slpNullStr($d['sectorIpGroupSpecify'] ?? '') : null,
+        ':remarks' => slpNullStr($d['remarks'] ?? ''),
+    ]);
+
+    slpSyncClassifications($pdo, $bid, $d);
+    slpSyncDocuments($pdo, $bid, $bsId, $uid, $d);
+
+    return $bid;
+}
+
 function slpCreateProfile() {
     $uid = requireLogin();
     $d = body();
-    [$sex, $birth, $civil, $bgyId, $eligibility, $track, $severity, $assessment, $edu] = slpValidateProfileInput($d);
-    $is4Ps = !empty($d['is4PsBeneficiary']);
+    $err = slpProfileValidationError($d);
+    if ($err) error($err, 422);
 
     $pdo = db();
     try {
         $pdo->beginTransaction();
-
-        $s = $pdo->prepare(
-            "INSERT INTO beneficiaries(first_name,middle_name,last_name,suffix,sex,birth_date,civil_status,street_address,barangay_id,contact_no,email,is_4ps_beneficiary,educational_attainment,status)
-             VALUES(:fn,:mn,:ln,:sfx,:sex,:bdate,:civil,:street,:bgy,:contact,:email,:is4ps,:edu,'Active') RETURNING beneficiary_id"
-        );
-        $s->execute([
-            ':fn' => trim($d['firstName']), ':mn' => slpNullStr($d['middleName'] ?? ''), ':ln' => trim($d['lastName']),
-            ':sfx' => slpNullStr($d['nameExtension'] ?? ''), ':sex' => $sex, ':bdate' => $birth, ':civil' => $civil,
-            ':street' => slpNullStr($d['streetPurok'] ?? ''), ':bgy' => $bgyId,
-            ':contact' => slpNullStr($d['contactNumber'] ?? ''), ':email' => slpNullStr($d['email'] ?? ''),
-            ':is4ps' => $is4Ps ? 'true' : 'false', ':edu' => $edu,
-        ]);
-        $bid = (int) $s->fetchColumn();
-
-        $s2 = $pdo->prepare(
-            "INSERT INTO beneficiary_services(beneficiary_id,service_id,status,date_applied,received_by,remarks) VALUES(:bid,:sid,'Active',:date,:rby,:rmk) RETURNING beneficiary_service_id"
-        );
-        $s2->execute([
-            ':bid' => $bid, ':sid' => slpServiceId(), ':date' => slpDate($d['dateApplied'] ?? '') ?? date('Y-m-d'),
-            ':rby' => slpNullStr($d['receivedBy'] ?? ''), ':rmk' => null,
-        ]);
-        $bsId = (int) $s2->fetchColumn();
-
-        $pdo->prepare(
-            "INSERT INTO slp_profiles(beneficiary_service_id,slp_participant_id_no,participant_type,eligibility_type,referring_party,source_of_income,household_monthly_income,vulnerability_score,vulnerability_severity,assessment_result,slp_track,indigenous_group,status,remarks,created_at,updated_at)
-             VALUES(:bsid,:pidno,:ptype,:elig,:refparty,:income,:hhincome,:vscore,:vsev,:assess,:track,:ipgroup,'Inactive',:remarks,now(),now())"
-        )->execute([
-            ':bsid' => $bsId, ':pidno' => slpNullStr($d['slpParticipantIdNumber'] ?? ''),
-            ':ptype' => $is4Ps ? '4Ps' : 'Non-4Ps', ':elig' => $eligibility,
-            ':refparty' => $eligibility === 'Referral' ? slpNullStr($d['referringParty'] ?? '') : null,
-            ':income' => slpNullStr($d['sourceOfIncome'] ?? ''), ':hhincome' => slpMoneyOrNull($d['totalHouseholdMonthlyIncome'] ?? null),
-            ':vscore' => slpNumOrNull($d['householdVulnerabilityScore'] ?? null), ':vsev' => $severity, ':assess' => $assessment,
-            ':track' => $track, ':ipgroup' => in_array('Indigenous People (IP)', is_array($d['sector'] ?? null) ? $d['sector'] : [], true) ? slpNullStr($d['sectorIpGroupSpecify'] ?? '') : null,
-            ':remarks' => slpNullStr($d['remarks'] ?? ''),
-        ]);
-
-        slpSyncClassifications($pdo, $bid, $d);
-        slpSyncDocuments($pdo, $bid, $bsId, $uid, $d);
-
+        $bid = slpInsertProfileRow($pdo, $uid, $d);
         $pdo->commit();
     } catch (Throwable $e) {
         if ($pdo->inTransaction()) $pdo->rollBack();
@@ -554,6 +598,47 @@ function slpCreateProfile() {
     }
     logActivity($uid, 'Create Profile', 'livelihood', "Created beneficiary: " . trim($d['lastName']) . ", " . trim($d['firstName']));
     json(['status' => 'ok', 'message' => 'Profile saved.', 'data' => slpBuildProfile($bid)]);
+}
+
+// POST /api/slp/importProfilesBulk   body = { rows: object[] }
+//
+// All-or-nothing bulk import: every row is validated up front, then the
+// whole batch is written inside ONE transaction. If any row fails validation
+// or the insert throws partway through, everything is rolled back.
+function slpImportProfilesBulk() {
+    $uid  = requireLogin();
+    $body = body();
+    $rows = is_array($body['rows'] ?? null) ? $body['rows'] : [];
+    if (!$rows) error('No rows to import.', 422);
+
+    $errors = [];
+    foreach ($rows as $i => $d) {
+        $err = slpProfileValidationError($d);
+        if ($err) $errors[] = ['row' => $i, 'error' => $err];
+    }
+    if ($errors) error('Validation failed. No records were imported.', 422, ['errors' => $errors]);
+
+    $pdo = db();
+    $ids = [];
+    try {
+        $pdo->beginTransaction();
+        foreach ($rows as $d) {
+            $ids[] = slpInsertProfileRow($pdo, $uid, $d);
+        }
+        $pdo->commit();
+    } catch (Throwable $e) {
+        if ($pdo->inTransaction()) $pdo->rollBack();
+        error('Failed to save profiles. No records were imported.', 500, [
+            'failedIndex' => count($ids),
+            'reason'      => 'An unexpected error occurred while saving this record.',
+        ]);
+    }
+
+    foreach ($rows as $d) {
+        logActivity($uid, 'Create Profile', 'livelihood', "Created beneficiary: " . trim($d['lastName']) . ", " . trim($d['firstName']));
+    }
+
+    json(['status' => 'ok', 'message' => 'Profiles saved.', 'data' => ['ids' => $ids, 'count' => count($ids)]]);
 }
 
 function slpUpdateProfile($id) {

@@ -22,6 +22,7 @@ function handle($action, $id, $method)
         case 'listProfiles':             requirePermission('cdsp','Viewer'); return cdspListProfiles();
         case 'getProfile':               requirePermission('cdsp','Viewer'); return cdspGetProfile($id);
         case 'createProfile':            requirePermission('cdsp','Editor'); return cdspCreateProfile();
+        case 'importProfilesBulk':       requirePermission('cdsp','Editor'); return cdspImportProfilesBulk();
         case 'updateProfile':            requirePermission('cdsp','Editor'); return cdspUpdateProfile($id);
         case 'deleteProfile':            requirePermission('cdsp','Editor'); return cdspDeleteProfile($id);
         case 'listDeleted':              requirePermission('cdsp','Viewer'); return cdspListDeleted();
@@ -707,63 +708,76 @@ function cdspBuildProfile($bid) {
     ];
 }
 
+// Required-field + enum validation, shared by the single-record create and
+// the bulk import. Returns an error string, or '' if valid.
+//
+// Birthdate, Civil Status, and Barangay are required by the underlying
+// beneficiaries table (NOT NULL columns) — validated here so a bad request
+// 422s cleanly instead of failing as a raw DB constraint violation
+// (birth_date/civil_status/barangay_id are all NOT NULL).
+function cdspValidateProfile($d) {
+    if (cdspNullStr($d['firstName'] ?? '') === null) return 'First name is required.';
+    if (cdspNullStr($d['lastName'] ?? '')  === null) return 'Last name is required.';
+    if (empty($d['highestEducation']))               return 'Highest educational attainment is required.';
+    if (empty($d['employmentStatus']))               return 'Employment status is required.';
+    if (empty($d['serviceAvailed']))                  return 'Service availed is required.';
+    if (!cdspServiceIdByName($d['serviceAvailed']))  return 'Selected CDSP service not found.';
+    if (!in_array($d['sex'] ?? '', ['Male','Female'], true)) return 'Sex is required.';
+    if (!cdspDate($d['birthdate'] ?? '')) return 'Birthdate is required.';
+    $validCivil = ['Single','Married','Widowed','Separated','Divorced'];
+    if (!in_array($d['civilStatus'] ?? '', $validCivil, true)) return 'Civil Status is required.';
+    $bgyId = (!empty($d['barangayId']) && is_numeric($d['barangayId']) && (int)$d['barangayId'] > 0)
+             ? (int)$d['barangayId'] : null;
+    if (!$bgyId) return 'Barangay is required.';
+    return '';
+}
+
+// Insert one profile's full beneficiary spine. Shared by the single-record
+// create and the bulk import so the write logic only lives in one place.
+function cdspInsertProfileRow($pdo, $uid, $d) {
+    $serviceId = cdspServiceIdByName($d['serviceAvailed']);
+    $sex       = $d['sex'];
+    $birth     = cdspDate($d['birthdate'] ?? '');
+    $civil     = $d['civilStatus'];
+    $bgyId     = (int) $d['barangayId'];
+
+    $s = $pdo->prepare("INSERT INTO beneficiaries(first_name,middle_name,last_name,sex,birth_date,civil_status,street_address,barangay_id,contact_no,email,status,educational_attainment) VALUES(:fn,:mn,:ln,:sex,:bdate,:civil,:street,:bgy,:contact,:email,'Active',:educ) RETURNING beneficiary_id");
+    $s->execute([':fn'=>trim($d['firstName']),':mn'=>cdspNullStr($d['middleName']??''),':ln'=>trim($d['lastName']),':sex'=>$sex,':bdate'=>$birth,':civil'=>$civil,':street'=>cdspNullStr($d['streetPurok']??''),':bgy'=>$bgyId,':contact'=>cdspNullStr($d['contactNumber']??''),':email'=>cdspNullStr($d['email']??''),':educ'=>cdspMapEducation($d['highestEducation']??'')]);
+    $bid = (int)$s->fetchColumn();
+
+    $s2 = $pdo->prepare("INSERT INTO beneficiary_services(beneficiary_id,service_id,status,date_applied,received_by) VALUES(:bid,:sid,'Active',:date,:rby) RETURNING beneficiary_service_id");
+    $s2->execute([':bid'=>$bid,':sid'=>$serviceId,':date'=>cdspDate($d['dateApplicationReceived']??'')??date('Y-m-d'),':rby'=>cdspNullStr($d['receivedBy']??'')]);
+    $bsId = (int)$s2->fetchColumn();
+
+    $validCls = cdspValidClassifications();
+    $rawCls   = is_array($d['classification'] ?? null) ? $d['classification'] : [];
+    $ins = $pdo->prepare("INSERT INTO beneficiary_classifications(beneficiary_id,classification,classification_other) VALUES(:bid,:cls,:clsOther) ON CONFLICT DO NOTHING");
+    foreach ($rawCls as $c) {
+        $norm = cdspNormalizeClassification($c);
+        if (in_array($norm, $validCls, true)) {
+            $clsOther = $norm === 'Other' ? cdspNullStr($d['classificationOther'] ?? '') : null;
+            $ins->execute([':bid'=>$bid,':cls'=>$norm,':clsOther'=>$clsOther]);
+        }
+    }
+
+    $pdo->prepare("INSERT INTO cdsp_profiles(beneficiary_service_id,school_name,course_program,strand,year_level,year_graduated,employment_status,current_occupation,remarks,status) VALUES(:bsid,:school,:course,:strand,:ylvl,:yr,:empst,:occ,:rmk,'Active')")
+        ->execute([':bsid'=>$bsId,':school'=>cdspNullStr($d['schoolName']??''),':course'=>cdspNullStr($d['course']??''),':strand'=>cdspNullStr($d['strand']??''),':ylvl'=>cdspNullStr($d['yearLevel']??''),':yr'=>cdspYearOrNull($d['yearGraduated']??''),':empst'=>cdspNullStr($d['employmentStatus']??''),':occ'=>cdspNullStr($d['currentOccupation']??''),':rmk'=>cdspNullStr($d['remarks']??'')]);
+
+    cdspSyncDocuments($pdo, $bid, $bsId, $uid, $d);
+
+    return $bid;
+}
+
 function cdspCreateProfile() {
     $uid = requireLogin();
     $d   = body();
-    if (cdspNullStr($d['firstName'] ?? '') === null) error('First name is required.', 422);
-    if (cdspNullStr($d['lastName'] ?? '')  === null) error('Last name is required.', 422);
-    if (empty($d['highestEducation']))               error('Highest educational attainment is required.', 422);
-    if (empty($d['employmentStatus']))               error('Employment status is required.', 422);
-    if (empty($d['serviceAvailed']))                  error('Service availed is required.', 422);
-    $serviceId = cdspServiceIdByName($d['serviceAvailed']);
-    if (!$serviceId) error('Selected CDSP service not found.', 422);
-
-    $sex = in_array($d['sex'] ?? '', ['Male','Female'], true) ? $d['sex'] : null;
-    if (!$sex) error('Sex is required.', 422);
-
-    // Birthdate, Civil Status, and Barangay are required by the underlying
-    // beneficiaries table (NOT NULL columns) — validated here so a bad
-    // request 422s cleanly instead of failing as a raw DB constraint
-    // violation (birth_date/civil_status/barangay_id are all NOT NULL).
-    $birth = cdspDate($d['birthdate'] ?? '');
-    if (!$birth) error('Birthdate is required.', 422);
-
-    $validCivil = ['Single','Married','Widowed','Separated','Divorced'];
-    $civil = in_array($d['civilStatus'] ?? '', $validCivil, true) ? $d['civilStatus'] : null;
-    if (!$civil) error('Civil Status is required.', 422);
-
-    $bgyId = (!empty($d['barangayId']) && is_numeric($d['barangayId']) && (int)$d['barangayId'] > 0)
-             ? (int)$d['barangayId'] : null;
-    if (!$bgyId) error('Barangay is required.', 422);
+    $err = cdspValidateProfile($d);
+    if ($err) error($err, 422);
 
     $pdo = db();
     try {
         $pdo->beginTransaction();
-
-        $s = $pdo->prepare("INSERT INTO beneficiaries(first_name,middle_name,last_name,sex,birth_date,civil_status,street_address,barangay_id,contact_no,email,status,educational_attainment) VALUES(:fn,:mn,:ln,:sex,:bdate,:civil,:street,:bgy,:contact,:email,'Active',:educ) RETURNING beneficiary_id");
-        $s->execute([':fn'=>trim($d['firstName']),':mn'=>cdspNullStr($d['middleName']??''),':ln'=>trim($d['lastName']),':sex'=>$sex,':bdate'=>$birth,':civil'=>$civil,':street'=>cdspNullStr($d['streetPurok']??''),':bgy'=>$bgyId,':contact'=>cdspNullStr($d['contactNumber']??''),':email'=>cdspNullStr($d['email']??''),':educ'=>cdspMapEducation($d['highestEducation']??'')]);
-        $bid = (int)$s->fetchColumn();
-
-        $s2 = $pdo->prepare("INSERT INTO beneficiary_services(beneficiary_id,service_id,status,date_applied,received_by) VALUES(:bid,:sid,'Active',:date,:rby) RETURNING beneficiary_service_id");
-        $s2->execute([':bid'=>$bid,':sid'=>$serviceId,':date'=>cdspDate($d['dateApplicationReceived']??'')??date('Y-m-d'),':rby'=>cdspNullStr($d['receivedBy']??'')]);
-        $bsId = (int)$s2->fetchColumn();
-
-        $validCls = cdspValidClassifications();
-        $rawCls   = is_array($d['classification'] ?? null) ? $d['classification'] : [];
-        $ins = $pdo->prepare("INSERT INTO beneficiary_classifications(beneficiary_id,classification,classification_other) VALUES(:bid,:cls,:clsOther) ON CONFLICT DO NOTHING");
-        foreach ($rawCls as $c) {
-            $norm = cdspNormalizeClassification($c);
-            if (in_array($norm, $validCls, true)) {
-                $clsOther = $norm === 'Other' ? cdspNullStr($d['classificationOther'] ?? '') : null;
-                $ins->execute([':bid'=>$bid,':cls'=>$norm,':clsOther'=>$clsOther]);
-            }
-        }
-
-        $pdo->prepare("INSERT INTO cdsp_profiles(beneficiary_service_id,school_name,course_program,strand,year_level,year_graduated,employment_status,current_occupation,remarks,status) VALUES(:bsid,:school,:course,:strand,:ylvl,:yr,:empst,:occ,:rmk,'Active')")
-            ->execute([':bsid'=>$bsId,':school'=>cdspNullStr($d['schoolName']??''),':course'=>cdspNullStr($d['course']??''),':strand'=>cdspNullStr($d['strand']??''),':ylvl'=>cdspNullStr($d['yearLevel']??''),':yr'=>cdspYearOrNull($d['yearGraduated']??''),':empst'=>cdspNullStr($d['employmentStatus']??''),':occ'=>cdspNullStr($d['currentOccupation']??''),':rmk'=>cdspNullStr($d['remarks']??'')]);
-
-        cdspSyncDocuments($pdo, $bid, $bsId, $uid, $d);
-
+        $bid = cdspInsertProfileRow($pdo, $uid, $d);
         $pdo->commit();
     } catch (Throwable $e) {
         if ($pdo->inTransaction()) $pdo->rollBack();
@@ -771,6 +785,47 @@ function cdspCreateProfile() {
     }
     logActivity($uid, 'Create Profile', 'cdsp', "Created applicant: " . trim($d['lastName']) . ", " . trim($d['firstName']));
     json(['status'=>'ok','message'=>'Profile saved.','data'=>cdspBuildProfile($bid)]);
+}
+
+// POST /api/cdsp/importProfilesBulk   body = { rows: object[] }
+//
+// All-or-nothing bulk import: every row is validated up front, then the
+// whole batch is written inside ONE transaction. If any row fails validation
+// or the insert throws partway through, everything is rolled back.
+function cdspImportProfilesBulk() {
+    $uid  = requireLogin();
+    $body = body();
+    $rows = is_array($body['rows'] ?? null) ? $body['rows'] : [];
+    if (!$rows) error('No rows to import.', 422);
+
+    $errors = [];
+    foreach ($rows as $i => $d) {
+        $err = cdspValidateProfile($d);
+        if ($err) $errors[] = ['row' => $i, 'error' => $err];
+    }
+    if ($errors) error('Validation failed. No records were imported.', 422, ['errors' => $errors]);
+
+    $pdo = db();
+    $ids = [];
+    try {
+        $pdo->beginTransaction();
+        foreach ($rows as $d) {
+            $ids[] = cdspInsertProfileRow($pdo, $uid, $d);
+        }
+        $pdo->commit();
+    } catch (Throwable $e) {
+        if ($pdo->inTransaction()) $pdo->rollBack();
+        error('Failed to save profiles. No records were imported.', 500, [
+            'failedIndex' => count($ids),
+            'reason'      => 'An unexpected error occurred while saving this record.',
+        ]);
+    }
+
+    foreach ($rows as $d) {
+        logActivity($uid, 'Create Profile', 'cdsp', "Created applicant: " . trim($d['lastName']) . ", " . trim($d['firstName']));
+    }
+
+    json(['status' => 'ok', 'message' => 'Profiles saved.', 'data' => ['ids' => $ids, 'count' => count($ids)]]);
 }
 
 function cdspUpdateProfile($id) {

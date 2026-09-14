@@ -51,6 +51,7 @@ function handle($action, $id, $method)
         case 'listProfiles':             requirePermission('skills','Viewer'); return stListProfiles();
         case 'getProfile':               requirePermission('skills','Viewer'); return stGetProfile($id);
         case 'createProfile':            requirePermission('skills','Editor'); return stCreateProfile();
+        case 'importProfilesBulk':       requirePermission('skills','Editor'); return stImportProfilesBulk();
         case 'updateProfile':            requirePermission('skills','Editor'); return stUpdateProfile($id);
         case 'deleteProfile':            requirePermission('skills','Editor'); return stDeleteProfile($id);
 
@@ -803,55 +804,67 @@ function stSyncSelections($pdo, $bid, $profileId, $d) {
     }
 }
 
-function stCreateProfile() {
-    $uid = requireLogin();
-    $d   = body();
-    if (stNullStr($d['firstName'] ?? '') === null) error('First name is required.', 422);
-    if (stNullStr($d['lastName'] ?? '')  === null) error('Last name is required.', 422);
-
-    $sex = in_array($d['sex'] ?? '', ['Male','Female'], true) ? $d['sex'] : null;
-    if (!$sex) error('Sex is required.', 422);
-
-    $birth = stDate($d['birthdate'] ?? '');
-    if (!$birth) error('Birthdate is required.', 422);
-
+// Required-field + enum validation, shared by the single-record create and
+// the bulk import. Returns an error string, or '' if valid.
+function stValidateProfile($d) {
+    if (stNullStr($d['firstName'] ?? '') === null) return 'First name is required.';
+    if (stNullStr($d['lastName'] ?? '')  === null) return 'Last name is required.';
+    if (!in_array($d['sex'] ?? '', ['Male','Female'], true)) return 'Sex is required.';
+    if (!stDate($d['birthdate'] ?? '')) return 'Birthdate is required.';
     $validCivil = ['Single','Married','Widowed','Separated','Divorced'];
-    $civil = in_array($d['civilStatus'] ?? '', $validCivil, true) ? $d['civilStatus'] : null;
-    if (!$civil) error('Civil Status is required.', 422);
-
+    if (!in_array($d['civilStatus'] ?? '', $validCivil, true)) return 'Civil Status is required.';
     $bgyId = (!empty($d['barangayId']) && is_numeric($d['barangayId']) && (int)$d['barangayId'] > 0)
              ? (int)$d['barangayId'] : null;
-    if (!$bgyId) error('Barangay is required.', 422);
+    if (!$bgyId) return 'Barangay is required.';
+    return '';
+}
+
+// Insert one profile's full beneficiary spine. Shared by the single-record
+// create and the bulk import.
+function stInsertProfileRow($pdo, $uid, $d) {
+    $sex   = $d['sex'];
+    $birth = stDate($d['birthdate'] ?? '');
+    $civil = $d['civilStatus'];
+    $bgyId = (int) $d['barangayId'];
 
     $validStatus = ['Pending','Accepted','Waitlisted','Rejected'];
     $appStatus = in_array($d['status'] ?? '', $validStatus, true) ? $d['status'] : 'Waitlisted';
 
+    $s = $pdo->prepare(
+        "INSERT INTO beneficiaries(first_name,middle_name,last_name,sex,birth_date,civil_status,street_address,barangay_id,contact_no,status)
+         VALUES(:fn,:mn,:ln,:sex,:bdate,:civil,:street,:bgy,:contact,'Active') RETURNING beneficiary_id"
+    );
+    $s->execute([
+        ':fn' => trim($d['firstName']), ':mn' => stNullStr($d['middleName'] ?? ''), ':ln' => trim($d['lastName']),
+        ':sex' => $sex, ':bdate' => $birth, ':civil' => $civil, ':street' => stNullStr($d['streetPurok'] ?? ''),
+        ':bgy' => $bgyId, ':contact' => stNullStr($d['contactNumber'] ?? ''),
+    ]);
+    $bid = (int)$s->fetchColumn();
+
+    $s2 = $pdo->prepare("INSERT INTO beneficiary_services(beneficiary_id,service_id,status,date_applied,received_by) VALUES(:bid,:sid,'Active',:date,:rby) RETURNING beneficiary_service_id");
+    $s2->execute([':bid' => $bid, ':sid' => stServiceId(), ':date' => stDate($d['dateApplicationReceived'] ?? '') ?? date('Y-m-d'), ':rby' => stNullStr($d['receivedBy'] ?? '')]);
+    $bsId = (int)$s2->fetchColumn();
+
+    $s3 = $pdo->prepare("INSERT INTO skills_training_profiles(beneficiary_service_id,application_status,created_at,updated_at) VALUES(:bsid,:st,now(),now()) RETURNING skills_training_profile_id");
+    $s3->execute([':bsid' => $bsId, ':st' => $appStatus]);
+    $profileId = (int)$s3->fetchColumn();
+
+    stSyncSelections($pdo, $bid, $profileId, $d);
+    stSyncDocuments($pdo, $bid, $bsId, $uid, $d);
+
+    return $bid;
+}
+
+function stCreateProfile() {
+    $uid = requireLogin();
+    $d   = body();
+    $err = stValidateProfile($d);
+    if ($err) error($err, 422);
+
     $pdo = db();
     try {
         $pdo->beginTransaction();
-
-        $s = $pdo->prepare(
-            "INSERT INTO beneficiaries(first_name,middle_name,last_name,sex,birth_date,civil_status,street_address,barangay_id,contact_no,status)
-             VALUES(:fn,:mn,:ln,:sex,:bdate,:civil,:street,:bgy,:contact,'Active') RETURNING beneficiary_id"
-        );
-        $s->execute([
-            ':fn' => trim($d['firstName']), ':mn' => stNullStr($d['middleName'] ?? ''), ':ln' => trim($d['lastName']),
-            ':sex' => $sex, ':bdate' => $birth, ':civil' => $civil, ':street' => stNullStr($d['streetPurok'] ?? ''),
-            ':bgy' => $bgyId, ':contact' => stNullStr($d['contactNumber'] ?? ''),
-        ]);
-        $bid = (int)$s->fetchColumn();
-
-        $s2 = $pdo->prepare("INSERT INTO beneficiary_services(beneficiary_id,service_id,status,date_applied,received_by) VALUES(:bid,:sid,'Active',:date,:rby) RETURNING beneficiary_service_id");
-        $s2->execute([':bid' => $bid, ':sid' => stServiceId(), ':date' => stDate($d['dateApplicationReceived'] ?? '') ?? date('Y-m-d'), ':rby' => stNullStr($d['receivedBy'] ?? '')]);
-        $bsId = (int)$s2->fetchColumn();
-
-        $s3 = $pdo->prepare("INSERT INTO skills_training_profiles(beneficiary_service_id,application_status,created_at,updated_at) VALUES(:bsid,:st,now(),now()) RETURNING skills_training_profile_id");
-        $s3->execute([':bsid' => $bsId, ':st' => $appStatus]);
-        $profileId = (int)$s3->fetchColumn();
-
-        stSyncSelections($pdo, $bid, $profileId, $d);
-        stSyncDocuments($pdo, $bid, $bsId, $uid, $d);
-
+        $bid = stInsertProfileRow($pdo, $uid, $d);
         $pdo->commit();
     } catch (Throwable $e) {
         if ($pdo->inTransaction()) $pdo->rollBack();
@@ -859,6 +872,47 @@ function stCreateProfile() {
     }
     logActivity($uid, 'Create Profile', 'skills', "Created applicant: " . trim($d['lastName']) . ", " . trim($d['firstName']));
     json(['status' => 'ok', 'message' => 'Profile saved.', 'data' => stBuildProfile($bid)]);
+}
+
+// POST /api/skills_training/importProfilesBulk   body = { rows: object[] }
+//
+// All-or-nothing bulk import: every row is validated up front, then the
+// whole batch is written inside ONE transaction. If any row fails validation
+// or the insert throws partway through, everything is rolled back.
+function stImportProfilesBulk() {
+    $uid  = requireLogin();
+    $body = body();
+    $rows = is_array($body['rows'] ?? null) ? $body['rows'] : [];
+    if (!$rows) error('No rows to import.', 422);
+
+    $errors = [];
+    foreach ($rows as $i => $d) {
+        $err = stValidateProfile($d);
+        if ($err) $errors[] = ['row' => $i, 'error' => $err];
+    }
+    if ($errors) error('Validation failed. No records were imported.', 422, ['errors' => $errors]);
+
+    $pdo = db();
+    $ids = [];
+    try {
+        $pdo->beginTransaction();
+        foreach ($rows as $d) {
+            $ids[] = stInsertProfileRow($pdo, $uid, $d);
+        }
+        $pdo->commit();
+    } catch (Throwable $e) {
+        if ($pdo->inTransaction()) $pdo->rollBack();
+        error('Failed to save profiles. No records were imported.', 500, [
+            'failedIndex' => count($ids),
+            'reason'      => 'An unexpected error occurred while saving this record.',
+        ]);
+    }
+
+    foreach ($rows as $d) {
+        logActivity($uid, 'Create Profile', 'skills', "Created applicant: " . trim($d['lastName']) . ", " . trim($d['firstName']));
+    }
+
+    json(['status' => 'ok', 'message' => 'Profiles saved.', 'data' => ['ids' => $ids, 'count' => count($ids)]]);
 }
 
 function stUpdateProfile($id) {

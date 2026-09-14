@@ -22,6 +22,7 @@ function handle($action, $id, $method)
         case 'listProfiles':        requirePermission('livelihood','Viewer'); return dilpListProfiles();
         case 'getProfile':          requirePermission('livelihood','Viewer'); return dilpGetProfile($id);
         case 'createProfile':       requirePermission('livelihood','Editor'); return dilpCreateProfile();
+        case 'importProfilesBulk':  requirePermission('livelihood','Editor'); return dilpImportProfilesBulk();
         case 'updateProfile':       requirePermission('livelihood','Editor'); return dilpUpdateProfile($id);
         case 'deleteProfile':       requirePermission('livelihood','Editor'); return dilpDeleteProfile($id);
         case 'assignProject':       requirePermission('livelihood','Editor'); return dilpAssignProject();
@@ -390,71 +391,92 @@ function dilpBuildProfile($bid) {
     ];
 }
 
+// Non-exiting sibling of dilpValidateProfileInput() below: returns an error
+// string (or '' if valid) instead of calling error()/exit, so the bulk
+// import can validate every row and collect all their problems instead of
+// aborting the whole request at the first bad row.
+//
 // Required fields mirror beneficiaries' real NOT NULL columns (sex, birth_date,
 // civil_status, barangay_id) so a bad request 422s cleanly instead of failing
 // as a raw DB constraint violation.
-function dilpValidateProfileInput($d) {
-    if (dilpNullStr($d['firstName'] ?? '') === null) error('First name is required.', 422);
-    if (dilpNullStr($d['lastName'] ?? '') === null)  error('Last name is required.', 422);
-
-    $sex = in_array($d['sex'] ?? '', ['Male', 'Female'], true) ? $d['sex'] : null;
-    if (!$sex) error('Sex is required.', 422);
-
-    $birth = dilpDate($d['birthdate'] ?? '');
-    if (!$birth) error('Birthdate is required.', 422);
-
+function dilpProfileValidationError($d) {
+    if (dilpNullStr($d['firstName'] ?? '') === null) return 'First name is required.';
+    if (dilpNullStr($d['lastName'] ?? '') === null)  return 'Last name is required.';
+    if (!in_array($d['sex'] ?? '', ['Male', 'Female'], true)) return 'Sex is required.';
+    if (!dilpDate($d['birthdate'] ?? '')) return 'Birthdate is required.';
     $validCivil = ['Single', 'Married', 'Widowed', 'Separated', 'Annulled'];
-    $civil = in_array($d['civilStatus'] ?? '', $validCivil, true) ? $d['civilStatus'] : null;
-    if (!$civil) error('Civil status is required.', 422);
-
+    if (!in_array($d['civilStatus'] ?? '', $validCivil, true)) return 'Civil status is required.';
     $bgyId = (!empty($d['barangayId']) && is_numeric($d['barangayId']) && (int) $d['barangayId'] > 0)
              ? (int) $d['barangayId'] : null;
-    if (!$bgyId) error('Barangay is required.', 422);
+    if (!$bgyId) return 'Barangay is required.';
+    return '';
+}
+
+function dilpValidateProfileInput($d) {
+    $err = dilpProfileValidationError($d);
+    if ($err) error($err, 422);
+
+    $sex   = $d['sex'];
+    $birth = dilpDate($d['birthdate'] ?? '');
+    $civil = $d['civilStatus'];
+    $bgyId = (int) $d['barangayId'];
 
     return [$sex, $birth, $civil, $bgyId];
+}
+
+// Insert one profile's full beneficiary spine. Shared by the single-record
+// create and the bulk import.
+function dilpInsertProfileRow($pdo, $uid, $d) {
+    $sex   = $d['sex'];
+    $birth = dilpDate($d['birthdate'] ?? '');
+    $civil = $d['civilStatus'];
+    $bgyId = (int) $d['barangayId'];
+    $is4Ps = !empty($d['is4PsBeneficiary']);
+
+    $s = $pdo->prepare(
+        "INSERT INTO beneficiaries(first_name,middle_name,last_name,suffix,sex,birth_date,civil_status,street_address,barangay_id,contact_no,email,is_4ps_beneficiary,year_graduated_4ps,status)
+         VALUES(:fn,:mn,:ln,:sfx,:sex,:bdate,:civil,:street,:bgy,:contact,:email,:is4ps,:ygrad,'Active') RETURNING beneficiary_id"
+    );
+    $s->execute([
+        ':fn' => trim($d['firstName']), ':mn' => dilpNullStr($d['middleName'] ?? ''), ':ln' => trim($d['lastName']),
+        ':sfx' => dilpNullStr($d['nameExtension'] ?? ''), ':sex' => $sex, ':bdate' => $birth, ':civil' => $civil,
+        ':street' => dilpNullStr($d['streetPurok'] ?? ''), ':bgy' => $bgyId,
+        ':contact' => dilpNullStr($d['contactNumber'] ?? ''), ':email' => dilpNullStr($d['email'] ?? ''),
+        ':is4ps' => $is4Ps ? 'true' : 'false', ':ygrad' => $is4Ps ? dilpIntOrNull($d['yearGraduated4Ps'] ?? null) : null,
+    ]);
+    $bid = (int) $s->fetchColumn();
+
+    $s2 = $pdo->prepare(
+        "INSERT INTO beneficiary_services(beneficiary_id,service_id,status,date_applied,received_by,remarks) VALUES(:bid,:sid,'Active',:date,:rby,:rmk) RETURNING beneficiary_service_id"
+    );
+    $s2->execute([
+        ':bid' => $bid, ':sid' => dilpServiceId(), ':date' => dilpDate($d['dateApplied'] ?? '') ?? date('Y-m-d'),
+        ':rby' => dilpNullStr($d['receivedBy'] ?? ''), ':rmk' => dilpNullStr($d['remarks'] ?? ''),
+    ]);
+    $bsId = (int) $s2->fetchColumn();
+
+    $cls = dilpNormalizeClassification($d['beneficiaryClassification'] ?? '');
+    if ($cls !== null) {
+        $clsOther = $cls === 'Other' ? dilpNullStr($d['beneficiaryClassificationOther'] ?? '') : null;
+        $pdo->prepare("INSERT INTO beneficiary_classifications(beneficiary_id,classification,classification_other) VALUES(:bid,:cls,:clsOther) ON CONFLICT DO NOTHING")
+            ->execute([':bid' => $bid, ':cls' => $cls, ':clsOther' => $clsOther]);
+    }
+
+    dilpSyncDocuments($pdo, $bid, $bsId, $uid, $d);
+
+    return $bid;
 }
 
 function dilpCreateProfile() {
     $uid = requireLogin();
     $d = body();
-    [$sex, $birth, $civil, $bgyId] = dilpValidateProfileInput($d);
-    $is4Ps = !empty($d['is4PsBeneficiary']);
+    $err = dilpProfileValidationError($d);
+    if ($err) error($err, 422);
 
     $pdo = db();
     try {
         $pdo->beginTransaction();
-
-        $s = $pdo->prepare(
-            "INSERT INTO beneficiaries(first_name,middle_name,last_name,suffix,sex,birth_date,civil_status,street_address,barangay_id,contact_no,email,is_4ps_beneficiary,year_graduated_4ps,status)
-             VALUES(:fn,:mn,:ln,:sfx,:sex,:bdate,:civil,:street,:bgy,:contact,:email,:is4ps,:ygrad,'Active') RETURNING beneficiary_id"
-        );
-        $s->execute([
-            ':fn' => trim($d['firstName']), ':mn' => dilpNullStr($d['middleName'] ?? ''), ':ln' => trim($d['lastName']),
-            ':sfx' => dilpNullStr($d['nameExtension'] ?? ''), ':sex' => $sex, ':bdate' => $birth, ':civil' => $civil,
-            ':street' => dilpNullStr($d['streetPurok'] ?? ''), ':bgy' => $bgyId,
-            ':contact' => dilpNullStr($d['contactNumber'] ?? ''), ':email' => dilpNullStr($d['email'] ?? ''),
-            ':is4ps' => $is4Ps ? 'true' : 'false', ':ygrad' => $is4Ps ? dilpIntOrNull($d['yearGraduated4Ps'] ?? null) : null,
-        ]);
-        $bid = (int) $s->fetchColumn();
-
-        $s2 = $pdo->prepare(
-            "INSERT INTO beneficiary_services(beneficiary_id,service_id,status,date_applied,received_by,remarks) VALUES(:bid,:sid,'Active',:date,:rby,:rmk) RETURNING beneficiary_service_id"
-        );
-        $s2->execute([
-            ':bid' => $bid, ':sid' => dilpServiceId(), ':date' => dilpDate($d['dateApplied'] ?? '') ?? date('Y-m-d'),
-            ':rby' => dilpNullStr($d['receivedBy'] ?? ''), ':rmk' => dilpNullStr($d['remarks'] ?? ''),
-        ]);
-        $bsId = (int) $s2->fetchColumn();
-
-        $cls = dilpNormalizeClassification($d['beneficiaryClassification'] ?? '');
-        if ($cls !== null) {
-            $clsOther = $cls === 'Other' ? dilpNullStr($d['beneficiaryClassificationOther'] ?? '') : null;
-            $pdo->prepare("INSERT INTO beneficiary_classifications(beneficiary_id,classification,classification_other) VALUES(:bid,:cls,:clsOther) ON CONFLICT DO NOTHING")
-                ->execute([':bid' => $bid, ':cls' => $cls, ':clsOther' => $clsOther]);
-        }
-
-        dilpSyncDocuments($pdo, $bid, $bsId, $uid, $d);
-
+        $bid = dilpInsertProfileRow($pdo, $uid, $d);
         $pdo->commit();
     } catch (Throwable $e) {
         if ($pdo->inTransaction()) $pdo->rollBack();
@@ -462,6 +484,47 @@ function dilpCreateProfile() {
     }
     logActivity($uid, 'Create Profile', 'livelihood', "Created beneficiary: " . trim($d['lastName']) . ", " . trim($d['firstName']));
     json(['status' => 'ok', 'message' => 'Profile saved.', 'data' => dilpBuildProfile($bid)]);
+}
+
+// POST /api/dilp/importProfilesBulk   body = { rows: object[] }
+//
+// All-or-nothing bulk import: every row is validated up front, then the
+// whole batch is written inside ONE transaction. If any row fails validation
+// or the insert throws partway through, everything is rolled back.
+function dilpImportProfilesBulk() {
+    $uid  = requireLogin();
+    $body = body();
+    $rows = is_array($body['rows'] ?? null) ? $body['rows'] : [];
+    if (!$rows) error('No rows to import.', 422);
+
+    $errors = [];
+    foreach ($rows as $i => $d) {
+        $err = dilpProfileValidationError($d);
+        if ($err) $errors[] = ['row' => $i, 'error' => $err];
+    }
+    if ($errors) error('Validation failed. No records were imported.', 422, ['errors' => $errors]);
+
+    $pdo = db();
+    $ids = [];
+    try {
+        $pdo->beginTransaction();
+        foreach ($rows as $d) {
+            $ids[] = dilpInsertProfileRow($pdo, $uid, $d);
+        }
+        $pdo->commit();
+    } catch (Throwable $e) {
+        if ($pdo->inTransaction()) $pdo->rollBack();
+        error('Failed to save profiles. No records were imported.', 500, [
+            'failedIndex' => count($ids),
+            'reason'      => 'An unexpected error occurred while saving this record.',
+        ]);
+    }
+
+    foreach ($rows as $d) {
+        logActivity($uid, 'Create Profile', 'livelihood', "Created beneficiary: " . trim($d['lastName']) . ", " . trim($d['firstName']));
+    }
+
+    json(['status' => 'ok', 'message' => 'Profiles saved.', 'data' => ['ids' => $ids, 'count' => count($ids)]]);
 }
 
 function dilpUpdateProfile($id) {

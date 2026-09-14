@@ -37,6 +37,9 @@ function handle($action, $id, $method)
         case 'createApplicant':
             requirePermission('employment', 'Editor');
             return employmentCreateApplicant();
+        case 'importApplicantsBulk':
+            requirePermission('employment', 'Editor');
+            return employmentImportApplicantsBulk();
         case 'updateApplicant':
             requirePermission('employment', 'Editor');
             return employmentUpdateApplicant($id);
@@ -49,6 +52,9 @@ function handle($action, $id, $method)
         case 'createEmployer':
             requirePermission('employment', 'Editor');
             return efCreateEmployer();
+        case 'importEmployersBulk':
+            requirePermission('employment', 'Editor');
+            return efImportEmployersBulk();
         case 'updateEmployer':
             requirePermission('employment', 'Editor');
             return efUpdateEmployer($id);
@@ -256,22 +262,94 @@ function employmentCreateApplicant()
     json(['status' => 'ok', 'message' => 'Applicant saved.', 'data' => ['id' => $beneficiaryId]]);
 }
 
+// POST /api/employment/importApplicantsBulk   body = { rows: ApplicantFormData[] }
+//
+// All-or-nothing bulk import: every row is validated up front, then the whole
+// batch is written inside ONE transaction. If any row fails validation or the
+// insert throws partway through, everything is rolled back and nothing is
+// saved — the caller (the Excel import flow) relies on this so a bad row in a
+// large file can never leave a partial set of applicants behind.
+function employmentImportApplicantsBulk()
+{
+    $uid  = requireLogin();
+    $body = body();
+    $rows = is_array($body['rows'] ?? null) ? $body['rows'] : [];
+
+    if (!$rows) {
+        error('No rows to import.', 422);
+    }
+
+    $errors = [];
+    foreach ($rows as $i => $d) {
+        $err = employmentValidateApplicant($d);
+        if ($err) $errors[] = ['row' => $i, 'error' => $err];
+    }
+    if ($errors) {
+        error('Validation failed. No records were imported.', 422, ['errors' => $errors]);
+    }
+
+    $pdo = db();
+    $ids = [];
+    try {
+        $pdo->beginTransaction();
+        foreach ($rows as $d) {
+            $beneficiaryId = employmentInsertBeneficiary($pdo, $d);
+
+            $stmt = $pdo->prepare(
+                "INSERT INTO beneficiary_services (beneficiary_id, service_id, status, date_applied, received_by)
+                 VALUES (:bid, :sid, 'Active', CURRENT_DATE, :uid)
+                 RETURNING beneficiary_service_id"
+            );
+            $stmt->execute([':bid' => $beneficiaryId, ':sid' => efServiceId(), ':uid' => $uid]);
+            $bsId = (int) $stmt->fetchColumn();
+
+            employmentInsertEfProfile($pdo, $bsId, $d);
+            employmentInsertResumeTables($pdo, $beneficiaryId, $d);
+            employmentInsertDisabilities($pdo, $beneficiaryId, $d);
+            employmentSavePhoto($pdo, $beneficiaryId, $bsId, $uid, $d);
+            employmentSyncDocuments($pdo, $beneficiaryId, $bsId, $uid, $d);
+
+            $ids[] = $beneficiaryId;
+        }
+        $pdo->commit();
+    } catch (Throwable $e) {
+        if ($pdo->inTransaction()) $pdo->rollBack();
+        error('Failed to save applicants. No records were imported.', 500, [
+            'failedIndex' => count($ids),
+            'reason'      => 'An unexpected error occurred while saving this record.',
+        ]);
+    }
+
+    foreach ($rows as $d) {
+        logActivity($uid, 'Create Applicant', 'employment', "Created applicant: " . trim($d['surname']) . ", " . trim($d['firstName']));
+    }
+
+    json(['status' => 'ok', 'message' => 'Applicants saved.', 'data' => ['ids' => $ids, 'count' => count($ids)]]);
+}
+
 // Required-field + enum validation. Returns an error string, or '' if valid.
 function employmentValidateApplicant($d)
 {
-    foreach (['firstName', 'surname', 'dateOfBirth', 'sex', 'civilStatus'] as $f) {
+    $labels = [
+        'firstName'   => 'First Name',
+        'surname'     => 'Surname',
+        'dateOfBirth' => 'Date of Birth',
+        'sex'         => 'Sex',
+        'civilStatus' => 'Civil Status',
+    ];
+    foreach ($labels as $f => $label) {
         if (efNull($d[$f] ?? '') === null) {
-            return "Missing required field: {$f}";
+            return "Missing required field: {$label}";
         }
     }
     if (!in_array($d['sex'], ['Male', 'Female'], true)) {
-        return 'Invalid sex.';
+        return 'Sex must be either Male or Female.';
     }
     if (!in_array($d['civilStatus'], ['Single', 'Married', 'Widowed', 'Separated', 'Divorced'], true)) {
-        return 'Invalid civil status.';
+        return 'Civil Status must be one of: Single, Married, Widowed, Separated, Divorced.';
     }
     if (efDateOrNull($d['dateOfBirth'] ?? '') === null) {
-        return 'Invalid date of birth.';
+        return 'Date of Birth is not a valid date.';
     }
     // barangay_id is required by the DB and comes from the address combobox.
     if (!isset($d['barangayId']) || !is_numeric($d['barangayId'])) {
@@ -818,7 +896,7 @@ function employmentBuildApplicant($bid)
 {
     $stmt = db()->prepare(
         "SELECT b.*, bgy.barangay_name, c.city_name, c.city_id, p.province_name, p.province_id, r.region_name,
-                bs.beneficiary_service_id
+                bs.beneficiary_service_id, bs.date_applied
          FROM beneficiaries b
          JOIN beneficiary_services bs ON bs.beneficiary_id = b.beneficiary_id AND bs.service_id = :sid
          LEFT JOIN barangays bgy ON bgy.barangay_id = b.barangay_id
@@ -1039,6 +1117,7 @@ function employmentBuildApplicant($bid)
         'jobPreference' => $jobPrefs[0]['occupation'] ?? '',
         'language' => $languageSummary,
         'referralState' => efApplicantReferralState($bsId),
+        'dateApplicationReceived' => $b['date_applied'] ?? '',
         'fullFormData' => $full,
     ];
 }
@@ -1417,8 +1496,10 @@ function efCreateEmployer()
     $err = efValidateEmployer($d);
     if ($err) error($err, 422);
 
+    $pdo = db();
     try {
-        $stmt = db()->prepare(
+        $pdo->beginTransaction();
+        $stmt = $pdo->prepare(
             "INSERT INTO employers
                 (company_name, industry_id, company_size, years_in_operation, tin_number,
                  contact_person_name, contact_person_position, contact_number, email_address,
@@ -1431,12 +1512,74 @@ function efCreateEmployer()
         );
         efBindEmployer($stmt, $d);
         $id = (int) $stmt->fetchColumn();
+        $pdo->commit();
     } catch (Throwable $e) {
+        if ($pdo->inTransaction()) $pdo->rollBack();
         error('Failed to save employer. Please try again.', 500);
     }
 
     logActivity(currentUserId(), 'Create Employer', 'employment', "Created employer: " . trim($d['companyName']));
     json(['status' => 'ok', 'message' => 'Employer saved.', 'data' => ['id' => $id]]);
+}
+
+// POST /api/employment/importEmployersBulk   body = { rows: EmployerFormData[] }
+//
+// All-or-nothing bulk import, same pattern as importApplicantsBulk: every row
+// is validated up front, then the whole batch is written inside ONE
+// transaction. If any row fails validation or the insert throws partway
+// through, everything is rolled back and nothing is saved.
+function efImportEmployersBulk()
+{
+    $body = body();
+    $rows = is_array($body['rows'] ?? null) ? $body['rows'] : [];
+
+    if (!$rows) {
+        error('No rows to import.', 422);
+    }
+
+    $errors = [];
+    foreach ($rows as $i => $d) {
+        $err = efValidateEmployer($d);
+        if ($err) $errors[] = ['row' => $i, 'error' => $err];
+    }
+    if ($errors) {
+        error('Validation failed. No records were imported.', 422, ['errors' => $errors]);
+    }
+
+    $pdo = db();
+    $ids = [];
+    try {
+        $pdo->beginTransaction();
+        foreach ($rows as $d) {
+            $stmt = $pdo->prepare(
+                "INSERT INTO employers
+                    (company_name, industry_id, company_size, years_in_operation, tin_number,
+                     contact_person_name, contact_person_position, contact_number, email_address,
+                     building_no, street, barangay_id, status, date_registered, remarks, business_type)
+                 VALUES
+                    (:name, :iid, :size, :years, :tin,
+                     :cname, :cpos, :cnum, :email,
+                     :bldg, :street, :bgid, :status, :dreg, :remarks, :btype)
+                 RETURNING employer_id"
+            );
+            efBindEmployer($stmt, $d);
+            $ids[] = (int) $stmt->fetchColumn();
+        }
+        $pdo->commit();
+    } catch (Throwable $e) {
+        if ($pdo->inTransaction()) $pdo->rollBack();
+        error('Failed to save employers. No records were imported.', 500, [
+            'failedIndex' => count($ids),
+            'reason'      => 'An unexpected error occurred while saving this record.',
+        ]);
+    }
+
+    $uid = currentUserId();
+    foreach ($rows as $d) {
+        logActivity($uid, 'Create Employer', 'employment', "Created employer: " . trim($d['companyName']));
+    }
+
+    json(['status' => 'ok', 'message' => 'Employers saved.', 'data' => ['ids' => $ids, 'count' => count($ids)]]);
 }
 
 // POST /api/employment/updateEmployer/{id}

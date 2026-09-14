@@ -15,6 +15,7 @@ function handle($action, $id, $method)
         case 'listProfiles':      requirePermission('gip','Viewer'); return gipListProfiles();
         case 'getProfile':        requirePermission('gip','Viewer'); return gipGetProfile($id);
         case 'createProfile':     requirePermission('gip','Editor'); return gipCreateProfile();
+        case 'importProfilesBulk': requirePermission('gip','Editor'); return gipImportProfilesBulk();
         case 'updateProfile':     requirePermission('gip','Editor'); return gipUpdateProfile($id);
         case 'deleteProfile':     requirePermission('gip','Editor'); return gipDeleteProfile($id);
         case 'assignWorkplace':   requirePermission('gip','Editor'); return gipAssignWorkplace();
@@ -400,65 +401,87 @@ function gipBuildProfile($bid) {
     ];
 }
 
+// Non-exiting sibling of gipValidateProfileInput() below: returns an error
+// string (or '' if valid) instead of calling error()/exit, so the bulk
+// import can validate every row and collect all their problems instead of
+// aborting the whole request at the first bad row.
+//
 // Required fields mirror beneficiaries' real NOT NULL columns (sex, birth_date,
 // civil_status, barangay_id) so a bad request 422s cleanly instead of failing
 // as a raw DB constraint violation.
+function gipProfileValidationError($d) {
+    if (gipNullStr($d['firstName'] ?? '') === null) return 'First name is required.';
+    if (gipNullStr($d['lastName'] ?? '') === null)  return 'Last name is required.';
+    if (!in_array($d['sex'] ?? '', ['Male', 'Female'], true)) return 'Sex is required.';
+    if (!gipDate($d['birthdate'] ?? '')) return 'Birthdate is required.';
+    $bgyId = (!empty($d['barangayId']) && is_numeric($d['barangayId']) && (int) $d['barangayId'] > 0)
+             ? (int) $d['barangayId'] : null;
+    if (!$bgyId) return 'Barangay is required.';
+    return '';
+}
+
 function gipValidateProfileInput($d) {
-    if (gipNullStr($d['firstName'] ?? '') === null) error('First name is required.', 422);
-    if (gipNullStr($d['lastName'] ?? '') === null)  error('Last name is required.', 422);
+    $err = gipProfileValidationError($d);
+    if ($err) error($err, 422);
 
-    $sex = in_array($d['sex'] ?? '', ['Male', 'Female'], true) ? $d['sex'] : null;
-    if (!$sex) error('Sex is required.', 422);
-
+    $sex   = $d['sex'];
     $birth = gipDate($d['birthdate'] ?? '');
-    if (!$birth) error('Birthdate is required.', 422);
-
     // civil_status_enum has no "Annulled" value (the frontend offers it as an
     // option) — anything outside the DB's real enum falls back to null rather
     // than failing the whole save.
     $validCivil = ['Single', 'Married', 'Widowed', 'Separated', 'Divorced'];
     $civil = in_array($d['civilStatus'] ?? '', $validCivil, true) ? $d['civilStatus'] : null;
-
-    $bgyId = (!empty($d['barangayId']) && is_numeric($d['barangayId']) && (int) $d['barangayId'] > 0)
-             ? (int) $d['barangayId'] : null;
-    if (!$bgyId) error('Barangay is required.', 422);
+    $bgyId = (int) $d['barangayId'];
 
     return [$sex, $birth, $civil, $bgyId];
+}
+
+// Insert one profile's full beneficiary spine. Shared by the single-record
+// create and the bulk import.
+function gipInsertProfileRow($pdo, $uid, $d) {
+    $sex   = $d['sex'];
+    $birth = gipDate($d['birthdate'] ?? '');
+    $validCivil = ['Single', 'Married', 'Widowed', 'Separated', 'Divorced'];
+    $civil = in_array($d['civilStatus'] ?? '', $validCivil, true) ? $d['civilStatus'] : null;
+    $bgyId = (int) $d['barangayId'];
+
+    $s = $pdo->prepare("INSERT INTO beneficiaries(first_name,middle_name,last_name,sex,birth_date,civil_status,street_address,barangay_id,contact_no,email,status,educational_attainment) VALUES(:fn,:mn,:ln,:sex,:bdate,:civil,:street,:bgy,:contact,:email,'Active',:educ) RETURNING beneficiary_id");
+    $s->execute([':fn'=>trim($d['firstName']),':mn'=>gipNullStr($d['middleName']??''),':ln'=>trim($d['lastName']),':sex'=>$sex,':bdate'=>$birth,':civil'=>$civil,':street'=>gipNullStr($d['streetPurok']??''),':bgy'=>$bgyId,':contact'=>gipNullStr($d['contactNumber']??''),':email'=>gipNullStr($d['email']??''),':educ'=>gipMapEducation($d['highestEducation']??'')]);
+    $bid = (int) $s->fetchColumn();
+
+    $s2 = $pdo->prepare("INSERT INTO beneficiary_services(beneficiary_id,service_id,status,date_applied,received_by) VALUES(:bid,:sid,'Active',:date,:rby) RETURNING beneficiary_service_id");
+    $s2->execute([':bid'=>$bid,':sid'=>gipServiceId(),':date'=>gipDate($d['dateApplicationReceived']??'')??date('Y-m-d'),':rby'=>gipNullStr($d['receivedBy']??'')]);
+    $bsId = (int) $s2->fetchColumn();
+
+    $validCls = gipValidClassifications();
+    $rawCls   = is_array($d['classification'] ?? null) ? $d['classification'] : [];
+    $ins = $pdo->prepare("INSERT INTO beneficiary_classifications(beneficiary_id,classification,classification_other) VALUES(:bid,:cls,:clsOther) ON CONFLICT DO NOTHING");
+    foreach ($rawCls as $c) {
+        $norm = gipNormalizeClassification($c);
+        if (in_array($norm, $validCls, true)) {
+            $clsOther = $norm === 'Other' ? gipNullStr($d['classificationOther'] ?? '') : null;
+            $ins->execute([':bid'=>$bid,':cls'=>$norm,':clsOther'=>$clsOther]);
+        }
+    }
+
+    $pdo->prepare("INSERT INTO gip_profiles(beneficiary_service_id,school_name,course_degree,strand,year_level,year_graduated,remarks,status) VALUES(:bsid,:school,:course,:strand,:ylvl,:yr,:rmk,'Inactive')")
+        ->execute([':bsid'=>$bsId,':school'=>gipNullStr($d['schoolName']??''),':course'=>gipNullStr($d['course']??''),':strand'=>gipNullStr($d['strand']??''),':ylvl'=>gipNullStr($d['yearLevel']??''),':yr'=>gipYearOrNull($d['yearGraduated']??''),':rmk'=>gipNullStr($d['remarks']??'')]);
+
+    gipSyncDocuments($pdo, $bid, $bsId, $uid, $d);
+
+    return $bid;
 }
 
 function gipCreateProfile() {
     $uid = requireLogin();
     $d = body();
-    [$sex, $birth, $civil, $bgyId] = gipValidateProfileInput($d);
+    $err = gipProfileValidationError($d);
+    if ($err) error($err, 422);
 
     $pdo = db();
     try {
         $pdo->beginTransaction();
-
-        $s = $pdo->prepare("INSERT INTO beneficiaries(first_name,middle_name,last_name,sex,birth_date,civil_status,street_address,barangay_id,contact_no,email,status,educational_attainment) VALUES(:fn,:mn,:ln,:sex,:bdate,:civil,:street,:bgy,:contact,:email,'Active',:educ) RETURNING beneficiary_id");
-        $s->execute([':fn'=>trim($d['firstName']),':mn'=>gipNullStr($d['middleName']??''),':ln'=>trim($d['lastName']),':sex'=>$sex,':bdate'=>$birth,':civil'=>$civil,':street'=>gipNullStr($d['streetPurok']??''),':bgy'=>$bgyId,':contact'=>gipNullStr($d['contactNumber']??''),':email'=>gipNullStr($d['email']??''),':educ'=>gipMapEducation($d['highestEducation']??'')]);
-        $bid = (int) $s->fetchColumn();
-
-        $s2 = $pdo->prepare("INSERT INTO beneficiary_services(beneficiary_id,service_id,status,date_applied,received_by) VALUES(:bid,:sid,'Active',:date,:rby) RETURNING beneficiary_service_id");
-        $s2->execute([':bid'=>$bid,':sid'=>gipServiceId(),':date'=>gipDate($d['dateApplicationReceived']??'')??date('Y-m-d'),':rby'=>gipNullStr($d['receivedBy']??'')]);
-        $bsId = (int) $s2->fetchColumn();
-
-        $validCls = gipValidClassifications();
-        $rawCls   = is_array($d['classification'] ?? null) ? $d['classification'] : [];
-        $ins = $pdo->prepare("INSERT INTO beneficiary_classifications(beneficiary_id,classification,classification_other) VALUES(:bid,:cls,:clsOther) ON CONFLICT DO NOTHING");
-        foreach ($rawCls as $c) {
-            $norm = gipNormalizeClassification($c);
-            if (in_array($norm, $validCls, true)) {
-                $clsOther = $norm === 'Other' ? gipNullStr($d['classificationOther'] ?? '') : null;
-                $ins->execute([':bid'=>$bid,':cls'=>$norm,':clsOther'=>$clsOther]);
-            }
-        }
-
-        $pdo->prepare("INSERT INTO gip_profiles(beneficiary_service_id,school_name,course_degree,strand,year_level,year_graduated,remarks,status) VALUES(:bsid,:school,:course,:strand,:ylvl,:yr,:rmk,'Inactive')")
-            ->execute([':bsid'=>$bsId,':school'=>gipNullStr($d['schoolName']??''),':course'=>gipNullStr($d['course']??''),':strand'=>gipNullStr($d['strand']??''),':ylvl'=>gipNullStr($d['yearLevel']??''),':yr'=>gipYearOrNull($d['yearGraduated']??''),':rmk'=>gipNullStr($d['remarks']??'')]);
-
-        gipSyncDocuments($pdo, $bid, $bsId, $uid, $d);
-
+        $bid = gipInsertProfileRow($pdo, $uid, $d);
         $pdo->commit();
     } catch (Throwable $e) {
         if ($pdo->inTransaction()) $pdo->rollBack();
@@ -466,6 +489,47 @@ function gipCreateProfile() {
     }
     logActivity($uid, 'Create Profile', 'gip', "Created applicant: " . trim($d['lastName']) . ", " . trim($d['firstName']));
     json(['status' => 'ok', 'message' => 'Profile saved.', 'data' => gipBuildProfile($bid)]);
+}
+
+// POST /api/gip/importProfilesBulk   body = { rows: object[] }
+//
+// All-or-nothing bulk import: every row is validated up front, then the
+// whole batch is written inside ONE transaction. If any row fails validation
+// or the insert throws partway through, everything is rolled back.
+function gipImportProfilesBulk() {
+    $uid  = requireLogin();
+    $body = body();
+    $rows = is_array($body['rows'] ?? null) ? $body['rows'] : [];
+    if (!$rows) error('No rows to import.', 422);
+
+    $errors = [];
+    foreach ($rows as $i => $d) {
+        $err = gipProfileValidationError($d);
+        if ($err) $errors[] = ['row' => $i, 'error' => $err];
+    }
+    if ($errors) error('Validation failed. No records were imported.', 422, ['errors' => $errors]);
+
+    $pdo = db();
+    $ids = [];
+    try {
+        $pdo->beginTransaction();
+        foreach ($rows as $d) {
+            $ids[] = gipInsertProfileRow($pdo, $uid, $d);
+        }
+        $pdo->commit();
+    } catch (Throwable $e) {
+        if ($pdo->inTransaction()) $pdo->rollBack();
+        error('Failed to save profiles. No records were imported.', 500, [
+            'failedIndex' => count($ids),
+            'reason'      => 'An unexpected error occurred while saving this record.',
+        ]);
+    }
+
+    foreach ($rows as $d) {
+        logActivity($uid, 'Create Profile', 'gip', "Created applicant: " . trim($d['lastName']) . ", " . trim($d['firstName']));
+    }
+
+    json(['status' => 'ok', 'message' => 'Profiles saved.', 'data' => ['ids' => $ids, 'count' => count($ids)]]);
 }
 
 function gipUpdateProfile($id) {

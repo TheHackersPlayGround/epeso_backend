@@ -31,6 +31,7 @@ function handle($action, $id, $method)
         case 'listProfiles':             requirePermission('livelihood','Viewer'); return clpepListProfiles();
         case 'getProfile':               requirePermission('livelihood','Viewer'); return clpepGetProfile($id);
         case 'createProfile':            requirePermission('livelihood','Editor'); return clpepCreateProfile();
+        case 'importProfilesBulk':       requirePermission('livelihood','Editor'); return clpepImportProfilesBulk();
         case 'updateProfile':            requirePermission('livelihood','Editor'); return clpepUpdateProfile($id);
         case 'deleteProfile':            requirePermission('livelihood','Editor'); return clpepDeleteProfile($id);
         case 'assignIntervention':       requirePermission('livelihood','Editor'); return clpepAssignIntervention();
@@ -383,24 +384,34 @@ function clpepBuildProfile($bid) {
     ];
 }
 
+// Non-exiting sibling of clpepValidateProfileInput() below: returns an error
+// string (or '' if valid) instead of calling error()/exit, so the bulk
+// import can validate every row and collect all their problems instead of
+// aborting the whole request at the first bad row.
+//
 // Required fields mirror beneficiaries' real NOT NULL columns (sex, birth_date,
 // barangay_id -- civil_status is hardcoded, not user input, since CLPEP is
 // minors-only and the form doesn't collect it). child_labor_status is also
 // NOT NULL on clpep_profiles but has no required marker in the UI, so an
 // empty value defaults to 'Not Yet Assessed' rather than blocking the save.
-function clpepValidateProfileInput($d) {
-    if (clpepNullStr($d['firstName'] ?? '') === null) error('First name is required.', 422);
-    if (clpepNullStr($d['lastName'] ?? '') === null)  error('Last name is required.', 422);
-
-    $sex = in_array($d['sex'] ?? '', ['Male', 'Female'], true) ? $d['sex'] : null;
-    if (!$sex) error('Sex is required.', 422);
-
-    $birth = clpepDate($d['birthdate'] ?? '');
-    if (!$birth) error('Birthdate is required.', 422);
-
+function clpepProfileValidationError($d) {
+    if (clpepNullStr($d['firstName'] ?? '') === null) return 'First name is required.';
+    if (clpepNullStr($d['lastName'] ?? '') === null)  return 'Last name is required.';
+    if (!in_array($d['sex'] ?? '', ['Male', 'Female'], true)) return 'Sex is required.';
+    if (!clpepDate($d['birthdate'] ?? '')) return 'Birthdate is required.';
     $bgyId = (!empty($d['barangayId']) && is_numeric($d['barangayId']) && (int) $d['barangayId'] > 0)
              ? (int) $d['barangayId'] : null;
-    if (!$bgyId) error('Barangay is required.', 422);
+    if (!$bgyId) return 'Barangay is required.';
+    return '';
+}
+
+function clpepValidateProfileInput($d) {
+    $err = clpepProfileValidationError($d);
+    if ($err) error($err, 422);
+
+    $sex   = $d['sex'];
+    $birth = clpepDate($d['birthdate'] ?? '');
+    $bgyId = (int) $d['barangayId'];
 
     $validChildLabor = ['Child Laborer', 'At Risk of Child Labor', 'Former Child Laborer', 'Not Yet Assessed'];
     $childLabor = in_array($d['childLaborStatus'] ?? '', $validChildLabor, true) ? $d['childLaborStatus'] : 'Not Yet Assessed';
@@ -411,48 +422,65 @@ function clpepValidateProfileInput($d) {
     return [$sex, $birth, $bgyId, $childLabor, $school];
 }
 
+// Insert one profile's full beneficiary spine. Shared by the single-record
+// create and the bulk import.
+function clpepInsertProfileRow($pdo, $uid, $d) {
+    $sex   = $d['sex'];
+    $birth = clpepDate($d['birthdate'] ?? '');
+    $bgyId = (int) $d['barangayId'];
+
+    $validChildLabor = ['Child Laborer', 'At Risk of Child Labor', 'Former Child Laborer', 'Not Yet Assessed'];
+    $childLabor = in_array($d['childLaborStatus'] ?? '', $validChildLabor, true) ? $d['childLaborStatus'] : 'Not Yet Assessed';
+
+    $validSchool = ['Currently Enrolled', 'Out of School', 'ALS Learner', 'ALS Graduate', 'Graduated'];
+    $school = in_array($d['schoolStatus'] ?? '', $validSchool, true) ? $d['schoolStatus'] : null;
+
+    $s = $pdo->prepare(
+        "INSERT INTO beneficiaries(first_name,middle_name,last_name,suffix,sex,birth_date,civil_status,street_address,barangay_id,status)
+         VALUES(:fn,:mn,:ln,:sfx,:sex,:bdate,'Single',:street,:bgy,'Active') RETURNING beneficiary_id"
+    );
+    $s->execute([
+        ':fn' => trim($d['firstName']), ':mn' => clpepNullStr($d['middleName'] ?? ''), ':ln' => trim($d['lastName']),
+        ':sfx' => clpepNullStr($d['nameExtension'] ?? ''), ':sex' => $sex, ':bdate' => $birth,
+        ':street' => clpepNullStr($d['streetPurok'] ?? ''), ':bgy' => $bgyId,
+    ]);
+    $bid = (int) $s->fetchColumn();
+
+    $s2 = $pdo->prepare(
+        "INSERT INTO beneficiary_services(beneficiary_id,service_id,status,date_applied,received_by,remarks) VALUES(:bid,:sid,'Active',:date,:rby,:rmk) RETURNING beneficiary_service_id"
+    );
+    $s2->execute([
+        ':bid' => $bid, ':sid' => clpepServiceId(), ':date' => clpepDate($d['dateApplied'] ?? '') ?? date('Y-m-d'),
+        ':rby' => clpepNullStr($d['receivedBy'] ?? ''), ':rmk' => clpepNullStr($d['remarks'] ?? ''),
+    ]);
+    $bsId = (int) $s2->fetchColumn();
+
+    $pdo->prepare(
+        "INSERT INTO clpep_profiles(beneficiary_service_id,child_labor_status,school_status,nature_of_work,currently_working,hours_worked_per_week,school_name,grade_year_level,guardian_name,guardian_relationship,guardian_contact_no,status,created_at,updated_at)
+         VALUES(:bsid,:cls,:school,:nature,:working,:hours,:sname,:grade,:gname,:grel,:gcontact,'Inactive',now(),now())"
+    )->execute([
+        ':bsid' => $bsId, ':cls' => $childLabor, ':school' => $school,
+        ':nature' => clpepNullStr($d['natureOfWork'] ?? ''), ':working' => clpepBoolOrNull($d['currentlyWorking'] ?? null),
+        ':hours' => clpepNumOrNull($d['hoursWorkedPerWeek'] ?? null), ':sname' => clpepNullStr($d['schoolName'] ?? ''),
+        ':grade' => clpepNullStr($d['gradeYearLevel'] ?? ''), ':gname' => clpepNullStr($d['guardianName'] ?? ''),
+        ':grel' => clpepNullStr($d['guardianRelationship'] ?? ''), ':gcontact' => clpepNullStr($d['guardianContactNumber'] ?? ''),
+    ]);
+
+    clpepSyncDocuments($pdo, $bid, $bsId, $uid, $d);
+
+    return $bid;
+}
+
 function clpepCreateProfile() {
     $uid = requireLogin();
     $d = body();
-    [$sex, $birth, $bgyId, $childLabor, $school] = clpepValidateProfileInput($d);
+    $err = clpepProfileValidationError($d);
+    if ($err) error($err, 422);
 
     $pdo = db();
     try {
         $pdo->beginTransaction();
-
-        $s = $pdo->prepare(
-            "INSERT INTO beneficiaries(first_name,middle_name,last_name,suffix,sex,birth_date,civil_status,street_address,barangay_id,status)
-             VALUES(:fn,:mn,:ln,:sfx,:sex,:bdate,'Single',:street,:bgy,'Active') RETURNING beneficiary_id"
-        );
-        $s->execute([
-            ':fn' => trim($d['firstName']), ':mn' => clpepNullStr($d['middleName'] ?? ''), ':ln' => trim($d['lastName']),
-            ':sfx' => clpepNullStr($d['nameExtension'] ?? ''), ':sex' => $sex, ':bdate' => $birth,
-            ':street' => clpepNullStr($d['streetPurok'] ?? ''), ':bgy' => $bgyId,
-        ]);
-        $bid = (int) $s->fetchColumn();
-
-        $s2 = $pdo->prepare(
-            "INSERT INTO beneficiary_services(beneficiary_id,service_id,status,date_applied,received_by,remarks) VALUES(:bid,:sid,'Active',:date,:rby,:rmk) RETURNING beneficiary_service_id"
-        );
-        $s2->execute([
-            ':bid' => $bid, ':sid' => clpepServiceId(), ':date' => clpepDate($d['dateApplied'] ?? '') ?? date('Y-m-d'),
-            ':rby' => clpepNullStr($d['receivedBy'] ?? ''), ':rmk' => clpepNullStr($d['remarks'] ?? ''),
-        ]);
-        $bsId = (int) $s2->fetchColumn();
-
-        $pdo->prepare(
-            "INSERT INTO clpep_profiles(beneficiary_service_id,child_labor_status,school_status,nature_of_work,currently_working,hours_worked_per_week,school_name,grade_year_level,guardian_name,guardian_relationship,guardian_contact_no,status,created_at,updated_at)
-             VALUES(:bsid,:cls,:school,:nature,:working,:hours,:sname,:grade,:gname,:grel,:gcontact,'Inactive',now(),now())"
-        )->execute([
-            ':bsid' => $bsId, ':cls' => $childLabor, ':school' => $school,
-            ':nature' => clpepNullStr($d['natureOfWork'] ?? ''), ':working' => clpepBoolOrNull($d['currentlyWorking'] ?? null),
-            ':hours' => clpepNumOrNull($d['hoursWorkedPerWeek'] ?? null), ':sname' => clpepNullStr($d['schoolName'] ?? ''),
-            ':grade' => clpepNullStr($d['gradeYearLevel'] ?? ''), ':gname' => clpepNullStr($d['guardianName'] ?? ''),
-            ':grel' => clpepNullStr($d['guardianRelationship'] ?? ''), ':gcontact' => clpepNullStr($d['guardianContactNumber'] ?? ''),
-        ]);
-
-        clpepSyncDocuments($pdo, $bid, $bsId, $uid, $d);
-
+        $bid = clpepInsertProfileRow($pdo, $uid, $d);
         $pdo->commit();
     } catch (Throwable $e) {
         if ($pdo->inTransaction()) $pdo->rollBack();
@@ -460,6 +488,47 @@ function clpepCreateProfile() {
     }
     logActivity($uid, 'Create Profile', 'livelihood', "Created beneficiary: " . trim($d['lastName']) . ", " . trim($d['firstName']));
     json(['status' => 'ok', 'message' => 'Profile saved.', 'data' => clpepBuildProfile($bid)]);
+}
+
+// POST /api/clpep/importProfilesBulk   body = { rows: object[] }
+//
+// All-or-nothing bulk import: every row is validated up front, then the
+// whole batch is written inside ONE transaction. If any row fails validation
+// or the insert throws partway through, everything is rolled back.
+function clpepImportProfilesBulk() {
+    $uid  = requireLogin();
+    $body = body();
+    $rows = is_array($body['rows'] ?? null) ? $body['rows'] : [];
+    if (!$rows) error('No rows to import.', 422);
+
+    $errors = [];
+    foreach ($rows as $i => $d) {
+        $err = clpepProfileValidationError($d);
+        if ($err) $errors[] = ['row' => $i, 'error' => $err];
+    }
+    if ($errors) error('Validation failed. No records were imported.', 422, ['errors' => $errors]);
+
+    $pdo = db();
+    $ids = [];
+    try {
+        $pdo->beginTransaction();
+        foreach ($rows as $d) {
+            $ids[] = clpepInsertProfileRow($pdo, $uid, $d);
+        }
+        $pdo->commit();
+    } catch (Throwable $e) {
+        if ($pdo->inTransaction()) $pdo->rollBack();
+        error('Failed to save profiles. No records were imported.', 500, [
+            'failedIndex' => count($ids),
+            'reason'      => 'An unexpected error occurred while saving this record.',
+        ]);
+    }
+
+    foreach ($rows as $d) {
+        logActivity($uid, 'Create Profile', 'livelihood', "Created beneficiary: " . trim($d['lastName']) . ", " . trim($d['firstName']));
+    }
+
+    json(['status' => 'ok', 'message' => 'Profiles saved.', 'data' => ['ids' => $ids, 'count' => count($ids)]]);
 }
 
 function clpepUpdateProfile($id) {

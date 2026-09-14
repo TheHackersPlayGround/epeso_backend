@@ -16,6 +16,7 @@ function handle($action, $id, $method)
         case 'listProfiles':      requirePermission('spes','Viewer'); return spesListProfiles();
         case 'getProfile':        requirePermission('spes','Viewer'); return spesGetProfile($id);
         case 'createProfile':     requirePermission('spes','Editor'); return spesCreateProfile();
+        case 'importProfilesBulk': requirePermission('spes','Editor'); return spesImportProfilesBulk();
         case 'updateProfile':     requirePermission('spes','Editor'); return spesUpdateProfile($id);
         case 'deleteProfile':     requirePermission('spes','Editor'); return spesDeleteProfile($id);
         case 'assignBatch':       requirePermission('spes','Editor'); return spesAssignBatch();
@@ -420,66 +421,88 @@ function spesBuildProfile($bid) {
     ];
 }
 
+// Non-exiting sibling of spesValidateProfileInput() below: returns an error
+// string (or '' if valid) instead of calling error()/exit, so the bulk
+// import can validate every row and collect all their problems instead of
+// aborting the whole request at the first bad row.
+//
 // Required fields mirror beneficiaries' real NOT NULL columns (sex, birth_date,
 // civil_status, barangay_id) so a bad request 422s cleanly instead of failing
 // as a raw DB constraint violation.
-function spesValidateProfileInput($d) {
-    if (spesNullStr($d['firstName'] ?? '') === null) error('First name is required.', 422);
-    if (spesNullStr($d['lastName'] ?? '') === null)  error('Last name is required.', 422);
-
-    $sex = in_array($d['sex'] ?? '', ['Male', 'Female'], true) ? $d['sex'] : null;
-    if (!$sex) error('Sex is required.', 422);
-
-    $birth = spesDate($d['birthdate'] ?? '');
-    if (!$birth) error('Birthdate is required.', 422);
-
-    $validCivil = ['Single', 'Married', 'Widowed', 'Separated', 'Divorced'];
-    $civil = in_array($d['civilStatus'] ?? '', $validCivil, true) ? $d['civilStatus'] : null;
-
+function spesProfileValidationError($d) {
+    if (spesNullStr($d['firstName'] ?? '') === null) return 'First name is required.';
+    if (spesNullStr($d['lastName'] ?? '') === null)  return 'Last name is required.';
+    if (!in_array($d['sex'] ?? '', ['Male', 'Female'], true)) return 'Sex is required.';
+    if (!spesDate($d['birthdate'] ?? '')) return 'Birthdate is required.';
     $bgyId = (!empty($d['barangayId']) && is_numeric($d['barangayId']) && (int) $d['barangayId'] > 0)
              ? (int) $d['barangayId'] : null;
-    if (!$bgyId) error('Barangay is required.', 422);
+    if (!$bgyId) return 'Barangay is required.';
+    return '';
+}
+
+function spesValidateProfileInput($d) {
+    $err = spesProfileValidationError($d);
+    if ($err) error($err, 422);
+
+    $sex   = $d['sex'];
+    $birth = spesDate($d['birthdate'] ?? '');
+    $validCivil = ['Single', 'Married', 'Widowed', 'Separated', 'Divorced'];
+    $civil = in_array($d['civilStatus'] ?? '', $validCivil, true) ? $d['civilStatus'] : null;
+    $bgyId = (int) $d['barangayId'];
 
     return [$sex, $birth, $civil, $bgyId];
+}
+
+// Insert one profile's full beneficiary spine. Shared by the single-record
+// create and the bulk import.
+function spesInsertProfileRow($pdo, $uid, $d) {
+    $sex   = $d['sex'];
+    $birth = spesDate($d['birthdate'] ?? '');
+    $validCivil = ['Single', 'Married', 'Widowed', 'Separated', 'Divorced'];
+    $civil = in_array($d['civilStatus'] ?? '', $validCivil, true) ? $d['civilStatus'] : null;
+    $bgyId = (int) $d['barangayId'];
+
+    $s = $pdo->prepare("INSERT INTO beneficiaries(first_name,middle_name,last_name,sex,birth_date,civil_status,street_address,barangay_id,contact_no,email,status) VALUES(:fn,:mn,:ln,:sex,:bdate,:civil,:street,:bgy,:contact,:email,'Active') RETURNING beneficiary_id");
+    $s->execute([':fn'=>trim($d['firstName']),':mn'=>spesNullStr($d['middleName']??''),':ln'=>trim($d['lastName']),':sex'=>$sex,':bdate'=>$birth,':civil'=>$civil,':street'=>spesNullStr($d['streetPurok']??''),':bgy'=>$bgyId,':contact'=>spesNullStr($d['contactNumber']??''),':email'=>spesNullStr($d['email']??'')]);
+    $bid = (int) $s->fetchColumn();
+
+    $s2 = $pdo->prepare("INSERT INTO beneficiary_services(beneficiary_id,service_id,status,date_applied,received_by) VALUES(:bid,:sid,'Active',:date,:rby) RETURNING beneficiary_service_id");
+    $s2->execute([':bid'=>$bid,':sid'=>spesServiceId(),':date'=>spesDate($d['dateApplicationReceived']??'')??date('Y-m-d'),':rby'=>spesNullStr($d['receivedBy']??'')]);
+    $bsId = (int) $s2->fetchColumn();
+
+    $pdo->prepare("INSERT INTO spes_profiles(beneficiary_service_id,school_name,school_type,grade_year_level,course,annual_family_income,dependent_count,remarks,status) VALUES(:bsid,:school,:stype,:glvl,:course,:income,:deps,:rmk,'Inactive')")
+        ->execute([
+            ':bsid'=>$bsId, ':school'=>spesNullStr($d['schoolName']??''), ':stype'=>spesNullStr($d['schoolType']??''),
+            ':glvl'=>spesNullStr($d['gradeYearLevel']??''), ':course'=>spesNullStr($d['course']??''),
+            ':income'=>spesMoneyOrNull($d['annualFamilyIncome']??null), ':deps'=>spesIntOrNull($d['numberOfDependents']??0) ?? 0,
+            ':rmk'=>spesNullStr($d['remarks']??''),
+        ]);
+
+    $validCls = spesValidClassifications();
+    $rawCls   = is_array($d['classification'] ?? null) ? $d['classification'] : [];
+    $ins = $pdo->prepare("INSERT INTO beneficiary_classifications(beneficiary_id,classification,classification_other) VALUES(:bid,:cls,:clsOther) ON CONFLICT DO NOTHING");
+    foreach ($rawCls as $c) {
+        if (in_array($c, $validCls, true)) {
+            $clsOther = $c === 'Other' ? spesNullStr($d['classificationOther'] ?? '') : null;
+            $ins->execute([':bid'=>$bid,':cls'=>$c,':clsOther'=>$clsOther]);
+        }
+    }
+
+    spesSyncDocuments($pdo, $bid, $bsId, $uid, $d);
+
+    return $bid;
 }
 
 function spesCreateProfile() {
     $uid = requireLogin();
     $d = body();
-    [$sex, $birth, $civil, $bgyId] = spesValidateProfileInput($d);
+    $err = spesProfileValidationError($d);
+    if ($err) error($err, 422);
 
     $pdo = db();
     try {
         $pdo->beginTransaction();
-
-        $s = $pdo->prepare("INSERT INTO beneficiaries(first_name,middle_name,last_name,sex,birth_date,civil_status,street_address,barangay_id,contact_no,email,status) VALUES(:fn,:mn,:ln,:sex,:bdate,:civil,:street,:bgy,:contact,:email,'Active') RETURNING beneficiary_id");
-        $s->execute([':fn'=>trim($d['firstName']),':mn'=>spesNullStr($d['middleName']??''),':ln'=>trim($d['lastName']),':sex'=>$sex,':bdate'=>$birth,':civil'=>$civil,':street'=>spesNullStr($d['streetPurok']??''),':bgy'=>$bgyId,':contact'=>spesNullStr($d['contactNumber']??''),':email'=>spesNullStr($d['email']??'')]);
-        $bid = (int) $s->fetchColumn();
-
-        $s2 = $pdo->prepare("INSERT INTO beneficiary_services(beneficiary_id,service_id,status,date_applied,received_by) VALUES(:bid,:sid,'Active',:date,:rby) RETURNING beneficiary_service_id");
-        $s2->execute([':bid'=>$bid,':sid'=>spesServiceId(),':date'=>spesDate($d['dateApplicationReceived']??'')??date('Y-m-d'),':rby'=>spesNullStr($d['receivedBy']??'')]);
-        $bsId = (int) $s2->fetchColumn();
-
-        $pdo->prepare("INSERT INTO spes_profiles(beneficiary_service_id,school_name,school_type,grade_year_level,course,annual_family_income,dependent_count,remarks,status) VALUES(:bsid,:school,:stype,:glvl,:course,:income,:deps,:rmk,'Inactive')")
-            ->execute([
-                ':bsid'=>$bsId, ':school'=>spesNullStr($d['schoolName']??''), ':stype'=>spesNullStr($d['schoolType']??''),
-                ':glvl'=>spesNullStr($d['gradeYearLevel']??''), ':course'=>spesNullStr($d['course']??''),
-                ':income'=>spesMoneyOrNull($d['annualFamilyIncome']??null), ':deps'=>spesIntOrNull($d['numberOfDependents']??0) ?? 0,
-                ':rmk'=>spesNullStr($d['remarks']??''),
-            ]);
-
-        $validCls = spesValidClassifications();
-        $rawCls   = is_array($d['classification'] ?? null) ? $d['classification'] : [];
-        $ins = $pdo->prepare("INSERT INTO beneficiary_classifications(beneficiary_id,classification,classification_other) VALUES(:bid,:cls,:clsOther) ON CONFLICT DO NOTHING");
-        foreach ($rawCls as $c) {
-            if (in_array($c, $validCls, true)) {
-                $clsOther = $c === 'Other' ? spesNullStr($d['classificationOther'] ?? '') : null;
-                $ins->execute([':bid'=>$bid,':cls'=>$c,':clsOther'=>$clsOther]);
-            }
-        }
-
-        spesSyncDocuments($pdo, $bid, $bsId, $uid, $d);
-
+        $bid = spesInsertProfileRow($pdo, $uid, $d);
         $pdo->commit();
     } catch (Throwable $e) {
         if ($pdo->inTransaction()) $pdo->rollBack();
@@ -487,6 +510,47 @@ function spesCreateProfile() {
     }
     logActivity($uid, 'Create Profile', 'spes', "Created applicant: " . trim($d['lastName']) . ", " . trim($d['firstName']));
     json(['status' => 'ok', 'message' => 'Profile saved.', 'data' => spesBuildProfile($bid)]);
+}
+
+// POST /api/spes/importProfilesBulk   body = { rows: object[] }
+//
+// All-or-nothing bulk import: every row is validated up front, then the
+// whole batch is written inside ONE transaction. If any row fails validation
+// or the insert throws partway through, everything is rolled back.
+function spesImportProfilesBulk() {
+    $uid  = requireLogin();
+    $body = body();
+    $rows = is_array($body['rows'] ?? null) ? $body['rows'] : [];
+    if (!$rows) error('No rows to import.', 422);
+
+    $errors = [];
+    foreach ($rows as $i => $d) {
+        $err = spesProfileValidationError($d);
+        if ($err) $errors[] = ['row' => $i, 'error' => $err];
+    }
+    if ($errors) error('Validation failed. No records were imported.', 422, ['errors' => $errors]);
+
+    $pdo = db();
+    $ids = [];
+    try {
+        $pdo->beginTransaction();
+        foreach ($rows as $d) {
+            $ids[] = spesInsertProfileRow($pdo, $uid, $d);
+        }
+        $pdo->commit();
+    } catch (Throwable $e) {
+        if ($pdo->inTransaction()) $pdo->rollBack();
+        error('Failed to save profiles. No records were imported.', 500, [
+            'failedIndex' => count($ids),
+            'reason'      => 'An unexpected error occurred while saving this record.',
+        ]);
+    }
+
+    foreach ($rows as $d) {
+        logActivity($uid, 'Create Profile', 'spes', "Created applicant: " . trim($d['lastName']) . ", " . trim($d['firstName']));
+    }
+
+    json(['status' => 'ok', 'message' => 'Profiles saved.', 'data' => ['ids' => $ids, 'count' => count($ids)]]);
 }
 
 function spesUpdateProfile($id) {
