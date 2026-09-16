@@ -33,6 +33,25 @@ function requireAdmin()
     return $id;
 }
 
+// Same admin gate, but reads the role cached in the session at login instead
+// of querying the users table. Use this ONLY for read-only polling endpoints
+// that must keep working while the database itself is mid-operation and
+// temporarily unqueryable -- e.g. backup restoreProgress, which is polled
+// throughout a restore that drops and reloads the very schema the users
+// table lives in. A normal requireAdmin() there would hang or error out for
+// the whole restore, since its DB query targets a table being torn down.
+// Trade-off: a demoted admin keeps this narrow, non-sensitive access (step
+// number + phase label, nothing else) until they next log in. Every other
+// admin-gated action still uses the live, DB-backed requireAdmin() above.
+function requireAdminSessionOnly()
+{
+    $id = requireLogin();
+    if (($_SESSION['role'] ?? null) !== 'Administrator') {
+        error('Administrator access required.', 403);
+    }
+    return $id;
+}
+
 
 // Module-level permission gate. Mirrors the frontend canManage()/canView() rules.
 //

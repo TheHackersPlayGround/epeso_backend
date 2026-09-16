@@ -100,8 +100,12 @@ function authLogin()
     db()->prepare("UPDATE users SET last_login = now() WHERE user_id = :id")
         ->execute([':id' => $user['user_id']]);
 
-    // Remember who is logged in.
+    // Remember who is logged in. Role is cached alongside so a handful of
+    // read-only checks (see requireAdminSessionOnly()) can confirm admin
+    // status without a database round trip -- see that function's comment
+    // for why that matters.
     $_SESSION['user_id'] = (int) $user['user_id'];
+    $_SESSION['role'] = $user['role'];
 
     logActivity((int) $user['user_id'], 'Login', 'system', "Successful login: {$username}", 'Success');
 

@@ -23,7 +23,7 @@ function handle($action, $id, $method)
         case 'deleteBackup':   requireAdmin(); return backupDelete($id);
         case 'restoreBackup':  requireAdmin(); return backupRestore($id);
         case 'restoreUpload':  requireAdmin(); return backupRestoreUpload();
-        case 'restoreProgress': requireAdmin(); return backupRestoreProgress();
+        case 'restoreProgress': requireAdminSessionOnly(); return backupRestoreProgress();
         default: error("Unknown Backup action: {$action}", 404);
     }
 }
@@ -420,6 +420,13 @@ function backupRestore($name)
     $step = 0;
 
     $uid = currentUserId();
+    // Release the session lock now that we have the user id. PHP's default
+    // session handler holds an exclusive file lock for the whole request --
+    // without closing it here, the frontend's restoreProgress polls (which
+    // also start a session) would queue behind this multi-step restore and
+    // only resolve once it's already finished, making the progress bar look
+    // stuck at 0% and then jump straight to done.
+    session_write_close();
     backupWriteProgress(++$step, $totalSteps, 'Creating safety backup of current data...');
     [$safetyName, $safetySize] = backupCreateSnapshot();
     logActivity($uid, 'Create Backup', 'security', "Automatic safety backup before restore: {$safetyName} ({$safetySize})");
