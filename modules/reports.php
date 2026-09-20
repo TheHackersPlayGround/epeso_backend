@@ -30,23 +30,25 @@ function handle($action, $id, $method)
 // the service_code(s) that roll up into it (Livelihood combines 4 programs),
 // and the table/date-column used to count "activities conducted" for it.
 // null activityTable means the concept doesn't apply (OFW: every row IS the
-// request, there's no separate "activity").
+// request, there's no separate "activity"). jobPlacements => true means the
+// program records placements in the shared job_placements table (EF has its
+// own employment_facilitation_placements table instead, handled separately).
 function reportPrograms()
 {
     return [
         'employment-facilitation' => ['label' => 'Employment Facilitation', 'services' => ['EF'],
             'activityTable' => 'vacancies', 'activityDateCol' => 'created_at'],
         'cdsp' => ['label' => 'CDSP', 'services' => ['CDSP'],
-            'activityTable' => 'cdsp_activities', 'activityDateCol' => 'activity_date'],
+            'activityTable' => 'cdsp_activities', 'activityDateCol' => 'activity_date', 'jobPlacements' => true],
         // gip_workplaces is now a reusable directory (no period of its own,
         // like EF's employers/vacancies split) -- "activities conducted"
         // counts new workplaces added in the period, via created_at.
         'gip' => ['label' => 'GIP', 'services' => ['GIP'],
-            'activityTable' => 'gip_workplaces', 'activityDateCol' => 'created_at'],
+            'activityTable' => 'gip_workplaces', 'activityDateCol' => 'created_at', 'jobPlacements' => true],
         'spes' => ['label' => 'SPES', 'services' => ['SPES'],
             'activityTable' => 'spes_batches', 'activityDateCol' => 'program_start_date'],
         'skills-training' => ['label' => 'Skills Training', 'services' => ['SKILLS'],
-            'activityTable' => 'skills_training_activities', 'activityDateCol' => 'activity_date'],
+            'activityTable' => 'skills_training_activities', 'activityDateCol' => 'activity_date', 'jobPlacements' => true],
         'livelihood' => ['label' => 'Livelihood', 'services' => ['DILP', 'TUPAD', 'SLP', 'CLPEP'],
             'activityTable' => null, 'activityDateCol' => null],
         'ofw-services' => ['label' => 'OFW Services', 'services' => ['OFW'],
@@ -166,9 +168,48 @@ function reportsSummary()
         $bySvc[$top]['female'] += (int) $r['female'];
     }
 
-    // Employment Facilitation is the only program with a clean single-outcome
-    // metric (placements) — everything else stays null rather than forcing a
-    // number onto a program the concept doesn't apply to.
+    // Placements: EF has its own table (below); CDSP, GIP and Skills Training
+    // record theirs in the shared job_placements table. Same definition for
+    // both -- unique people whose date_hired falls in the report window -- so
+    // the column reads consistently. Every other program stays null rather
+    // than forcing a number onto a program that doesn't track placements.
+    // A person is counted once per top-level program (CDSP's three child
+    // services roll up together), but NOT deduplicated across programs: the
+    // same person registered separately under EF and CDSP has two unrelated
+    // beneficiary records, so they show up in both rows.
+    $jpTopCodes = [];
+    foreach ($selected as $meta) {
+        if (!empty($meta['jobPlacements'])) {
+            foreach ($meta['services'] as $t) {
+                $jpTopCodes[$t] = true;
+            }
+        }
+    }
+    $jpCodes = array_values(array_filter($codes, fn($c) => isset($jpTopCodes[$codeToTop[$c]])));
+    $placedByTop = [];
+    if (!empty($jpCodes)) {
+        $jpPlaceholders = implode(',', array_map(fn($i) => ":j{$i}", array_keys($jpCodes)));
+        $jpBind = [];
+        foreach ($jpCodes as $i => $c) {
+            $jpBind[":j{$i}"] = $c;
+        }
+        $jpStmt = db()->prepare(
+            "SELECT DISTINCT s.service_code, bs.beneficiary_id
+             FROM job_placements jp
+             JOIN beneficiary_services bs ON bs.beneficiary_service_id = jp.beneficiary_service_id
+             JOIN beneficiaries b ON b.beneficiary_id = bs.beneficiary_id
+             JOIN services s ON s.service_id = bs.service_id
+             WHERE jp.deleted_at IS NULL AND b.deleted_at IS NULL
+               AND jp.date_hired BETWEEN :from AND :to
+               AND s.service_code IN ({$jpPlaceholders})"
+        );
+        $jpStmt->execute(array_merge([':from' => $from, ':to' => $to], $jpBind));
+        foreach ($jpStmt->fetchAll() as $r) {
+            $top = $codeToTop[$r['service_code']] ?? $r['service_code'];
+            $placedByTop[$top][$r['beneficiary_id']] = true;
+        }
+    }
+
     $efSid = null;
     if (isset($selected['employment-facilitation'])) {
         $sidStmt = db()->query("SELECT service_id FROM services WHERE service_code = 'EF' LIMIT 1");
@@ -209,6 +250,17 @@ function reportsSummary()
             $activities = reportsCountActivities($meta['activityTable'], $meta['activityDateCol'], $from, $to);
         }
 
+        if ($key === 'employment-facilitation') {
+            $placements = $efPlacements;
+        } elseif (!empty($meta['jobPlacements'])) {
+            $placements = 0;
+            foreach ($meta['services'] as $code) {
+                $placements += count($placedByTop[$code] ?? []);
+            }
+        } else {
+            $placements = null;
+        }
+
         $rows[] = [
             'key' => $key,
             'program' => $meta['label'],
@@ -216,7 +268,7 @@ function reportsSummary()
             'male' => $male,
             'female' => $female,
             'activities' => $activities,
-            'placements' => $key === 'employment-facilitation' ? $efPlacements : null,
+            'placements' => $placements,
         ];
     }
 
