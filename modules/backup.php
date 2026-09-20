@@ -128,10 +128,15 @@ function backupFormatBytes($bytes)
 // actions, which take a filename straight from the URL. .sql covers backups
 // created before uploads/ was bundled in; new backups are always .zip. The
 // optional _N suffix is for backupUniqueName()'s collision disambiguation
-// (see its comment for why that's needed at all).
+// (see its comment for why that's needed at all). The second alternative,
+// PESO_DB_Backup_pre_<label>, covers hand-made safety snapshots taken before
+// a migration: backupList() shows them (same PESO_DB_Backup_* prefix), so
+// they must also be deletable/downloadable/restorable, or they'd sit in the
+// list rejecting every action. Its charset is letters/digits/underscore
+// only, so it can't carry a path separator or dots either.
 function backupValidName($name)
 {
-    return is_string($name) && preg_match('/^PESO_DB_Backup_\d{4}-\d{2}-\d{2}_\d{6}(?:_\d+)?\.(sql|zip)$/', $name);
+    return is_string($name) && preg_match('/^PESO_DB_Backup_(?:\d{4}-\d{2}-\d{2}_\d{6}(?:_\d+)?|pre_[A-Za-z0-9_]+)\.(sql|zip)$/', $name);
 }
 
 // The created-at shown here is parsed straight out of the filename (which
