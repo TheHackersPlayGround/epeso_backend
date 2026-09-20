@@ -1,0 +1,8 @@
+# Uploads are public (document previews/downloads). During development the app
+# runs on the Vite origin and fetch()es Word documents from here to render the
+# Documents preview -- the browser blocks that cross-origin read unless the file
+# response allows it. Match cors_origin in config.php. Not needed in production,
+# where the app and uploads share one origin.
+<IfModule mod_headers.c>
+    Header set Access-Control-Allow-Origin "http://localhost:5173"
+</IfModule>
