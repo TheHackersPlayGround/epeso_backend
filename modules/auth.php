@@ -313,7 +313,7 @@ function authForgotQuestions()
     $stmt->execute([':u' => $username]);
     $row = $stmt->fetch();
     if (!$row) {
-        error("Password recovery is only available for administrator accounts with security questions set up. If you're a staff member, please contact an administrator to reset your password.", 404);
+        error("We couldn't find an administrator account with security questions set up for that username. Please check that you typed it correctly. If you're a staff member, contact an administrator to reset your password.", 404);
     }
 
     $qmap = securityQuestions();
@@ -347,7 +347,7 @@ function authForgotVerify()
     $stmt->execute([':u' => $username]);
     $row = $stmt->fetch();
     if (!$row) {
-        error("Password recovery is only available for administrator accounts with security questions set up. If you're a staff member, please contact an administrator to reset your password.", 404);
+        error("We couldn't find an administrator account with security questions set up for that username. Please check that you typed it correctly. If you're a staff member, contact an administrator to reset your password.", 404);
     }
 
     $ok = password_verify(normalizeAnswer($answers[0]), $row['answer_1_hash'])
@@ -384,7 +384,7 @@ function authForgotReset()
     $stmt->execute([':u' => $username]);
     $row = $stmt->fetch();
     if (!$row) {
-        error("Password recovery is only available for administrator accounts with security questions set up. If you're a staff member, please contact an administrator to reset your password.", 404);
+        error("We couldn't find an administrator account with security questions set up for that username. Please check that you typed it correctly. If you're a staff member, contact an administrator to reset your password.", 404);
     }
 
     $ok = password_verify(normalizeAnswer($answers[0]), $row['answer_1_hash'])
