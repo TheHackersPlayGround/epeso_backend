@@ -210,7 +210,7 @@ function ofwFetchDocuments($bid) {
 function ofwBuildProfile($bid) {
     $s = db()->prepare(
         "SELECT b.*, bgy.barangay_name, c.city_name, p.province_name, r.region_name,
-                bs.beneficiary_service_id, bs.date_applied, bs.received_by,
+                bs.beneficiary_service_id, bs.received_by,
                 op.ofw_profile_id, op.reference_no, op.date_filed, op.employment_status,
                 op.desired_position, op.type_of_skill, op.status, op.remarks
          FROM beneficiaries b
@@ -289,7 +289,6 @@ function ofwBuildProfile($bid) {
         'otherProgramSpecify'     => $otherProgramSpecify,
         'owwaWelfareFile'         => $docs['named']['OWWA Welfare Case Form'] ?? null,
         'elporFiles'              => $elporFiles,
-        'dateApplicationReceived' => $b['date_applied'] ?? '',
         'receivedBy'              => $b['received_by'] ?? '',
         'attachedDocuments'       => $docs['generic'],
     ];
@@ -400,8 +399,10 @@ function ofwCreateProfile() {
         ]);
         $bid = (int)$s->fetchColumn();
 
+        // OFW has a single date (the Date Filed on the paper form); date_applied is the
+        // shared spine column every program's reports read, so it mirrors date_filed.
         $s2 = $pdo->prepare("INSERT INTO beneficiary_services(beneficiary_id,service_id,status,date_applied,received_by) VALUES(:bid,:sid,'Active',:date,:rby) RETURNING beneficiary_service_id");
-        $s2->execute([':bid' => $bid, ':sid' => ofwServiceId(), ':date' => ofwDate($d['dateApplicationReceived'] ?? '') ?? date('Y-m-d'), ':rby' => ofwNullStr($d['receivedBy'] ?? '')]);
+        $s2->execute([':bid' => $bid, ':sid' => ofwServiceId(), ':date' => $filed, ':rby' => ofwNullStr($d['receivedBy'] ?? '')]);
         $bsId = (int)$s2->fetchColumn();
 
         try {
@@ -467,7 +468,7 @@ function ofwUpdateProfile($id) {
         ]);
 
         $pdo->prepare("UPDATE beneficiary_services SET received_by=:rby,date_applied=:date WHERE beneficiary_service_id=:bsid")
-            ->execute([':rby' => ofwNullStr($d['receivedBy'] ?? ''), ':date' => ofwDate($d['dateApplicationReceived'] ?? '') ?? date('Y-m-d'), ':bsid' => $bsId]);
+            ->execute([':rby' => ofwNullStr($d['receivedBy'] ?? ''), ':date' => $filed, ':bsid' => $bsId]);
 
         try {
             $pdo->prepare(
