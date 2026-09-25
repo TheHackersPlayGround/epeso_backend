@@ -566,6 +566,7 @@ function ofwRecordName($id) {
 }
 
 function ofwListDeleted() {
+    ofwPurgeExpired();
     $s = db()->prepare(
         "SELECT b.beneficiary_id AS id,
                 CONCAT(b.last_name, ', ', b.first_name,
@@ -610,11 +611,6 @@ function ofwPurgeRecord() {
     json(['status' => 'ok', 'message' => 'Record permanently deleted.']);
 }
 
-// Auto-purges anything past the recycle bin's retention window (see
-// RECYCLE_BIN_RETENTION_DAYS in core/helpers.php). Called from
-// ofwListDeleted() so simply viewing the recycle bin enforces the "N days
-// left" countdown the UI already shows -- that display was cosmetic only
-// until this existed.
 // Auto-purges anything past the recycle bin's retention window (see
 // RECYCLE_BIN_RETENTION_DAYS in core/helpers.php). Called from
 // ofwListDeleted() so simply viewing the recycle bin enforces the "N days
