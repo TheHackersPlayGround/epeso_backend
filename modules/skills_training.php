@@ -30,6 +30,7 @@ function handle($action, $id, $method)
     switch ($action) {
         case 'listBatches':              requirePermission('skills-maintenance','Viewer'); return stListBatches();
         case 'createBatch':              requirePermission('skills-maintenance','Editor'); return stCreateBatch();
+        case 'updateBatch':              requirePermission('skills-maintenance','Editor'); return stUpdateBatch($id);
         case 'deleteBatch':              requirePermission('skills-maintenance','Editor'); return stDeleteBatch($id);
 
         case 'listActivities':           requirePermission('skills-maintenance','Viewer'); return stListActivities();
@@ -143,6 +144,39 @@ function stCreateBatch() {
     $s->execute([':n' => $name, ':d' => stNullStr($d['description'] ?? '')]);
     logActivity(currentUserId(), 'Create Batch', 'skills-maintenance', "Created batch: {$name}");
     json(['status' => 'ok', 'message' => 'Batch added.', 'data' => ['id' => (int)$s->fetchColumn(), 'batchName' => $name]]);
+}
+
+// Renames a batch. Trainings and applicants point at a batch by batch_id, not by
+// name, so they all follow the new name automatically.
+function stUpdateBatch($id) {
+    if (!is_numeric($id)) error('Invalid batch id.', 422);
+    $id = (int)$id;
+    $d = body();
+    $name = trim($d['batchName'] ?? '');
+    if ($name === '') error('Batch name is required.', 422);
+
+    $cur = db()->prepare("SELECT batch_name FROM skills_training_batches WHERE batch_id=:id AND deleted_at IS NULL");
+    $cur->execute([':id' => $id]);
+    $oldName = $cur->fetchColumn();
+    if ($oldName === false) error('Batch not found.', 404);
+
+    // batch_name is UNIQUE across ALL rows, including batches sitting in the
+    // recycle bin, so check without the deleted_at filter to give a clear
+    // message instead of a raw database error.
+    // fetch() (not fetchColumn()): the selected value is itself a boolean, so
+    // fetchColumn()'s "false" would be indistinguishable from "no row found".
+    $dup = db()->prepare("SELECT deleted_at IS NOT NULL AS is_deleted FROM skills_training_batches WHERE batch_name=:n AND batch_id<>:id");
+    $dup->execute([':n' => $name, ':id' => $id]);
+    $dupRow = $dup->fetch();
+    if ($dupRow !== false) {
+        error($dupRow['is_deleted'] ? 'A deleted batch already uses this name. Restore it from the recycle bin or choose a different name.' : 'This batch already exists.', 409);
+    }
+
+    if ($name !== $oldName) {
+        db()->prepare("UPDATE skills_training_batches SET batch_name=:n, updated_at=now() WHERE batch_id=:id")->execute([':n' => $name, ':id' => $id]);
+        logActivity(currentUserId(), 'Update Batch', 'skills-maintenance', "Renamed batch \"{$oldName}\" to \"{$name}\"");
+    }
+    json(['status' => 'ok', 'message' => 'Batch updated.', 'data' => ['id' => $id, 'batchName' => $name]]);
 }
 
 function stDeleteBatch($id) {
