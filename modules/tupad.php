@@ -136,6 +136,10 @@ function tupadValidateProjectInput($d) {
     $date = tupadDate($d['date'] ?? '');
     if (!$date) error('Date is required.', 422);
 
+    // Number of Participants is the project's slot count: required, whole number >= 1.
+    $slots = wholeNumberOrNull($d['participants'] ?? null);
+    if ($slots === null || $slots < 1) error('Number of Participants must be a whole number of at least 1.', 422);
+
     return [$title, $date];
 }
 

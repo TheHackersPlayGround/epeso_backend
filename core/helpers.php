@@ -12,6 +12,15 @@ if (!defined('RECYCLE_BIN_RETENTION_DAYS')) {
     define('RECYCLE_BIN_RETENTION_DAYS', 30);
 }
 
+// Strict whole-number parse for slot counts: only plain digits ("5" or 5) are
+// accepted. "1.5", "1e3", "-2", " " and "" all return null, so a slot field can
+// never be quietly truncated (1.5 -> 1) the way a plain (int) cast would.
+function wholeNumberOrNull($v)
+{
+    $s = trim((string) $v);
+    return ctype_digit($s) ? (int) $s : null;
+}
+
 // Resolve a report's reporting window from the query string. Explicit
 // ?from=&to= wins; otherwise falls back to ?year=&month= (a single calendar
 // month), defaulting to the current month. Also returns the prior-period

@@ -279,6 +279,9 @@ function cdspCreateActivity() {
     $d = body();
     if (cdspNullStr($d['title'] ?? '') === null) error('Activity title is required.', 422);
     if (cdspDate($d['date'] ?? '') === null)      error('Activity date is required.', 422);
+    // Number of Participants is the activity's slot count: required, whole number >= 1.
+    $slots = wholeNumberOrNull($d['participants'] ?? '');
+    if ($slots === null || $slots < 1) error('Number of Participants must be a whole number of at least 1.', 422);
     $sid = null;
     if (!empty($d['serviceName'])) $sid = cdspServiceIdByName($d['serviceName']);
     elseif (!empty($d['serviceId'])) $sid = cdspIntOrNull($d['serviceId']);
@@ -299,6 +302,9 @@ function cdspUpdateActivity($id) {
     $d = body();
     if (cdspNullStr($d['title'] ?? '') === null) error('Activity title is required.', 422);
     if (cdspDate($d['date'] ?? '') === null)      error('Activity date is required.', 422);
+    // Number of Participants is the activity's slot count: required, whole number >= 1.
+    $slots = wholeNumberOrNull($d['participants'] ?? '');
+    if ($slots === null || $slots < 1) error('Number of Participants must be a whole number of at least 1.', 422);
     $valid  = ['Planned', 'Ongoing', 'Completed'];
     $status = in_array($d['status'] ?? '', $valid, true) ? $d['status'] : 'Planned';
 

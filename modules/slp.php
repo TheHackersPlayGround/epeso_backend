@@ -39,6 +39,7 @@ function handle($action, $id, $method)
         case 'deleteProfile':       requirePermission('livelihood','Editor'); return slpDeleteProfile($id);
         case 'assignProject':       requirePermission('livelihood','Editor'); return slpAssignProject();
         case 'unassignProject':     requirePermission('livelihood','Editor'); return slpUnassignProject();
+        case 'updateAssessmentResult': requirePermission('livelihood','Editor'); return slpUpdateAssessmentResult();
         case 'listDeleted':         requirePermission('livelihood','Viewer'); return slpListDeleted();
         case 'restoreRecord':       requirePermission('livelihood','Editor'); return slpRestoreRecord();
         case 'purgeRecord':         requirePermission('livelihood','Editor'); return slpPurgeRecord();
@@ -726,6 +727,66 @@ function slpDeleteProfile($id) {
     db()->prepare("UPDATE beneficiaries SET deleted_at=now(),deleted_by=:uid WHERE beneficiary_id=:id")->execute([':uid' => $uid, ':id' => $bid]);
     logActivity($uid, 'Delete Profile', 'livelihood', "Moved to recycle bin: " . ($nameRow ? $nameRow['last_name'] . ', ' . $nameRow['first_name'] : "#{$bid}"));
     json(['status' => 'ok', 'message' => 'Beneficiary moved to recycle bin.']);
+}
+
+// ─── Update Assessment Result (quick action) ──────────────────────────────────
+// Changes only slp_profiles.assessment_result, so staff don't have to reopen
+// the whole Edit form. Assigning a project requires 'Qualified', so switching
+// to 'Not Qualified' is refused while the beneficiary's current project is
+// Planned (they can unassign first -- see slpUnassignProject) or Ongoing (they
+// can't unassign, and should simply stay Qualified while it runs). A Completed
+// project stays on record and does not block a later change.
+function slpUpdateAssessmentResult() {
+    $uid = requireLogin();
+    $d = body();
+    $bid = slpIntOrNull($d['applicantId'] ?? '');
+    if (!$bid) error('applicantId is required.', 422);
+
+    $result = $d['assessmentResult'] ?? '';
+    if (!in_array($result, ['Qualified', 'Not Qualified'], true)) {
+        error('Assessment Result must be Qualified or Not Qualified.', 422);
+    }
+
+    $bsS = db()->prepare(
+        "SELECT bs.beneficiary_service_id, sp.assessment_result, b.first_name, b.last_name
+         FROM beneficiary_services bs
+         JOIN slp_profiles sp ON sp.beneficiary_service_id = bs.beneficiary_service_id
+         JOIN beneficiaries b ON b.beneficiary_id = bs.beneficiary_id AND b.deleted_at IS NULL
+         WHERE bs.beneficiary_id=:bid AND bs.service_id=:sid ORDER BY bs.beneficiary_service_id DESC LIMIT 1"
+    );
+    $bsS->execute([':bid' => $bid, ':sid' => slpServiceId()]);
+    $row = $bsS->fetch();
+    if (!$row) error('SLP profile not found.', 404);
+    $bsId = (int) $row['beneficiary_service_id'];
+
+    if ($row['assessment_result'] === $result) {
+        json(['status' => 'ok', 'message' => 'Assessment result is already ' . $result . '.']);
+    }
+
+    if ($result === 'Not Qualified') {
+        $curS = db()->prepare(
+            "SELECT pr.status
+             FROM slp_project_beneficiaries pb
+             JOIN slp_projects pr ON pr.project_id = pb.project_id
+             WHERE pb.beneficiary_service_id=:bsid
+             ORDER BY pb.assigned_at DESC, pb.project_beneficiary_id DESC LIMIT 1"
+        );
+        $curS->execute([':bsid' => $bsId]);
+        $curStatus = $curS->fetchColumn();
+        if ($curStatus === 'Planned') {
+            error('This beneficiary is assigned to a project. Unassign them first, then try again.', 409);
+        }
+        if ($curStatus === 'Ongoing') {
+            error('This beneficiary is currently in an ongoing project, so their assessment result cannot be changed to Not Qualified.', 409);
+        }
+    }
+
+    db()->prepare("UPDATE slp_profiles SET assessment_result=:r, updated_at=now() WHERE beneficiary_service_id=:bsid")
+        ->execute([':r' => $result, ':bsid' => $bsId]);
+
+    $name = $row['last_name'] . ', ' . $row['first_name'];
+    logActivity($uid, 'Update Assessment Result', 'livelihood', "Set assessment result of {$name} to {$result}");
+    json(['status' => 'ok', 'message' => 'Assessment result updated.']);
 }
 
 // ─── Assign / Unassign project ────────────────────────────────────────────────

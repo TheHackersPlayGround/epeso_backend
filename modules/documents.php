@@ -459,6 +459,44 @@ function docsRecordName($type, $id)
     return $name !== false ? $name : "#{$id}";
 }
 
+// After a restore, if another active record in the same folder already uses this
+// name, rename the restored one to "base (N).ext" (first free N). Returns the new
+// name, or null if no rename was needed.
+function docsRenameIfTakenAfterRestore($type, $id, $name)
+{
+    if ($type === 'documentsFolder') {
+        $s = db()->prepare("SELECT parent_folder_id FROM folders WHERE folder_id = :id");
+        $s->execute([':id' => $id]);
+        $parent = $s->fetchColumn();
+        $parent = $parent === null || $parent === false ? null : (int) $parent;
+
+        if (!docsFolderNameTaken($name, $parent, $id)) return null;
+        $n = 1;
+        while (docsFolderNameTaken("{$name} ({$n})", $parent, $id)) $n++;
+        $newName = "{$name} ({$n})";
+        db()->prepare("UPDATE folders SET folder_name = :name WHERE folder_id = :id")
+            ->execute([':name' => $newName, ':id' => $id]);
+        return $newName;
+    }
+
+    $s = db()->prepare("SELECT folder_id FROM document_library WHERE document_id = :id");
+    $s->execute([':id' => $id]);
+    $folder = $s->fetchColumn();
+    $folder = $folder === null || $folder === false ? null : (int) $folder;
+
+    if (!docsDocumentNameTaken($name, $folder, $id)) return null;
+    $ext  = pathinfo($name, PATHINFO_EXTENSION);
+    $base = pathinfo($name, PATHINFO_FILENAME);
+    $n = 1;
+    do {
+        $newName = $ext !== '' ? "{$base} ({$n}).{$ext}" : "{$base} ({$n})";
+        $n++;
+    } while (docsDocumentNameTaken($newName, $folder, $id));
+    db()->prepare("UPDATE document_library SET title = :name, file_name = :name, updated_at = now() WHERE document_id = :id")
+        ->execute([':name' => $newName, ':id' => $id]);
+    return $newName;
+}
+
 function docsRestoreRecord()
 {
     [$type, $id] = docsRecycleTarget();
@@ -488,9 +526,14 @@ function docsRestoreRecord()
         )->execute([':id' => $id]);
     }
 
+    // The name may have been reused while this record sat in the bin. Instead of
+    // leaving two same-named siblings, restore under "name (1)", "name (2)", ...
+    $renamedTo = docsRenameIfTakenAfterRestore($type, $id, $name);
+
     $label = $type === 'documentsFolder' ? 'folder' : 'document';
-    logActivity(currentUserId(), 'Restore Record', 'documents', "Restored {$label} \"{$name}\" from recycle bin");
-    json(['status' => 'ok', 'message' => 'Record restored.']);
+    $logName = $renamedTo !== null ? "{$name}\" as \"{$renamedTo}" : $name;
+    logActivity(currentUserId(), 'Restore Record', 'documents', "Restored {$label} \"{$logName}\" from recycle bin");
+    json(['status' => 'ok', 'message' => 'Record restored.', 'data' => ['renamedTo' => $renamedTo]]);
 }
 
 // Only acts on records already in the recycle bin (deleted_at IS NOT NULL).

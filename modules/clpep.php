@@ -148,6 +148,10 @@ function clpepValidateInterventionInput($d) {
     $officer = trim($d['implementingOfficer'] ?? '');
     if ($officer === '') error('Implementing Officer is required.', 422);
 
+    // Target Beneficiaries is the intervention's slot count: required, whole number >= 1.
+    $target = wholeNumberOrNull($d['targetBeneficiaries'] ?? null);
+    if ($target === null || $target < 1) error('Target Beneficiaries must be a whole number of at least 1.', 422);
+
     $category = clpepNullStr($d['interventionCategory'] ?? '');
     if (!$category) error('Intervention Category is required.', 422);
 

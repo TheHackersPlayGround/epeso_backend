@@ -136,7 +136,7 @@ function backupFormatBytes($bytes)
 // only, so it can't carry a path separator or dots either.
 function backupValidName($name)
 {
-    return is_string($name) && preg_match('/^PESO_DB_Backup_(?:\d{4}-\d{2}-\d{2}_\d{6}(?:_\d+)?|pre_[A-Za-z0-9_]+)\.(sql|zip)$/', $name);
+    return is_string($name) && preg_match('/^PESO_DB_Backup_(?:(?:before_restore_)?\d{4}-\d{2}-\d{2}_\d{6}(?:_\d+)?|pre_[A-Za-z0-9_]+)\.(sql|zip)$/', $name);
 }
 
 // The created-at shown here is parsed straight out of the filename (which
@@ -148,8 +148,14 @@ function backupValidName($name)
 // this app already uses.
 function backupCreatedAt($filename)
 {
-    if (preg_match('/^PESO_DB_Backup_(\d{4}-\d{2}-\d{2})_(\d{2})(\d{2})(\d{2})(?:_\d+)?\.(?:sql|zip)$/', $filename, $m)) {
+    if (preg_match('/^PESO_DB_Backup_(?:before_restore_)?(\d{4}-\d{2}-\d{2})_(\d{2})(\d{2})(\d{2})(?:_\d+)?\.(?:sql|zip)$/', $filename, $m)) {
         return "{$m[1]} {$m[2]}:{$m[3]}:{$m[4]}";
+    }
+    // Earlier automatic safety backups used a compact, dash-less date
+    // (pre_restore_YYYYMMDD_HHMMSS) to fit the pre_<label> shape; still
+    // listed, so they keep a proper created-at.
+    if (preg_match('/^PESO_DB_Backup_pre_restore_(\d{4})(\d{2})(\d{2})_(\d{2})(\d{2})(\d{2})(?:_\d+)?\.(?:sql|zip)$/', $filename, $m)) {
+        return "{$m[1]}-{$m[2]}-{$m[3]} {$m[4]}:{$m[5]}:{$m[6]}";
     }
     return '';
 }
@@ -163,12 +169,18 @@ function backupCreatedAt($filename)
 // the safety snapshot (i.e. current data) instead of the intended backup,
 // with no error to show for it. This guarantees a name that doesn't already
 // exist on disk, appending _2, _3, ... only in that rare collision case.
-function backupUniqueName($ts, $ext)
+function backupUniqueName($ts, $ext, $safety = false)
 {
-    $name = "PESO_DB_Backup_{$ts}.{$ext}";
+    // $ts is 'YYYY-MM-DD_HHMMSS'. Automatic safety backups taken before a
+    // restore get a "before_restore" marker so they're recognisable even
+    // once downloaded, where the UI badge isn't shown.
+    $base = $safety
+        ? "PESO_DB_Backup_before_restore_{$ts}"
+        : "PESO_DB_Backup_{$ts}";
+    $name = "{$base}.{$ext}";
     $n = 2;
     while (is_file(backupDir() . $name)) {
-        $name = "PESO_DB_Backup_{$ts}_{$n}.{$ext}";
+        $name = "{$base}_{$n}.{$ext}";
         $n++;
     }
     return $name;
@@ -215,7 +227,7 @@ function backupAddDirToZip(ZipArchive $zip, $dir, $zipPrefix)
 // backupRestore() (which takes one of these automatically right before
 // overwriting live data, so a bad restore always has a way back). Returns
 // [filename, formattedSize] or throws via error() on failure.
-function backupCreateSnapshot()
+function backupCreateSnapshot($safety = false)
 {
     $config = include __DIR__ . '/../config.php';
     $db = $config['db'];
@@ -236,7 +248,7 @@ function backupCreateSnapshot()
     // request (see backupUniqueName()'s comment for the incident that
     // caused this).
     $ts = db()->query("SELECT to_char(now(), 'YYYY-MM-DD_HH24MISS')")->fetchColumn();
-    $zipName = backupUniqueName($ts, 'zip');
+    $zipName = backupUniqueName($ts, 'zip', $safety);
     $sqlName = substr($zipName, 0, -4) . '.sql';
     $sqlPath = backupDir() . $sqlName;
 
@@ -314,14 +326,13 @@ function backupDelete($name)
     json(['status' => 'ok', 'message' => 'Backup deleted.']);
 }
 
-// Accepts a .sql/.zip uploaded from outside the system (e.g. the admin only
+// Accepts a .zip uploaded from outside the system (e.g. the admin only
 // has a copy on a USB drive/cloud folder because the on-server copy was
-// deleted) and restores from it. The upload is saved into backups/ under a
-// freshly generated system name first -- not the browser's original
-// filename, to dodge collisions and keep every backup matching
-// backupValidName()'s pattern -- then handed to the exact same
-// backupRestore() used for on-server backups, so it also reappears in
-// Backup History afterward like any other entry.
+// deleted) and restores from it. The upload is restored straight from PHP's
+// temporary upload file (which PHP discards when the request ends) rather
+// than being copied into backups/, so it doesn't pile up in Backup History
+// -- the admin still has their own copy, and the automatic safety backup
+// taken first is what protects the current data.
 function backupRestoreUpload()
 {
     if (empty($_FILES['backupFile']) || $_FILES['backupFile']['error'] !== UPLOAD_ERR_OK) {
@@ -330,21 +341,23 @@ function backupRestoreUpload()
 
     $origName = $_FILES['backupFile']['name'];
     $ext = strtolower(pathinfo($origName, PATHINFO_EXTENSION));
-    if (!in_array($ext, ['sql', 'zip'], true)) {
-        error('Only .sql or .zip backup files are accepted.', 422);
+    // New backups are always .zip (database + uploaded documents). Old .sql
+    // backups already in backups/ can still be restored from Backup History,
+    // but are no longer accepted as an upload, since they'd restore the
+    // database without the documents it refers to.
+    if ($ext !== 'zip') {
+        error('Only .zip backup files are accepted.', 422);
     }
 
-    $ts = db()->query("SELECT to_char(now(), 'YYYY-MM-DD_HH24MISS')")->fetchColumn();
-    $name = backupUniqueName($ts, $ext);
-    $path = backupDir() . $name;
-
-    if (!move_uploaded_file($_FILES['backupFile']['tmp_name'], $path)) {
-        error('Failed to save the uploaded file.', 500);
+    $tmpPath = $_FILES['backupFile']['tmp_name'];
+    if (!is_uploaded_file($tmpPath)) {
+        error('No valid file was uploaded.', 422);
     }
 
-    logActivity(currentUserId(), 'Upload Backup', 'security', "Uploaded external backup file, saved as: {$name} (originally \"{$origName}\")");
-
-    return backupRestore($name);
+    // Shown in the activity log as the source of the restore. basename() +
+    // control-character strip because this string is user-supplied.
+    $label = preg_replace('/[\x00-\x1F\x7F]/', '', basename($origName));
+    return backupRunRestore($tmpPath, true, "uploaded backup file: \"{$label}\"");
 }
 
 // Deletes every file/folder inside $dir, keeping $dir itself. Used to wipe
@@ -415,12 +428,18 @@ function backupRestore($name)
     $path = backupDir() . $name;
     if (!is_file($path)) error('Backup file not found.', 404);
 
+    return backupRunRestore($path, str_ends_with(strtolower($name), '.zip'), "backup: {$name}");
+}
+
+// $sourceLabel is only for the activity log ("backup: <name>" for a file in
+// Backup History, "uploaded backup file: "<name>"" for Upload & Recover).
+function backupRunRestore($path, $isZip, $sourceLabel)
+{
     $psql = backupPsqlPath();
     if (!is_file($psql)) {
         error('psql was not found on this server. Contact your system administrator.', 500);
     }
 
-    $isZip = str_ends_with(strtolower($name), '.zip');
     $totalSteps = $isZip ? 6 : 4;
     $step = 0;
 
@@ -433,7 +452,7 @@ function backupRestore($name)
     // stuck at 0% and then jump straight to done.
     session_write_close();
     backupWriteProgress(++$step, $totalSteps, 'Creating safety backup of current data...');
-    [$safetyName, $safetySize] = backupCreateSnapshot();
+    [$safetyName, $safetySize] = backupCreateSnapshot(true);
     logActivity($uid, 'Create Backup', 'security', "Automatic safety backup before restore: {$safetyName} ({$safetySize})");
 
     $tmpDir = null;
@@ -495,7 +514,7 @@ function backupRestore($name)
 
     if ($tmpDir) { backupClearDirContents($tmpDir); @rmdir($tmpDir); }
 
-    logActivity($uid, 'Restore Backup', 'security', "Restored system from backup: {$name}" . ($uploadsRestored ? ' (database + uploaded files)' : ' (database only -- this backup had no bundled uploads)') . ". Safety backup taken first: {$safetyName}");
+    logActivity($uid, 'Restore Backup', 'security', "Restored system from {$sourceLabel}" . ($uploadsRestored ? '' : ' (database only -- this backup had no bundled uploads)') . ". Safety backup taken first: {$safetyName}");
     backupWriteProgress($totalSteps, $totalSteps, 'Restore complete.', true);
     json([
         'status'  => 'ok',

@@ -255,6 +255,9 @@ function stCreateActivity() {
     if (stNullStr($d['title'] ?? '') === null) error('Training title is required.', 422);
     $batchId = stIntOrNull($d['batchId'] ?? '');
     if (!$batchId) error('Training batch is required.', 422);
+    // Number of Participants is the training's slot count: required, whole number >= 1.
+    $slots = wholeNumberOrNull($d['participants'] ?? '');
+    if ($slots === null || $slots < 1) error('Number of Participants must be a whole number of at least 1.', 422);
     $chk = db()->prepare("SELECT 1 FROM skills_training_batches WHERE batch_id=:id AND deleted_at IS NULL");
     $chk->execute([':id' => $batchId]);
     if (!$chk->fetchColumn()) error('Selected batch not found.', 422);
@@ -268,7 +271,7 @@ function stCreateActivity() {
     $s->execute([
         ':bid' => $batchId, ':t' => trim($d['title']), ':desc' => stNullStr($d['description'] ?? ''),
         ':date' => stDate($d['date'] ?? '') ?? date('Y-m-d'), ':venue' => stNullStr($d['location'] ?? ''),
-        ':fac' => stNullStr($d['facilitator'] ?? ''), ':pc' => stIntOrNull($d['participants'] ?? '') ?? 0,
+        ':fac' => stNullStr($d['facilitator'] ?? ''), ':pc' => $slots,
     ]);
     logActivity(currentUserId(), 'Create Activity', 'skills-maintenance', "Created training: " . trim($d['title']));
     json(['status' => 'ok', 'message' => 'Training created.', 'data' => stGetActivityById((int)$s->fetchColumn())]);
@@ -281,6 +284,9 @@ function stUpdateActivity($id) {
     if (stNullStr($d['title'] ?? '') === null) error('Training title is required.', 422);
     $batchId = stIntOrNull($d['batchId'] ?? '');
     if (!$batchId) error('Training batch is required.', 422);
+    // Number of Participants is the training's slot count: required, whole number >= 1.
+    $slots = wholeNumberOrNull($d['participants'] ?? '');
+    if ($slots === null || $slots < 1) error('Number of Participants must be a whole number of at least 1.', 422);
     $valid  = ['Planned', 'Ongoing', 'Completed', 'Cancelled'];
     $status = in_array($d['status'] ?? '', $valid, true) ? $d['status'] : 'Planned';
 
@@ -299,7 +305,7 @@ function stUpdateActivity($id) {
     )->execute([
         ':bid' => $batchId, ':t' => trim($d['title']), ':desc' => stNullStr($d['description'] ?? ''),
         ':date' => stDate($d['date'] ?? '') ?? date('Y-m-d'), ':venue' => stNullStr($d['location'] ?? ''),
-        ':fac' => stNullStr($d['facilitator'] ?? ''), ':pc' => stIntOrNull($d['participants'] ?? '') ?? 0,
+        ':fac' => stNullStr($d['facilitator'] ?? ''), ':pc' => $slots,
         ':st' => $status, ':id' => $id,
     ]);
     logActivity(currentUserId(), 'Update Activity', 'skills-maintenance', "Updated training: " . trim($d['title']));
@@ -468,6 +474,16 @@ function stAddParticipant() {
     $actId = stIntOrNull($d['activityId'] ?? '');
     $bsId  = stIntOrNull($d['beneficiaryServiceId'] ?? '');
     if (!$actId || !$bsId) error('activityId and beneficiaryServiceId are required.', 422);
+
+    // The screen already greys out assigning for anyone not Accepted; enforce it
+    // here too so the rule can't be bypassed by calling the endpoint directly.
+    $stS = db()->prepare("SELECT application_status FROM skills_training_profiles WHERE beneficiary_service_id=:b");
+    $stS->execute([':b' => $bsId]);
+    $appStatusNow = $stS->fetchColumn();
+    if ($appStatusNow === false) error('Skills Training profile not found.', 404);
+    if ($appStatusNow !== 'Accepted') {
+        error('This applicant must be Accepted before they can be assigned to a training.', 409);
+    }
 
     $actS = db()->prepare("SELECT status, batch_id, participant_count FROM skills_training_activities WHERE activity_id=:a AND deleted_at IS NULL");
     $actS->execute([':a' => $actId]);
@@ -980,6 +996,33 @@ function stUpdateProfile($id) {
 
     $validStatus = ['Pending','Accepted','Waitlisted','Rejected'];
     $appStatus = in_array($d['status'] ?? '', $validStatus, true) ? $d['status'] : 'Waitlisted';
+
+    // Accepted is required to be assigned a training, so an Accepted applicant
+    // can't be moved to another status while they are in a Planned or Ongoing
+    // training. Planned can be unassigned first (see stRemoveParticipant); Ongoing
+    // can't, and they should simply stay Accepted while it runs. A Completed
+    // training stays on record and does not block a later status change.
+    if ($appStatus !== 'Accepted') {
+        $curS = db()->prepare("SELECT application_status FROM skills_training_profiles WHERE skills_training_profile_id=:pid");
+        $curS->execute([':pid' => $profileId]);
+        if ($curS->fetchColumn() === 'Accepted') {
+            // Planned first, so the "unassign first" advice wins when both exist.
+            $activeS = db()->prepare(
+                "SELECT a.status FROM skills_training_activity_participants p
+                 JOIN skills_training_activities a ON a.activity_id = p.activity_id
+                 WHERE p.beneficiary_service_id=:b AND a.status IN ('Planned','Ongoing') AND a.deleted_at IS NULL
+                 ORDER BY (a.status = 'Planned') DESC LIMIT 1"
+            );
+            $activeS->execute([':b' => $bsId]);
+            $activeStatus = $activeS->fetchColumn();
+            if ($activeStatus === 'Planned') {
+                error('This applicant is assigned to a training. Unassign them first, then try again.', 409);
+            }
+            if ($activeStatus === 'Ongoing') {
+                error('This applicant is currently in an ongoing training, so their status cannot be changed.', 409);
+            }
+        }
+    }
 
     $pdo = db();
     try {

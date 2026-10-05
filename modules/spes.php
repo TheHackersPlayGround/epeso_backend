@@ -145,7 +145,7 @@ function spesValidateBatchInput($d) {
     if (!$progEnd)   error('Program End Date is required.', 422);
     if ($progEnd < $progStart) error('Program End Date cannot be before Program Start Date.', 422);
 
-    $slots = spesIntOrNull($d['availableSlots'] ?? '');
+    $slots = wholeNumberOrNull($d['availableSlots'] ?? '');
     if ($slots === null || $slots < 1) error('Available slots must be a whole number of at least 1.', 422);
 
     $employer = trim($d['employer'] ?? '');
