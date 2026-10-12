@@ -14,7 +14,7 @@ return [
 
     // --- CORS ---
     // The Vite dev server origin allowed to call this API.
-    //'cors_origin' => 'http://192.168.8.221',
+    //'cors_origin' => 'http://192.168.1.70',
     'cors_origin' => 'http://localhost:5173',
 
     // --- App ---
