@@ -225,6 +225,50 @@ function cdspListServices() {
 
 // ─── Activities ───────────────────────────────────────────────────────────────
 
+// ─── Stored profile status (kept in step with the derived display status) ─────
+// The status a person SHOWS is derived from their activity assignments (see
+// cdspBuildProfile): Active while any assigned activity is Planned/Ongoing,
+// Inactive with none or once all are Completed. cdsp_profiles.status mirrors
+// that rule so SQL, exports and external tools can read it directly. The
+// derived value stays the source of truth for the screens -- if a code path
+// ever forgets to call these, the mirror is stale but the display is not.
+//
+// Call after ANYTHING that changes assignments or an activity's status:
+// add/remove participant, update activity, update activity status, and
+// profile creation. (Deleting an activity is blocked while it has
+// participants, so delete/restore of an activity never changes anyone.)
+function cdspSyncProfileStatusWhere($where, $params) {
+    db()->prepare(
+        "UPDATE cdsp_profiles cp SET status = s.new_status, updated_at = now()
+         FROM (
+             SELECT p.beneficiary_service_id,
+                    CASE WHEN EXISTS (
+                        SELECT 1 FROM cdsp_activity_participants cap
+                        JOIN cdsp_activities ca ON ca.activity_id = cap.activity_id
+                        WHERE cap.beneficiary_service_id = p.beneficiary_service_id
+                          AND ca.status <> 'Completed'
+                    ) THEN 'Active'::profile_status_enum ELSE 'Inactive'::profile_status_enum END AS new_status
+             FROM cdsp_profiles p
+             WHERE {$where}
+         ) s
+         WHERE cp.beneficiary_service_id = s.beneficiary_service_id
+           AND cp.status IS DISTINCT FROM s.new_status"
+    )->execute($params);
+}
+
+// One person (identified by their CDSP beneficiary_service_id).
+function cdspSyncProfileStatus($bsId) {
+    cdspSyncProfileStatusWhere('p.beneficiary_service_id = :bs', [':bs' => (int) $bsId]);
+}
+
+// Everyone assigned to one activity (its status or details just changed).
+function cdspSyncActivityParticipantsStatus($activityId) {
+    cdspSyncProfileStatusWhere(
+        'p.beneficiary_service_id IN (SELECT beneficiary_service_id FROM cdsp_activity_participants WHERE activity_id = :a)',
+        [':a' => (int) $activityId]
+    );
+}
+
 function cdspListActivities() {
     $s = db()->prepare(
         "SELECT ca.activity_id, ca.service_id, sv.service_name,
@@ -318,6 +362,7 @@ function cdspUpdateActivity($id) {
     db()->prepare(
         "UPDATE cdsp_activities SET activity_title=:t,description=:desc,activity_date=:date,location=:loc,facilitator=:fac,participant_count=:pc,status=:st,counselor=:c,session_duration=:dur,updated_at=now(){$completedAt} WHERE activity_id=:id"
     )->execute([':t'=>trim($d['title']),':desc'=>cdspNullStr($d['description']??''),':date'=>cdspDate($d['date']),':loc'=>cdspNullStr($d['location']??''),':fac'=>cdspNullStr($d['facilitator']??''),':pc'=>cdspIntOrNull($d['participants']??''),':st'=>$status,':c'=>cdspNullStr($d['counselor']??''),':dur'=>cdspNullStr($d['sessionDuration']??''),':id'=>(int)$id]);
+    cdspSyncActivityParticipantsStatus((int)$id);
     logActivity(currentUserId(), 'Update Activity', 'cdsp-maintenance', "Updated activity: " . trim($d['title']));
     json(['status' => 'ok', 'message' => 'Activity updated.', 'data' => cdspGetActivityById((int)$id)]);
 }
@@ -336,6 +381,7 @@ function cdspUpdateActivityStatus($id) {
     // marking it Completed again resets everyone's aging clock to "just now".
     $completedAt = ($status === 'Completed' && $prevStatus !== 'Completed') ? ',completed_at=now()' : '';
     db()->prepare("UPDATE cdsp_activities SET status=:s,updated_at=now(){$completedAt} WHERE activity_id=:id")->execute([':s'=>$status,':id'=>(int)$id]);
+    cdspSyncActivityParticipantsStatus((int)$id);
     $title = db()->prepare("SELECT activity_title FROM cdsp_activities WHERE activity_id=:id");
     $title->execute([':id'=>(int)$id]);
     logActivity(currentUserId(), 'Update Activity Status', 'cdsp-maintenance', "Set activity '{$title->fetchColumn()}' status to {$status}");
@@ -438,6 +484,7 @@ function cdspAddParticipant() {
     }
 
     db()->prepare("INSERT INTO cdsp_activity_participants(activity_id,beneficiary_service_id,date_assigned) VALUES(:a,:b,now()) ON CONFLICT DO NOTHING")->execute([':a'=>$actId,':b'=>$bsId]);
+    cdspSyncProfileStatus($bsId);
     json(['status' => 'ok', 'message' => 'Participant added.']);
 }
 
@@ -458,6 +505,7 @@ function cdspRemoveParticipant() {
     }
 
     db()->prepare("DELETE FROM cdsp_activity_participants WHERE activity_id=:a AND beneficiary_service_id=:b")->execute([':a'=>$actId,':b'=>$bsId]);
+    cdspSyncProfileStatus($bsId);
     json(['status' => 'ok', 'message' => 'Participant removed.']);
 }
 
@@ -666,8 +714,12 @@ function cdspBuildProfile($bid) {
     if (!empty($b['birth_date'])) {
         $age = (new DateTime($b['birth_date']))->diff(new DateTime('today'))->y;
     }
-    $bsStatus = $b['bs_status'] ?? 'Active';
-    $frontendStatus = in_array($bsStatus, ['Active','Approved'], true) ? 'Active' : 'Inactive';
+    // Status is DERIVED from the current assignment, never read from a stored
+    // column (beneficiary_services.status / cdsp_profiles.status are not kept in
+    // sync): Active while the person's current activity is Planned/Ongoing,
+    // Inactive with no assignment or once that activity is Completed. Same rule
+    // as DILP/TUPAD/SLP/CLPEP, so the page, reports and exports all agree.
+    $frontendStatus = ($currentAct && $currentAct['activity_status'] !== 'Completed') ? 'Active' : 'Inactive';
 
     return [
         'id'                      => $bid,
@@ -730,6 +782,8 @@ function cdspValidateProfile($d) {
     if (!cdspServiceIdByName($d['serviceAvailed']))  return 'Selected CDSP service not found.';
     if (!in_array($d['sex'] ?? '', ['Male','Female'], true)) return 'Sex is required.';
     if (!cdspDate($d['birthdate'] ?? '')) return 'Birthdate is required.';
+    if (cdspDate($d['birthdate'] ?? '') > date('Y-m-d')) return 'Birthdate cannot be in the future.';
+    if (cdspDate($d['dateApplicationReceived'] ?? '') > date('Y-m-d')) return 'Date Applied cannot be in the future.';
     $validCivil = ['Single','Married','Widowed','Separated','Divorced'];
     if (!in_array($d['civilStatus'] ?? '', $validCivil, true)) return 'Civil Status is required.';
     $bgyId = (!empty($d['barangayId']) && is_numeric($d['barangayId']) && (int)$d['barangayId'] > 0)
@@ -747,7 +801,7 @@ function cdspInsertProfileRow($pdo, $uid, $d) {
     $civil     = $d['civilStatus'];
     $bgyId     = (int) $d['barangayId'];
 
-    $s = $pdo->prepare("INSERT INTO beneficiaries(first_name,middle_name,last_name,sex,birth_date,civil_status,street_address,barangay_id,contact_no,email,status,educational_attainment) VALUES(:fn,:mn,:ln,:sex,:bdate,:civil,:street,:bgy,:contact,:email,'Active',:educ) RETURNING beneficiary_id");
+    $s = $pdo->prepare("INSERT INTO beneficiaries(first_name,middle_name,last_name,sex,birth_date,civil_status,street_address,barangay_id,contact_no,email,educational_attainment) VALUES(:fn,:mn,:ln,:sex,:bdate,:civil,:street,:bgy,:contact,:email,:educ) RETURNING beneficiary_id");
     $s->execute([':fn'=>trim($d['firstName']),':mn'=>cdspNullStr($d['middleName']??''),':ln'=>trim($d['lastName']),':sex'=>$sex,':bdate'=>$birth,':civil'=>$civil,':street'=>cdspNullStr($d['streetPurok']??''),':bgy'=>$bgyId,':contact'=>cdspNullStr($d['contactNumber']??''),':email'=>cdspNullStr($d['email']??''),':educ'=>cdspMapEducation($d['highestEducation']??'')]);
     $bid = (int)$s->fetchColumn();
 
@@ -766,8 +820,9 @@ function cdspInsertProfileRow($pdo, $uid, $d) {
         }
     }
 
-    $pdo->prepare("INSERT INTO cdsp_profiles(beneficiary_service_id,school_name,course_program,strand,year_level,year_graduated,employment_status,current_occupation,remarks,status) VALUES(:bsid,:school,:course,:strand,:ylvl,:yr,:empst,:occ,:rmk,'Active')")
+    $pdo->prepare("INSERT INTO cdsp_profiles(beneficiary_service_id,school_name,course_program,strand,year_level,year_graduated,employment_status,current_occupation,remarks,status) VALUES(:bsid,:school,:course,:strand,:ylvl,:yr,:empst,:occ,:rmk,'Inactive')")
         ->execute([':bsid'=>$bsId,':school'=>cdspNullStr($d['schoolName']??''),':course'=>cdspNullStr($d['course']??''),':strand'=>cdspNullStr($d['strand']??''),':ylvl'=>cdspNullStr($d['yearLevel']??''),':yr'=>cdspYearOrNull($d['yearGraduated']??''),':empst'=>cdspNullStr($d['employmentStatus']??''),':occ'=>cdspNullStr($d['currentOccupation']??''),':rmk'=>cdspNullStr($d['remarks']??'')]);
+    cdspSyncProfileStatus($bsId);
 
     cdspSyncDocuments($pdo, $bid, $bsId, $uid, $d);
 
@@ -879,6 +934,7 @@ function cdspUpdateProfile($id) {
     // request 422s cleanly instead of failing as a raw DB constraint violation.
     $birth = cdspDate($d['birthdate'] ?? '');
     if (!$birth) error('Birthdate is required.', 422);
+    if ($birth > date('Y-m-d')) error('Birthdate cannot be in the future.', 422);
 
     $validCivil = ['Single','Married','Widowed','Separated','Divorced'];
     $civil = in_array($d['civilStatus'] ?? '', $validCivil, true) ? $d['civilStatus'] : null;
@@ -921,8 +977,9 @@ function cdspUpdateProfile($id) {
             $pdo->prepare("UPDATE cdsp_profiles SET school_name=:school,course_program=:course,strand=:strand,year_level=:ylvl,year_graduated=:yr,employment_status=:empst,current_occupation=:occ,remarks=:rmk,updated_at=now() WHERE beneficiary_service_id=:bsid")
                 ->execute([':school'=>cdspNullStr($d['schoolName']??''),':course'=>cdspNullStr($d['course']??''),':strand'=>cdspNullStr($d['strand']??''),':ylvl'=>cdspNullStr($d['yearLevel']??''),':yr'=>cdspYearOrNull($d['yearGraduated']??''),':empst'=>cdspNullStr($d['employmentStatus']??''),':occ'=>cdspNullStr($d['currentOccupation']??''),':rmk'=>cdspNullStr($d['remarks']??''),':bsid'=>$bsId]);
         } else {
-            $pdo->prepare("INSERT INTO cdsp_profiles(beneficiary_service_id,school_name,course_program,strand,year_level,year_graduated,employment_status,current_occupation,remarks,status) VALUES(:bsid,:school,:course,:strand,:ylvl,:yr,:empst,:occ,:rmk,'Active')")
+            $pdo->prepare("INSERT INTO cdsp_profiles(beneficiary_service_id,school_name,course_program,strand,year_level,year_graduated,employment_status,current_occupation,remarks,status) VALUES(:bsid,:school,:course,:strand,:ylvl,:yr,:empst,:occ,:rmk,'Inactive')")
                 ->execute([':bsid'=>$bsId,':school'=>cdspNullStr($d['schoolName']??''),':course'=>cdspNullStr($d['course']??''),':strand'=>cdspNullStr($d['strand']??''),':ylvl'=>cdspNullStr($d['yearLevel']??''),':yr'=>cdspYearOrNull($d['yearGraduated']??''),':empst'=>cdspNullStr($d['employmentStatus']??''),':occ'=>cdspNullStr($d['currentOccupation']??''),':rmk'=>cdspNullStr($d['remarks']??'')]);
+            cdspSyncProfileStatus($bsId);
         }
 
         cdspSyncDocuments($pdo, $bid, $bsId, $uid, $d);

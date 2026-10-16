@@ -861,6 +861,8 @@ function stValidateProfile($d) {
     if (stNullStr($d['lastName'] ?? '')  === null) return 'Last name is required.';
     if (!in_array($d['sex'] ?? '', ['Male','Female'], true)) return 'Sex is required.';
     if (!stDate($d['birthdate'] ?? '')) return 'Birthdate is required.';
+    if (stDate($d['birthdate'] ?? '') > date('Y-m-d')) return 'Birthdate cannot be in the future.';
+    if (stDate($d['dateApplicationReceived'] ?? '') > date('Y-m-d')) return 'Date Applied cannot be in the future.';
     $validCivil = ['Single','Married','Widowed','Separated','Divorced'];
     if (!in_array($d['civilStatus'] ?? '', $validCivil, true)) return 'Civil Status is required.';
     $bgyId = (!empty($d['barangayId']) && is_numeric($d['barangayId']) && (int)$d['barangayId'] > 0)
@@ -881,8 +883,8 @@ function stInsertProfileRow($pdo, $uid, $d) {
     $appStatus = in_array($d['status'] ?? '', $validStatus, true) ? $d['status'] : 'Waitlisted';
 
     $s = $pdo->prepare(
-        "INSERT INTO beneficiaries(first_name,middle_name,last_name,sex,birth_date,civil_status,street_address,barangay_id,contact_no,status)
-         VALUES(:fn,:mn,:ln,:sex,:bdate,:civil,:street,:bgy,:contact,'Active') RETURNING beneficiary_id"
+        "INSERT INTO beneficiaries(first_name,middle_name,last_name,sex,birth_date,civil_status,street_address,barangay_id,contact_no)
+         VALUES(:fn,:mn,:ln,:sex,:bdate,:civil,:street,:bgy,:contact) RETURNING beneficiary_id"
     );
     $s->execute([
         ':fn' => trim($d['firstName']), ':mn' => stNullStr($d['middleName'] ?? ''), ':ln' => trim($d['lastName']),
@@ -985,6 +987,7 @@ function stUpdateProfile($id) {
 
     $birth = stDate($d['birthdate'] ?? '');
     if (!$birth) error('Birthdate is required.', 422);
+    if ($birth > date('Y-m-d')) error('Birthdate cannot be in the future.', 422);
 
     $validCivil = ['Single','Married','Widowed','Separated','Divorced'];
     $civil = in_array($d['civilStatus'] ?? '', $validCivil, true) ? $d['civilStatus'] : null;

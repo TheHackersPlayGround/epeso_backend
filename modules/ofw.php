@@ -353,6 +353,7 @@ function ofwValidateProfileInput($d) {
 
     $birth = ofwDate($d['birthdate'] ?? '');
     if (!$birth) error('Birthdate is required.', 422);
+    if ($birth > date('Y-m-d')) error('Birthdate cannot be in the future.', 422);
 
     $validCivil = ['Single', 'Married', 'Widowed', 'Separated', 'Divorced'];
     $civil = in_array($d['civilStatus'] ?? '', $validCivil, true) ? $d['civilStatus'] : null;
@@ -371,6 +372,7 @@ function ofwValidateProfileInput($d) {
 
     $filed = ofwDate($d['dateFiled'] ?? '');
     if (!$filed) error('Date Filed is required.', 422);
+    if ($filed > date('Y-m-d')) error('Date Filed cannot be in the future.', 422);
 
     return [$sex, $birth, $civil, $bgyId, $emp, $refNo, $filed];
 }
@@ -388,8 +390,8 @@ function ofwCreateProfile() {
         $pdo->beginTransaction();
 
         $s = $pdo->prepare(
-            "INSERT INTO beneficiaries(first_name,middle_name,last_name,suffix,sex,birth_date,civil_status,street_address,barangay_id,contact_no,email,status)
-             VALUES(:fn,:mn,:ln,:sfx,:sex,:bdate,:civil,:street,:bgy,:contact,:email,'Active') RETURNING beneficiary_id"
+            "INSERT INTO beneficiaries(first_name,middle_name,last_name,suffix,sex,birth_date,civil_status,street_address,barangay_id,contact_no,email)
+             VALUES(:fn,:mn,:ln,:sfx,:sex,:bdate,:civil,:street,:bgy,:contact,:email) RETURNING beneficiary_id"
         );
         $s->execute([
             ':fn' => trim($d['firstName']), ':mn' => ofwNullStr($d['middleName'] ?? ''), ':ln' => trim($d['lastName']),

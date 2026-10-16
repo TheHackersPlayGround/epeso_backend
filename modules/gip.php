@@ -21,6 +21,7 @@ function handle($action, $id, $method)
         case 'assignWorkplace':   requirePermission('gip','Editor'); return gipAssignWorkplace();
         case 'unassignWorkplace': requirePermission('gip','Editor'); return gipUnassignWorkplace();
         case 'completeAssignment':requirePermission('gip','Editor'); return gipCompleteAssignment();
+        case 'withdrawFromWorkplace': requirePermission('gip','Editor'); return gipWithdrawFromWorkplace();
         case 'agingReport':       requirePermission('gip','Viewer'); return gipAgingReport();
         case 'listDeleted':       requirePermission('gip','Viewer'); return gipListDeleted();
         case 'restoreRecord':     requirePermission('gip','Editor'); return gipRestoreRecord();
@@ -340,6 +341,8 @@ function gipBuildProfile($bid) {
                 'workplaceName' => $wp['workplace_name'],
                 'assignedDate'  => $gp['workplace_assigned_at'] ?? '',
                 'completedDate' => ($gp['status'] === 'Completed') ? ($gp['workplace_completed_at'] ?? '') : null,
+                'exitedAt'      => $gp['exited_at'] ?? null,
+                'exitReason'    => $gp['exit_reason'] ?? '',
             ];
         }
     }
@@ -397,6 +400,8 @@ function gipBuildProfile($bid) {
         'dateApplicationReceived' => $b['date_applied'] ?? '',
         'receivedBy'              => $b['received_by'] ?? '',
         'status'                  => $gp['status'] ?? 'Inactive',
+        'exitedAt'                => $gp['exited_at'] ?? null,
+        'exitReason'              => $gp['exit_reason'] ?? '',
         'remarks'                 => $gp['remarks'] ?? '',
     ];
 }
@@ -414,6 +419,8 @@ function gipProfileValidationError($d) {
     if (gipNullStr($d['lastName'] ?? '') === null)  return 'Last name is required.';
     if (!in_array($d['sex'] ?? '', ['Male', 'Female'], true)) return 'Sex is required.';
     if (!gipDate($d['birthdate'] ?? '')) return 'Birthdate is required.';
+    if (gipDate($d['birthdate'] ?? '') > date('Y-m-d')) return 'Birthdate cannot be in the future.';
+    if (gipDate($d['dateApplicationReceived'] ?? '') > date('Y-m-d')) return 'Date Applied cannot be in the future.';
     $bgyId = (!empty($d['barangayId']) && is_numeric($d['barangayId']) && (int) $d['barangayId'] > 0)
              ? (int) $d['barangayId'] : null;
     if (!$bgyId) return 'Barangay is required.';
@@ -445,7 +452,7 @@ function gipInsertProfileRow($pdo, $uid, $d) {
     $civil = in_array($d['civilStatus'] ?? '', $validCivil, true) ? $d['civilStatus'] : null;
     $bgyId = (int) $d['barangayId'];
 
-    $s = $pdo->prepare("INSERT INTO beneficiaries(first_name,middle_name,last_name,sex,birth_date,civil_status,street_address,barangay_id,contact_no,email,status,educational_attainment) VALUES(:fn,:mn,:ln,:sex,:bdate,:civil,:street,:bgy,:contact,:email,'Active',:educ) RETURNING beneficiary_id");
+    $s = $pdo->prepare("INSERT INTO beneficiaries(first_name,middle_name,last_name,sex,birth_date,civil_status,street_address,barangay_id,contact_no,email,educational_attainment) VALUES(:fn,:mn,:ln,:sex,:bdate,:civil,:street,:bgy,:contact,:email,:educ) RETURNING beneficiary_id");
     $s->execute([':fn'=>trim($d['firstName']),':mn'=>gipNullStr($d['middleName']??''),':ln'=>trim($d['lastName']),':sex'=>$sex,':bdate'=>$birth,':civil'=>$civil,':street'=>gipNullStr($d['streetPurok']??''),':bgy'=>$bgyId,':contact'=>gipNullStr($d['contactNumber']??''),':email'=>gipNullStr($d['email']??''),':educ'=>gipMapEducation($d['highestEducation']??'')]);
     $bid = (int) $s->fetchColumn();
 
@@ -704,6 +711,9 @@ function gipAssignWorkplace() {
     if ($gp['status'] === 'Completed') {
         error('This applicant has already completed a GIP internship and cannot be reassigned — the program is one-time only.', 409);
     }
+    if ($gp['status'] === 'Withdrawn') {
+        error('This applicant withdrew from the GIP internship and cannot be reassigned — their withdrawal stays on record.', 409);
+    }
 
     $wpS = db()->prepare("SELECT 1 FROM gip_workplaces WHERE workplace_id=:id AND deleted_at IS NULL");
     $wpS->execute([':id' => $workplaceId]);
@@ -725,6 +735,9 @@ function gipUnassignWorkplace() {
 
     // Only while still Ongoing — once completed, the assignment is history
     // and should stay on record rather than being unassigned away.
+    if ($gp['status'] === 'Withdrawn') {
+        error('This applicant was marked as withdrawn — that record cannot be unassigned.', 409);
+    }
     if ($gp['status'] !== 'Ongoing') {
         error('This assignment is already completed and cannot be unassigned — it stays on record.', 409);
     }
@@ -752,6 +765,57 @@ function gipCompleteAssignment() {
     db()->prepare("UPDATE gip_profiles SET status='Completed', workplace_completed_at=now(), updated_at=now() WHERE gip_profile_id=:gid")
         ->execute([':gid' => (int) $gp['gip_profile_id']]);
     json(['status' => 'ok', 'message' => 'Applicant marked as completed.']);
+}
+
+// Records that an applicant LEFT their workplace/office internship before it
+// finished. Unlike unassign (a correction that clears the link) this KEEPS
+// workplace_id and the assignment date, sets the status to Withdrawn and
+// stores when/why/who. Counts that look at status = 'Ongoing' (the
+// workplace's active interns) stop including them automatically. Final, like
+// Completed: GIP is a one-time program, so a withdrawn record is not reopened.
+function gipWithdrawFromWorkplace() {
+    $uid = requireLogin();
+    $d = body();
+    $bid = gipIntOrNull($d['applicantId'] ?? '');
+    if (!$bid) error('applicantId is required.', 422);
+
+    $reason = trim((string) ($d['reason'] ?? ''));
+    if ($reason === '') error('A reason is required.', 422);
+    if (mb_strlen($reason) > 500) error('Reason must be 500 characters or fewer.', 422);
+
+    $date = gipDate($d['exitDate'] ?? '') ?: date('Y-m-d');
+    if ($date > date('Y-m-d')) error('The date left cannot be in the future.', 422);
+
+    $q = db()->prepare(
+        "SELECT gp.gip_profile_id, gp.status, gp.workplace_id, gp.workplace_assigned_at,
+                w.workplace_name, b.first_name, b.last_name
+         FROM gip_profiles gp
+         JOIN beneficiary_services bs ON bs.beneficiary_service_id = gp.beneficiary_service_id
+         JOIN beneficiaries b ON b.beneficiary_id = bs.beneficiary_id
+         LEFT JOIN gip_workplaces w ON w.workplace_id = gp.workplace_id
+         WHERE bs.beneficiary_id = :bid AND bs.service_id = :sid AND b.deleted_at IS NULL
+         ORDER BY gp.gip_profile_id DESC LIMIT 1"
+    );
+    $q->execute([':bid' => $bid, ':sid' => gipServiceId()]);
+    $r = $q->fetch();
+    if (!$r) error('GIP profile not found.', 404);
+    if ((string) $r['status'] === 'Withdrawn') error('This applicant is already marked as withdrawn.', 409);
+    if (!$r['workplace_id'] || (string) $r['status'] !== 'Ongoing') {
+        error('Only an applicant currently interning at a workplace/office can be withdrawn.', 409);
+    }
+    if (!empty($r['workplace_assigned_at']) && $date < substr($r['workplace_assigned_at'], 0, 10)) {
+        error('The date left cannot be before the applicant was assigned to the workplace/office.', 422);
+    }
+
+    db()->prepare(
+        "UPDATE gip_profiles
+         SET status='Withdrawn', exited_at=:at, exit_reason=:why, exited_by=:uid, updated_at=now()
+         WHERE gip_profile_id=:gid"
+    )->execute([':at' => $date . ' 00:00:00', ':why' => $reason, ':uid' => $uid, ':gid' => (int) $r['gip_profile_id']]);
+
+    logActivity($uid, 'Withdraw Applicant', 'gip',
+        "Marked {$r['last_name']}, {$r['first_name']} as withdrawn from \"{$r['workplace_name']}\" (left {$date}): {$reason}");
+    json(['status' => 'ok', 'message' => 'Applicant marked as withdrawn.']);
 }
 
 // ─── Documents (applicant) ────────────────────────────────────────────────────

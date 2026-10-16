@@ -80,7 +80,7 @@ function authLogin()
 
     $stmt = db()->prepare(
         "SELECT user_id, first_name, last_name, username, password_hash, role, status, last_login
-         FROM users WHERE username = :u"
+         FROM users WHERE username = :u AND (to_jsonb(users)->>'deleted_at') IS NULL"
     );
     $stmt->execute([':u' => $username]);
     $user = $stmt->fetch();
@@ -126,7 +126,7 @@ function authMe()
     }
 
     $stmt = db()->prepare(
-        "SELECT user_id, first_name, last_name, username, role, status, last_login
+        "SELECT user_id, first_name, last_name, username, role, status, last_login, to_jsonb(users)->>'deleted_at' AS deleted_at
          FROM users WHERE user_id = :id"
     );
     $stmt->execute([':id' => $_SESSION['user_id']]);
@@ -136,6 +136,13 @@ function authMe()
         // Session points at a user that no longer exists.
         session_destroy();
         error('Not authenticated.', 401);
+    }
+
+    // Deactivated by an administrator while signed in: end the session and say why
+    // (the app shows an "account deactivated" notice instead of a generic error).
+    if ($user['status'] !== 'Active' || $user['deleted_at'] !== null) {
+        session_destroy();
+        error('Your account has been deactivated.', 401, ['code' => 'ACCOUNT_DEACTIVATED']);
     }
 
     $pub = publicUser($user);
@@ -308,7 +315,7 @@ function authForgotQuestions()
         "SELECT a.question_1_id, a.question_2_id, a.question_3_id
          FROM users u
          JOIN admin_security_answers a ON a.user_id = u.user_id
-         WHERE u.username = :u AND u.role = 'Administrator' AND u.status = 'Active'"
+         WHERE u.username = :u AND u.role = 'Administrator' AND u.status = 'Active' AND (to_jsonb(u)->>'deleted_at') IS NULL"
     );
     $stmt->execute([':u' => $username]);
     $row = $stmt->fetch();
@@ -342,7 +349,7 @@ function authForgotVerify()
         "SELECT a.answer_1_hash, a.answer_2_hash, a.answer_3_hash
          FROM users u
          JOIN admin_security_answers a ON a.user_id = u.user_id
-         WHERE u.username = :u AND u.role = 'Administrator' AND u.status = 'Active'"
+         WHERE u.username = :u AND u.role = 'Administrator' AND u.status = 'Active' AND (to_jsonb(u)->>'deleted_at') IS NULL"
     );
     $stmt->execute([':u' => $username]);
     $row = $stmt->fetch();
@@ -379,7 +386,7 @@ function authForgotReset()
         "SELECT u.user_id, a.answer_1_hash, a.answer_2_hash, a.answer_3_hash
          FROM users u
          JOIN admin_security_answers a ON a.user_id = u.user_id
-         WHERE u.username = :u AND u.role = 'Administrator' AND u.status = 'Active'"
+         WHERE u.username = :u AND u.role = 'Administrator' AND u.status = 'Active' AND (to_jsonb(u)->>'deleted_at') IS NULL"
     );
     $stmt->execute([':u' => $username]);
     $row = $stmt->fetch();

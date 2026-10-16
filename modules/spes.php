@@ -21,6 +21,7 @@ function handle($action, $id, $method)
         case 'deleteProfile':     requirePermission('spes','Editor'); return spesDeleteProfile($id);
         case 'assignBatch':       requirePermission('spes','Editor'); return spesAssignBatch();
         case 'unassignBatch':     requirePermission('spes','Editor'); return spesUnassignBatch();
+        case 'withdrawFromBatch': requirePermission('spes','Editor'); return spesWithdrawFromBatch();
         case 'listDeleted':       requirePermission('spes','Viewer'); return spesListDeleted();
         case 'restoreRecord':     requirePermission('spes','Editor'); return spesRestoreRecord();
         case 'purgeRecord':       requirePermission('spes','Editor'); return spesPurgeRecord();
@@ -97,7 +98,7 @@ function spesFormatBytes($bytes) {
 
 function spesListBatches() {
     $s = db()->query(
-        "SELECT b.*, (SELECT COUNT(*) FROM spes_profiles sp WHERE sp.batch_id = b.batch_id) AS assigned_count
+        "SELECT b.*, (SELECT COUNT(*) FROM spes_profiles sp WHERE sp.batch_id = b.batch_id AND sp.status::text <> 'Withdrawn') AS assigned_count
          FROM spes_batches b
          WHERE b.deleted_at IS NULL
          ORDER BY b.created_at DESC, b.batch_id DESC"
@@ -107,7 +108,7 @@ function spesListBatches() {
 
 function spesGetBatchById($id) {
     $s = db()->prepare(
-        "SELECT b.*, (SELECT COUNT(*) FROM spes_profiles sp WHERE sp.batch_id = b.batch_id) AS assigned_count
+        "SELECT b.*, (SELECT COUNT(*) FROM spes_profiles sp WHERE sp.batch_id = b.batch_id AND sp.status::text <> 'Withdrawn') AS assigned_count
          FROM spes_batches b WHERE b.batch_id = :id"
     );
     $s->execute([':id' => $id]);
@@ -417,6 +418,8 @@ function spesBuildProfile($bid) {
         'dateApplicationReceived' => $b['date_applied'] ?? '',
         'receivedBy'              => $b['received_by'] ?? '',
         'status'                  => $sp['status'] ?? 'Inactive',
+        'exitedAt'                => $sp['exited_at'] ?? null,
+        'exitReason'              => $sp['exit_reason'] ?? '',
         'remarks'                 => $sp['remarks'] ?? '',
     ];
 }
@@ -434,6 +437,8 @@ function spesProfileValidationError($d) {
     if (spesNullStr($d['lastName'] ?? '') === null)  return 'Last name is required.';
     if (!in_array($d['sex'] ?? '', ['Male', 'Female'], true)) return 'Sex is required.';
     if (!spesDate($d['birthdate'] ?? '')) return 'Birthdate is required.';
+    if (spesDate($d['birthdate'] ?? '') > date('Y-m-d')) return 'Birthdate cannot be in the future.';
+    if (spesDate($d['dateApplicationReceived'] ?? '') > date('Y-m-d')) return 'Date Applied cannot be in the future.';
     $bgyId = (!empty($d['barangayId']) && is_numeric($d['barangayId']) && (int) $d['barangayId'] > 0)
              ? (int) $d['barangayId'] : null;
     if (!$bgyId) return 'Barangay is required.';
@@ -462,7 +467,7 @@ function spesInsertProfileRow($pdo, $uid, $d) {
     $civil = in_array($d['civilStatus'] ?? '', $validCivil, true) ? $d['civilStatus'] : null;
     $bgyId = (int) $d['barangayId'];
 
-    $s = $pdo->prepare("INSERT INTO beneficiaries(first_name,middle_name,last_name,sex,birth_date,civil_status,street_address,barangay_id,contact_no,email,status) VALUES(:fn,:mn,:ln,:sex,:bdate,:civil,:street,:bgy,:contact,:email,'Active') RETURNING beneficiary_id");
+    $s = $pdo->prepare("INSERT INTO beneficiaries(first_name,middle_name,last_name,sex,birth_date,civil_status,street_address,barangay_id,contact_no,email) VALUES(:fn,:mn,:ln,:sex,:bdate,:civil,:street,:bgy,:contact,:email) RETURNING beneficiary_id");
     $s->execute([':fn'=>trim($d['firstName']),':mn'=>spesNullStr($d['middleName']??''),':ln'=>trim($d['lastName']),':sex'=>$sex,':bdate'=>$birth,':civil'=>$civil,':street'=>spesNullStr($d['streetPurok']??''),':bgy'=>$bgyId,':contact'=>spesNullStr($d['contactNumber']??''),':email'=>spesNullStr($d['email']??'')]);
     $bid = (int) $s->fetchColumn();
 
@@ -685,7 +690,7 @@ function spesAssignBatch() {
     if (!$batch) error('Batch not found.', 404);
     if ($batch['status'] !== 'Planned') error('Only Planned batches can be assigned.', 409);
 
-    $cntS = db()->prepare("SELECT COUNT(*) FROM spes_profiles WHERE batch_id=:id AND spes_profile_id != :spid");
+    $cntS = db()->prepare("SELECT COUNT(*) FROM spes_profiles WHERE batch_id=:id AND spes_profile_id != :spid AND status::text <> 'Withdrawn'");
     $cntS->execute([':id' => $batchId, ':spid' => $spId]);
     $current = (int) $cntS->fetchColumn();
     if ($current >= (int) $batch['available_slots']) {
@@ -726,6 +731,63 @@ function spesUnassignBatch() {
     db()->prepare("UPDATE spes_profiles SET batch_id=NULL, status='Inactive', batch_assigned_at=NULL, updated_at=now() WHERE spes_profile_id=:spid")
         ->execute([':spid' => (int) $r['spes_profile_id']]);
     json(['status' => 'ok', 'message' => 'Applicant unassigned from batch.']);
+}
+
+// Records that an applicant LEFT an already-started batch early. Unlike
+// unassign (a correction, only possible while the batch is still Planned, and
+// it clears the link), this KEEPS batch_id so the history survives, sets the
+// status to Withdrawn and stores when/why/who. Only meaningful once the batch
+// is Ongoing: while Planned nobody has started, so Unassign is the right tool.
+// Batch completion only flips 'Active' people to 'Completed', so a withdrawn
+// applicant is never counted as having completed.
+function spesWithdrawFromBatch() {
+    $uid = requireLogin();
+    $d = body();
+    $bid = spesIntOrNull($d['applicantId'] ?? '');
+    if (!$bid) error('applicantId is required.', 422);
+
+    $reason = trim((string) ($d['reason'] ?? ''));
+    if ($reason === '') error('A reason is required.', 422);
+    if (mb_strlen($reason) > 500) error('Reason must be 500 characters or fewer.', 422);
+
+    $date = spesDate($d['exitDate'] ?? '') ?: date('Y-m-d');
+    if ($date > date('Y-m-d')) error('The date left cannot be in the future.', 422);
+
+    $q = db()->prepare(
+        "SELECT sp.spes_profile_id, sp.status, sp.batch_id, sp.batch_assigned_at,
+                spb.status AS batch_status, spb.batch_name,
+                b.first_name, b.last_name
+         FROM spes_profiles sp
+         JOIN beneficiary_services bs ON bs.beneficiary_service_id = sp.beneficiary_service_id
+         JOIN beneficiaries b ON b.beneficiary_id = bs.beneficiary_id
+         LEFT JOIN spes_batches spb ON spb.batch_id = sp.batch_id
+         WHERE bs.beneficiary_id = :bid AND bs.service_id = :sid AND b.deleted_at IS NULL
+         ORDER BY sp.spes_profile_id DESC LIMIT 1"
+    );
+    $q->execute([':bid' => $bid, ':sid' => spesServiceId()]);
+    $r = $q->fetch();
+    if (!$r || !$r['spes_profile_id']) error('SPES profile not found.', 404);
+    if (!$r['batch_id']) error('This applicant is not assigned to a batch.', 409);
+    if ((string) $r['status'] === 'Withdrawn') error('This applicant is already marked as withdrawn.', 409);
+    if ($r['batch_status'] !== 'Ongoing') {
+        error($r['batch_status'] === 'Planned'
+            ? 'This batch has not started yet. Unassign the applicant instead.'
+            : 'This batch is already completed, so the applicant can no longer be withdrawn.', 409);
+    }
+    if ((string) $r['status'] !== 'Active') error('Only an applicant currently active in the batch can be withdrawn.', 409);
+    if (!empty($r['batch_assigned_at']) && $date < substr($r['batch_assigned_at'], 0, 10)) {
+        error('The date left cannot be before the applicant was assigned to the batch.', 422);
+    }
+
+    db()->prepare(
+        "UPDATE spes_profiles
+         SET status='Withdrawn', exited_at=:at, exit_reason=:why, exited_by=:uid, updated_at=now()
+         WHERE spes_profile_id=:spid"
+    )->execute([':at' => $date . ' 00:00:00', ':why' => $reason, ':uid' => $uid, ':spid' => (int) $r['spes_profile_id']]);
+
+    logActivity($uid, 'Withdraw Applicant', 'spes',
+        "Marked {$r['last_name']}, {$r['first_name']} as withdrawn from batch \"{$r['batch_name']}\" (left {$date}): {$reason}");
+    json(['status' => 'ok', 'message' => 'Applicant marked as withdrawn.']);
 }
 
 // ─── Documents (applicant) ────────────────────────────────────────────────────

@@ -100,6 +100,7 @@ function jpValidateInput($d) {
     if ($employer === '') error('Employer is required.', 422);
     $hired = jpDate($d['dateHired'] ?? '');
     if (!$hired) error('Date hired is required.', 422);
+    if ($hired > date('Y-m-d')) error('Date hired cannot be in the future.', 422);
     return [$title, $employer, $hired];
 }
 

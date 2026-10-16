@@ -10,12 +10,39 @@ function currentUserId()
     return isset($_SESSION['user_id']) ? (int) $_SESSION['user_id'] : null;
 }
 
-// Stop the request unless someone is logged in. Returns the user id.
-function requireLogin()
+// Session-only check: is there a logged-in session? No database access, so it
+// is safe for the few read-only endpoints that must keep working while the
+// database is mid-restore (see requireAdminSessionOnly()).
+function requireSession()
 {
     $id = currentUserId();
     if (!$id) {
         error('Not authenticated.', 401);
+    }
+    return $id;
+}
+
+// Stop the request unless someone is logged in AND their account is still
+// Active. An administrator setting a user to Inactive (or deleting them) must
+// take effect on the very next request, not only at their next login -- the
+// session they already hold would otherwise stay valid. The detail code lets
+// the app show "your account has been deactivated" instead of a generic error.
+// Returns the user id.
+function requireLogin()
+{
+    $id = requireSession();
+    $stmt = db()->prepare("SELECT status, to_jsonb(users)->>'deleted_at' AS deleted_at FROM users WHERE user_id = :id");
+    $stmt->execute([':id' => $id]);
+    $row = $stmt->fetch();
+    if (!$row) {
+        // The account no longer exists.
+        session_destroy();
+        error('Not authenticated.', 401);
+    }
+    // Deactivated, or deleted (soft-deleted -> in the Recycle Bin).
+    if ($row['status'] !== 'Active' || $row['deleted_at'] !== null) {
+        session_destroy();
+        error('Your account has been deactivated.', 401, ['code' => 'ACCOUNT_DEACTIVATED']);
     }
     return $id;
 }
@@ -45,7 +72,7 @@ function requireAdmin()
 // admin-gated action still uses the live, DB-backed requireAdmin() above.
 function requireAdminSessionOnly()
 {
-    $id = requireLogin();
+    $id = requireSession();
     if (($_SESSION['role'] ?? null) !== 'Administrator') {
         error('Administrator access required.', 403);
     }

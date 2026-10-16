@@ -39,6 +39,7 @@ function handle($action, $id, $method)
         case 'deleteProfile':       requirePermission('livelihood','Editor'); return slpDeleteProfile($id);
         case 'assignProject':       requirePermission('livelihood','Editor'); return slpAssignProject();
         case 'unassignProject':     requirePermission('livelihood','Editor'); return slpUnassignProject();
+        case 'withdrawFromProject': requirePermission('livelihood','Editor'); return slpWithdrawFromProject();
         case 'updateAssessmentResult': requirePermission('livelihood','Editor'); return slpUpdateAssessmentResult();
         case 'listDeleted':         requirePermission('livelihood','Viewer'); return slpListDeleted();
         case 'restoreRecord':       requirePermission('livelihood','Editor'); return slpRestoreRecord();
@@ -122,7 +123,7 @@ function slpClassificationToSector($classification) {
 
 function slpListProjects() {
     $s = db()->query(
-        "SELECT p.*, (SELECT COUNT(*) FROM slp_project_beneficiaries pb WHERE pb.project_id = p.project_id) AS assigned_count
+        "SELECT p.*, (SELECT COUNT(*) FROM slp_project_beneficiaries pb WHERE pb.project_id = p.project_id AND pb.exited_at IS NULL) AS assigned_count
          FROM slp_projects p
          WHERE p.deleted_at IS NULL
          ORDER BY p.created_at DESC, p.project_id DESC"
@@ -132,7 +133,7 @@ function slpListProjects() {
 
 function slpGetProjectById($id) {
     $s = db()->prepare(
-        "SELECT p.*, (SELECT COUNT(*) FROM slp_project_beneficiaries pb WHERE pb.project_id = p.project_id) AS assigned_count
+        "SELECT p.*, (SELECT COUNT(*) FROM slp_project_beneficiaries pb WHERE pb.project_id = p.project_id AND pb.exited_at IS NULL) AS assigned_count
          FROM slp_projects p WHERE p.project_id = :id"
     );
     $s->execute([':id' => $id]);
@@ -261,7 +262,7 @@ function slpRefreshDerivedStatusForProject($projectId, $projectStatus) {
     db()->prepare(
         "UPDATE slp_profiles SET status=:st, updated_at=now()
          WHERE beneficiary_service_id IN (
-           SELECT beneficiary_service_id FROM slp_project_beneficiaries WHERE project_id=:pid
+           SELECT beneficiary_service_id FROM slp_project_beneficiaries WHERE project_id=:pid AND exited_at IS NULL
          )"
     )->execute([':st' => $derived, ':pid' => $projectId]);
 }
@@ -342,7 +343,7 @@ function slpBuildProfile($bid) {
     // Current assignment = most recently assigned row; older rows survive as
     // history rather than being deleted on reassignment (same rule as TUPAD).
     $histS = db()->prepare(
-        "SELECT pb.project_id, pb.assigned_at, pr.project_name, pr.status
+        "SELECT pb.*, pr.project_name, pr.status
          FROM slp_project_beneficiaries pb
          JOIN slp_projects pr ON pr.project_id = pb.project_id
          WHERE pb.beneficiary_service_id = :bsid
@@ -357,7 +358,9 @@ function slpBuildProfile($bid) {
             'projectId'     => (int) $h['project_id'],
             'projectName'   => $h['project_name'],
             'assignedDate'  => $h['assigned_at'],
-            'completedDate' => $h['status'] === 'Completed' ? $h['assigned_at'] : null,
+            'completedDate' => ($h['status'] === 'Completed' && empty($h['exited_at'])) ? $h['assigned_at'] : null,
+            'exitedAt'      => $h['exited_at'] ?? null,
+            'exitReason'    => $h['exit_reason'] ?? '',
         ];
     }, $history);
 
@@ -424,6 +427,8 @@ function slpBuildProfile($bid) {
         'assignedSlpProjectId'        => $current ? (int) $current['project_id'] : null,
         'projectName'                 => $current['project_name'] ?? '',
         'assignedProjectStatus'       => $current['status'] ?? '',
+        'exitedAt'                    => $current['exited_at'] ?? null,
+        'exitReason'                  => $current['exit_reason'] ?? '',
         'assignmentHistory'           => $assignmentHistory,
         'attachedDocuments'           => slpFetchSavedDocuments($bid),
         'dateApplied'                 => $b['bs_date_applied'] ?? '',
@@ -444,6 +449,8 @@ function slpProfileValidationError($d) {
     if (slpNullStr($d['lastName'] ?? '') === null)  return 'Last name is required.';
     if (!in_array($d['sex'] ?? '', ['Male', 'Female'], true)) return 'Sex is required.';
     if (!slpDate($d['birthdate'] ?? '')) return 'Birthdate is required.';
+    if (slpDate($d['birthdate'] ?? '') > date('Y-m-d')) return 'Birthdate cannot be in the future.';
+    if (slpDate($d['dateApplied'] ?? '') > date('Y-m-d')) return 'Date Applied cannot be in the future.';
     // Civil status enum is Single/Married/Widowed/Separated/Divorced -- the
     // form's dropdown currently shows "Annulled" instead of "Divorced",
     // which does not exist as a value; treated as invalid/blank here so it
@@ -542,8 +549,8 @@ function slpInsertProfileRow($pdo, $uid, $d) {
     $edu = in_array($d['educationalAttainment'] ?? '', $validEdu, true) ? $d['educationalAttainment'] : null;
 
     $s = $pdo->prepare(
-        "INSERT INTO beneficiaries(first_name,middle_name,last_name,suffix,sex,birth_date,civil_status,street_address,barangay_id,contact_no,email,is_4ps_beneficiary,educational_attainment,status)
-         VALUES(:fn,:mn,:ln,:sfx,:sex,:bdate,:civil,:street,:bgy,:contact,:email,:is4ps,:edu,'Active') RETURNING beneficiary_id"
+        "INSERT INTO beneficiaries(first_name,middle_name,last_name,suffix,sex,birth_date,civil_status,street_address,barangay_id,contact_no,email,is_4ps_beneficiary,educational_attainment)
+         VALUES(:fn,:mn,:ln,:sfx,:sex,:bdate,:civil,:street,:bgy,:contact,:email,:is4ps,:edu) RETURNING beneficiary_id"
     );
     $s->execute([
         ':fn' => trim($d['firstName']), ':mn' => slpNullStr($d['middleName'] ?? ''), ':ln' => trim($d['lastName']),
@@ -707,7 +714,7 @@ function slpDeleteProfile($id) {
     // Cannot delete a beneficiary whose most recent assignment is to a
     // non-completed project -- unassign first, same lock spirit as TUPAD.
     $chk = db()->prepare(
-        "SELECT pr.status
+        "SELECT CASE WHEN pb.exited_at IS NULL THEN pr.status::text ELSE 'Withdrawn' END
          FROM beneficiary_services bs
          JOIN slp_project_beneficiaries pb ON pb.beneficiary_service_id = bs.beneficiary_service_id
          JOIN slp_projects pr ON pr.project_id = pb.project_id
@@ -765,7 +772,7 @@ function slpUpdateAssessmentResult() {
 
     if ($result === 'Not Qualified') {
         $curS = db()->prepare(
-            "SELECT pr.status
+            "SELECT CASE WHEN pb.exited_at IS NULL THEN pr.status::text ELSE 'Withdrawn' END
              FROM slp_project_beneficiaries pb
              JOIN slp_projects pr ON pr.project_id = pb.project_id
              WHERE pb.beneficiary_service_id=:bsid
@@ -852,7 +859,7 @@ function slpUnassignProject() {
     if (!$bid) error('applicantId is required.', 422);
 
     $row = db()->prepare(
-        "SELECT pb.project_beneficiary_id, pb.beneficiary_service_id, pr.status AS project_status
+        "SELECT pb.project_beneficiary_id, pb.beneficiary_service_id, pb.exited_at, pr.status AS project_status
          FROM beneficiary_services bs
          JOIN slp_project_beneficiaries pb ON pb.beneficiary_service_id = bs.beneficiary_service_id
          JOIN slp_projects pr ON pr.project_id = pb.project_id
@@ -862,6 +869,7 @@ function slpUnassignProject() {
     $row->execute([':bid' => $bid, ':sid' => slpServiceId()]);
     $r = $row->fetch();
     if (!$r) error('This beneficiary is not currently assigned to a project.', 404);
+    if (!empty($r['exited_at'])) error('This beneficiary was marked as withdrawn from this project -- that record cannot be unassigned.', 409);
 
     if ($r['project_status'] !== 'Planned') {
         error('This project is no longer Planned -- unassigning would erase the only record of this assignment.', 409);
@@ -884,6 +892,73 @@ function slpUnassignProject() {
     }
 
     json(['status' => 'ok', 'message' => 'Beneficiary unassigned from project.']);
+}
+
+// Records that a beneficiary LEFT an already-started project early. Unlike
+// unassign (a correction, only while the project is still Planned, which
+// deletes the link), this KEEPS the assignment row and marks it with when/why/
+// who, and sets the stored profile status to Withdrawn. The project-status
+// cascade skips exited rows, so completing the project never turns them into
+// Completed. Only meaningful for an Ongoing project.
+function slpWithdrawFromProject() {
+    $uid = requireLogin();
+    $d = body();
+    $bid = slpIntOrNull($d['applicantId'] ?? '');
+    if (!$bid) error('applicantId is required.', 422);
+
+    $reason = trim((string) ($d['reason'] ?? ''));
+    if ($reason === '') error('A reason is required.', 422);
+    if (mb_strlen($reason) > 500) error('Reason must be 500 characters or fewer.', 422);
+
+    $date = slpDate($d['exitDate'] ?? '') ?: date('Y-m-d');
+    if ($date > date('Y-m-d')) error('The date left cannot be in the future.', 422);
+
+    $q = db()->prepare(
+        "SELECT pb.project_beneficiary_id, pb.beneficiary_service_id, pb.assigned_at, pb.exited_at,
+                pr.status AS project_status, pr.project_name,
+                b.first_name, b.last_name
+         FROM beneficiary_services bs
+         JOIN beneficiaries b ON b.beneficiary_id = bs.beneficiary_id
+         JOIN slp_project_beneficiaries pb ON pb.beneficiary_service_id = bs.beneficiary_service_id
+         JOIN slp_projects pr ON pr.project_id = pb.project_id
+         WHERE bs.beneficiary_id = :bid AND bs.service_id = :sid AND b.deleted_at IS NULL
+         ORDER BY pb.assigned_at DESC, pb.project_beneficiary_id DESC LIMIT 1"
+    );
+    $q->execute([':bid' => $bid, ':sid' => slpServiceId()]);
+    $r = $q->fetch();
+    if (!$r) error('This beneficiary is not currently assigned to a project.', 404);
+    if (!empty($r['exited_at'])) error('This beneficiary is already marked as withdrawn.', 409);
+    if ($r['project_status'] !== 'Ongoing') {
+        error($r['project_status'] === 'Planned'
+            ? 'This project has not started yet. Unassign the beneficiary instead.'
+            : 'This project is no longer ongoing, so the beneficiary cannot be withdrawn.', 409);
+    }
+    if ($date < substr($r['assigned_at'], 0, 10)) {
+        error('The date left cannot be before the beneficiary was assigned to the project.', 422);
+    }
+
+    $pdo = db();
+    try {
+        $pdo->beginTransaction();
+
+        $pdo->prepare(
+            "UPDATE slp_project_beneficiaries
+             SET exited_at=:at, exit_reason=:why, exited_by=:uid
+             WHERE project_beneficiary_id=:id"
+        )->execute([':at' => $date . ' 00:00:00', ':why' => $reason, ':uid' => $uid, ':id' => (int) $r['project_beneficiary_id']]);
+
+        $pdo->prepare("UPDATE slp_profiles SET status='Withdrawn', updated_at=now() WHERE beneficiary_service_id=:bsid")
+            ->execute([':bsid' => (int) $r['beneficiary_service_id']]);
+
+        $pdo->commit();
+    } catch (Throwable $e) {
+        if ($pdo->inTransaction()) $pdo->rollBack();
+        error('Failed to record the withdrawal: ' . $e->getMessage(), 500);
+    }
+
+    logActivity($uid, 'Withdraw Beneficiary', 'livelihood',
+        "Marked {$r['last_name']}, {$r['first_name']} as withdrawn from project \"{$r['project_name']}\" (left {$date}): {$reason}");
+    json(['status' => 'ok', 'message' => 'Beneficiary marked as withdrawn.']);
 }
 
 // ─── Documents (applicant) ────────────────────────────────────────────────────

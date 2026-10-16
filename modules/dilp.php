@@ -404,6 +404,8 @@ function dilpProfileValidationError($d) {
     if (dilpNullStr($d['lastName'] ?? '') === null)  return 'Last name is required.';
     if (!in_array($d['sex'] ?? '', ['Male', 'Female'], true)) return 'Sex is required.';
     if (!dilpDate($d['birthdate'] ?? '')) return 'Birthdate is required.';
+    if (dilpDate($d['birthdate'] ?? '') > date('Y-m-d')) return 'Birthdate cannot be in the future.';
+    if (dilpDate($d['dateApplied'] ?? '') > date('Y-m-d')) return 'Date Applied cannot be in the future.';
     $validCivil = ['Single', 'Married', 'Widowed', 'Separated', 'Annulled'];
     if (!in_array($d['civilStatus'] ?? '', $validCivil, true)) return 'Civil status is required.';
     $bgyId = (!empty($d['barangayId']) && is_numeric($d['barangayId']) && (int) $d['barangayId'] > 0)
@@ -434,8 +436,8 @@ function dilpInsertProfileRow($pdo, $uid, $d) {
     $is4Ps = !empty($d['is4PsBeneficiary']);
 
     $s = $pdo->prepare(
-        "INSERT INTO beneficiaries(first_name,middle_name,last_name,suffix,sex,birth_date,civil_status,street_address,barangay_id,contact_no,email,is_4ps_beneficiary,year_graduated_4ps,status)
-         VALUES(:fn,:mn,:ln,:sfx,:sex,:bdate,:civil,:street,:bgy,:contact,:email,:is4ps,:ygrad,'Active') RETURNING beneficiary_id"
+        "INSERT INTO beneficiaries(first_name,middle_name,last_name,suffix,sex,birth_date,civil_status,street_address,barangay_id,contact_no,email,is_4ps_beneficiary,year_graduated_4ps)
+         VALUES(:fn,:mn,:ln,:sfx,:sex,:bdate,:civil,:street,:bgy,:contact,:email,:is4ps,:ygrad) RETURNING beneficiary_id"
     );
     $s->execute([
         ':fn' => trim($d['firstName']), ':mn' => dilpNullStr($d['middleName'] ?? ''), ':ln' => trim($d['lastName']),

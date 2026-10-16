@@ -351,6 +351,9 @@ function employmentValidateApplicant($d)
     if (efDateOrNull($d['dateOfBirth'] ?? '') === null) {
         return 'Date of Birth is not a valid date.';
     }
+    if (efDateOrNull($d['dateOfBirth'] ?? '') > date('Y-m-d')) {
+        return 'Date of Birth cannot be in the future.';
+    }
     // barangay_id is required by the DB and comes from the address combobox.
     if (!isset($d['barangayId']) || !is_numeric($d['barangayId'])) {
         return 'Please select a barangay from the dropdown.';
@@ -369,10 +372,10 @@ function employmentInsertBeneficiary($pdo, $d)
     $stmt = $pdo->prepare(
         "INSERT INTO beneficiaries
             (first_name, middle_name, last_name, suffix, sex, birth_date, civil_status,
-             street_address, barangay_id, contact_no, email, is_4ps_beneficiary, status, educational_attainment)
+             street_address, barangay_id, contact_no, email, is_4ps_beneficiary, educational_attainment)
          VALUES
             (:first, :middle, :last, :suffix, :sex, :bdate, :civil,
-             :street, :bgy, :contact, :email, :is4ps, 'Active', :educ)
+             :street, :bgy, :contact, :email, :is4ps, :educ)
          RETURNING beneficiary_id"
     );
     $stmt->execute([
@@ -1458,6 +1461,7 @@ function efValidateEmployer($d)
     if (efNull($d['contactNumber']    ?? '') === null) return 'Contact number is required.';
     if (efNull($d['dateRegistered']   ?? '') === null) return 'Date registered is required.';
     if (efDateOrNull($d['dateRegistered'] ?? '') === null) return 'Invalid date registered format.';
+    if (efDateOrNull($d['dateRegistered'] ?? '') > date('Y-m-d')) return 'Date registered cannot be in the future.';
     return '';
 }
 
@@ -2290,6 +2294,7 @@ function efUpdatePlacement($id)
     $d = body();
 
     if (efNull($d['dateHired'] ?? '') === null) error('Date hired is required.', 422);
+    if (efDateOrNull($d['dateHired'] ?? '') > date('Y-m-d')) error('Date hired cannot be in the future.', 422);
 
     $validStatus = ['Active', 'Resigned', 'Terminated', 'Completed'];
     $status = in_array($d['status'] ?? '', $validStatus, true) ? $d['status'] : 'Active';

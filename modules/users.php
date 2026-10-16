@@ -88,7 +88,7 @@ function usersList()
 {
     $users = db()->query(
         "SELECT user_id, first_name, last_name, username, role, status, last_login
-         FROM users ORDER BY user_id"
+         FROM users WHERE deleted_at IS NULL ORDER BY user_id"
     )->fetchAll();
 
     // Pull every user's permissions in one query, then group by user.
@@ -153,7 +153,7 @@ function usersCreate()
     }
 
     // Username must be unique.
-    $check = db()->prepare("SELECT 1 FROM users WHERE username = :u");
+    $check = db()->prepare("SELECT 1 FROM users WHERE username = :u AND deleted_at IS NULL");
     $check->execute([':u' => $username]);
     if ($check->fetch()) {
         error('That username is already taken.', 409);
@@ -248,7 +248,7 @@ function usersUpdate($id)
     }
 
     // Username must be unique among OTHER users.
-    $check = db()->prepare("SELECT 1 FROM users WHERE username = :u AND user_id <> :id");
+    $check = db()->prepare("SELECT 1 FROM users WHERE username = :u AND user_id <> :id AND deleted_at IS NULL");
     $check->execute([':u' => $username, ':id' => $id]);
     if ($check->fetch()) {
         error('That username is already taken.', 409);
@@ -315,11 +315,17 @@ function usersDelete($id)
         error('A valid user id is required.', 422);
     }
 
-    $stmt = db()->prepare("SELECT username, role, status FROM users WHERE user_id = :id");
+    $stmt = db()->prepare("SELECT username, role, status FROM users WHERE user_id = :id AND deleted_at IS NULL");
     $stmt->execute([':id' => $id]);
     $user = $stmt->fetch();
     if (!$user) {
         error('User not found.', 404);
+    }
+
+    // Deleting your own account would sign you out mid-action; ask another
+    // administrator to do it.
+    if ($id === (int) currentUserId()) {
+        error('You cannot delete your own account.', 409);
     }
 
     // Only a true Administrator may delete an Administrator account.
@@ -332,16 +338,20 @@ function usersDelete($id)
         error('Cannot delete the last administrator account.', 409);
     }
 
-    $pdo = db();
-    $pdo->beginTransaction();
-    try {
-        $pdo->prepare("DELETE FROM user_permissions WHERE user_id = :id")->execute([':id' => $id]);
-        $pdo->prepare("DELETE FROM users WHERE user_id = :id")->execute([':id' => $id]);
-        $pdo->commit();
-    } catch (Throwable $e) {
-        $pdo->rollBack();
-        error('Could not delete user.', 500, $e->getMessage());
-    }
+    // Soft delete: the row (and their permission rows) stay so every record
+    // that points at this user keeps pointing at a real person. There is
+    // deliberately NO restore or purge in the app -- to everyone using the
+    // system it behaves like a hard delete, and the row only records who
+    // deleted it and when. requireLogin() refuses a deleted account on the
+    // very next request, so any open session ends.
+    // The username is renamed to "<name> (deleted #<id>)": it frees the name for a
+    // new account and keeps old log / "uploaded by" entries unmistakable (they
+    // would otherwise read exactly like the new account's). username is
+    // varchar(50), so the original is trimmed to leave room for the suffix.
+    $suffix  = " (deleted #{$id})";
+    $renamed = mb_substr($user['username'], 0, max(1, 50 - mb_strlen($suffix))) . $suffix;
+    db()->prepare("UPDATE users SET username = :name, deleted_at = now(), deleted_by = :by, updated_at = now() WHERE user_id = :id")
+        ->execute([':name' => $renamed, ':by' => currentUserId(), ':id' => $id]);
 
     logActivity(currentUserId(), 'Delete User', 'security', "Deleted user: {$user['username']} ({$user['role']})", 'Success');
     json(['status' => 'ok', 'message' => 'User deleted.']);
@@ -460,7 +470,7 @@ function allPermissionNames()
 
 function countAdmins()
 {
-    return (int) db()->query("SELECT count(*) FROM users WHERE role = 'Administrator' AND status = 'Active'")->fetchColumn();
+    return (int) db()->query("SELECT count(*) FROM users WHERE role = 'Administrator' AND status = 'Active' AND deleted_at IS NULL")->fetchColumn();
 }
 
 // Block changes that would remove the last active Administrator.

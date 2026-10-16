@@ -34,6 +34,7 @@ function handle($action, $id, $method)
         case 'deleteProfile':       requirePermission('livelihood','Editor'); return tupadDeleteProfile($id);
         case 'assignProject':       requirePermission('livelihood','Editor'); return tupadAssignProject();
         case 'unassignProject':     requirePermission('livelihood','Editor'); return tupadUnassignProject();
+        case 'withdrawFromProject': requirePermission('livelihood','Editor'); return tupadWithdrawFromProject();
         case 'listDeleted':         requirePermission('livelihood','Viewer'); return tupadListDeleted();
         case 'restoreRecord':       requirePermission('livelihood','Editor'); return tupadRestoreRecord();
         case 'purgeRecord':         requirePermission('livelihood','Editor'); return tupadPurgeRecord();
@@ -94,7 +95,7 @@ function tupadFormatBytes($bytes) {
 
 function tupadListProjects() {
     $s = db()->query(
-        "SELECT p.*, (SELECT COUNT(*) FROM tupad_project_beneficiaries pb WHERE pb.project_id = p.project_id) AS assigned_count
+        "SELECT p.*, (SELECT COUNT(*) FROM tupad_project_beneficiaries pb WHERE pb.project_id = p.project_id AND pb.exited_at IS NULL) AS assigned_count
          FROM tupad_projects p
          WHERE p.deleted_at IS NULL
          ORDER BY p.created_at DESC, p.project_id DESC"
@@ -104,7 +105,7 @@ function tupadListProjects() {
 
 function tupadGetProjectById($id) {
     $s = db()->prepare(
-        "SELECT p.*, (SELECT COUNT(*) FROM tupad_project_beneficiaries pb WHERE pb.project_id = p.project_id) AS assigned_count
+        "SELECT p.*, (SELECT COUNT(*) FROM tupad_project_beneficiaries pb WHERE pb.project_id = p.project_id AND pb.exited_at IS NULL) AS assigned_count
          FROM tupad_projects p WHERE p.project_id = :id"
     );
     $s->execute([':id' => $id]);
@@ -290,7 +291,7 @@ function tupadBuildProfile($bid) {
     // Current assignment = most recently assigned row; older rows (if any)
     // survive as history rather than being deleted on reassignment.
     $histS = db()->prepare(
-        "SELECT tpb.project_id, tpb.assigned_at, tp.title, tp.status
+        "SELECT tpb.*, tp.title, tp.status
          FROM tupad_project_beneficiaries tpb
          JOIN tupad_projects tp ON tp.project_id = tpb.project_id
          WHERE tpb.beneficiary_service_id = :bsid
@@ -305,7 +306,9 @@ function tupadBuildProfile($bid) {
             'projectId'     => (int) $h['project_id'],
             'projectName'   => $h['title'],
             'assignedDate'  => $h['assigned_at'],
-            'completedDate' => $h['status'] === 'Completed' ? $h['assigned_at'] : null,
+            'completedDate' => ($h['status'] === 'Completed' && empty($h['exited_at'])) ? $h['assigned_at'] : null,
+            'exitedAt'      => $h['exited_at'] ?? null,
+            'exitReason'    => $h['exit_reason'] ?? '',
         ];
     }, $history);
 
@@ -335,12 +338,15 @@ function tupadBuildProfile($bid) {
         'assignedProjectId'     => $current ? (int) $current['project_id'] : null,
         'assignedProjectName'   => $current['title'] ?? '',
         'assignedProjectStatus' => $current['status'] ?? '',
+        'exitedAt'              => $current['exited_at'] ?? null,
+        'exitReason'            => $current['exit_reason'] ?? '',
         'assignmentHistory'     => $assignmentHistory,
         'attachedDocuments'     => tupadFetchSavedDocuments($bid),
         'dateApplied'           => $b['date_applied'] ?? '',
         'remarks'               => $b['remarks'] ?? '',
         'receivedBy'            => $b['received_by'] ?? '',
-        'status'                => tupadDeriveStatus($current['status'] ?? null),
+        // Left the project early -> Withdrawn, whatever the project's own status.
+        'status'                => (!empty($current['exited_at'])) ? 'Withdrawn' : tupadDeriveStatus($current['status'] ?? null),
     ];
 }
 
@@ -357,6 +363,8 @@ function tupadProfileValidationError($d) {
     if (tupadNullStr($d['lastName'] ?? '') === null)  return 'Last name is required.';
     if (!in_array($d['sex'] ?? '', ['Male', 'Female'], true)) return 'Sex is required.';
     if (!tupadDate($d['birthdate'] ?? '')) return 'Birthdate is required.';
+    if (tupadDate($d['birthdate'] ?? '') > date('Y-m-d')) return 'Birthdate cannot be in the future.';
+    if (tupadDate($d['dateApplied'] ?? '') > date('Y-m-d')) return 'Date Applied cannot be in the future.';
     $validCivil = ['Single', 'Married', 'Widowed', 'Separated', 'Annulled'];
     if (!in_array($d['civilStatus'] ?? '', $validCivil, true)) return 'Civil status is required.';
     $bgyId = (!empty($d['barangayId']) && is_numeric($d['barangayId']) && (int) $d['barangayId'] > 0)
@@ -386,8 +394,8 @@ function tupadInsertProfileRow($pdo, $uid, $d) {
     $bgyId = (int) $d['barangayId'];
 
     $s = $pdo->prepare(
-        "INSERT INTO beneficiaries(first_name,middle_name,last_name,suffix,sex,birth_date,civil_status,street_address,barangay_id,contact_no,status)
-         VALUES(:fn,:mn,:ln,:sfx,:sex,:bdate,:civil,:street,:bgy,:contact,'Active') RETURNING beneficiary_id"
+        "INSERT INTO beneficiaries(first_name,middle_name,last_name,suffix,sex,birth_date,civil_status,street_address,barangay_id,contact_no)
+         VALUES(:fn,:mn,:ln,:sfx,:sex,:bdate,:civil,:street,:bgy,:contact) RETURNING beneficiary_id"
     );
     $s->execute([
         ':fn' => trim($d['firstName']), ':mn' => tupadNullStr($d['middleName'] ?? ''), ':ln' => trim($d['lastName']),
@@ -522,7 +530,7 @@ function tupadDeleteProfile($id) {
     // Cannot delete a beneficiary whose most recent assignment is to a
     // non-completed project — unassign first, same lock spirit as DILP/SPES.
     $chk = db()->prepare(
-        "SELECT tp.status
+        "SELECT CASE WHEN tpb.exited_at IS NULL THEN tp.status::text ELSE 'Withdrawn' END
          FROM beneficiary_services bs
          JOIN tupad_project_beneficiaries tpb ON tpb.beneficiary_service_id = bs.beneficiary_service_id
          JOIN tupad_projects tp ON tp.project_id = tpb.project_id
@@ -575,7 +583,7 @@ function tupadAssignProject() {
     if ($proj['participant_count'] !== null) {
         $cntS = db()->prepare(
             "SELECT COUNT(*) FROM tupad_project_beneficiaries
-             WHERE project_id=:id AND beneficiary_service_id != :bsid"
+             WHERE project_id=:id AND beneficiary_service_id != :bsid AND exited_at IS NULL"
         );
         $cntS->execute([':id' => $projectId, ':bsid' => (int) $bsId]);
         $current = (int) $cntS->fetchColumn();
@@ -600,7 +608,7 @@ function tupadUnassignProject() {
     if (!$bid) error('applicantId is required.', 422);
 
     $row = db()->prepare(
-        "SELECT tpb.project_beneficiary_id, tp.status AS project_status
+        "SELECT tpb.project_beneficiary_id, tpb.exited_at, tp.status AS project_status
          FROM beneficiary_services bs
          JOIN tupad_project_beneficiaries tpb ON tpb.beneficiary_service_id = bs.beneficiary_service_id
          JOIN tupad_projects tp ON tp.project_id = tpb.project_id
@@ -610,6 +618,7 @@ function tupadUnassignProject() {
     $row->execute([':bid' => $bid, ':sid' => tupadServiceId()]);
     $r = $row->fetch();
     if (!$r) error('This beneficiary is not currently assigned to a project.', 404);
+    if (!empty($r['exited_at'])) error('This beneficiary was marked as withdrawn from this project — that record cannot be unassigned.', 409);
 
     // Only the current (most recent) assignment can be undone, and only while
     // its project is still Planned — once it has moved on, this row is the
@@ -622,6 +631,60 @@ function tupadUnassignProject() {
         ->execute([':id' => (int) $r['project_beneficiary_id']]);
 
     json(['status' => 'ok', 'message' => 'Beneficiary unassigned from project.']);
+}
+
+// Records that a beneficiary LEFT an already-started project early. Unlike
+// unassign (a correction, only while the project is still Planned, which
+// deletes the link), this KEEPS the assignment row and marks it with when/why/
+// who. TUPAD's status is derived, so the exit marker itself makes the status
+// read Withdrawn; the row also stops counting toward the project's headcount,
+// freeing the slot for a replacement. Only meaningful for an Ongoing project.
+function tupadWithdrawFromProject() {
+    $uid = requireLogin();
+    $d = body();
+    $bid = tupadIntOrNull($d['applicantId'] ?? '');
+    if (!$bid) error('applicantId is required.', 422);
+
+    $reason = trim((string) ($d['reason'] ?? ''));
+    if ($reason === '') error('A reason is required.', 422);
+    if (mb_strlen($reason) > 500) error('Reason must be 500 characters or fewer.', 422);
+
+    $date = tupadDate($d['exitDate'] ?? '') ?: date('Y-m-d');
+    if ($date > date('Y-m-d')) error('The date left cannot be in the future.', 422);
+
+    $q = db()->prepare(
+        "SELECT tpb.project_beneficiary_id, tpb.assigned_at, tpb.exited_at,
+                tp.status AS project_status, tp.title AS project_name,
+                b.first_name, b.last_name
+         FROM beneficiary_services bs
+         JOIN beneficiaries b ON b.beneficiary_id = bs.beneficiary_id
+         JOIN tupad_project_beneficiaries tpb ON tpb.beneficiary_service_id = bs.beneficiary_service_id
+         JOIN tupad_projects tp ON tp.project_id = tpb.project_id
+         WHERE bs.beneficiary_id = :bid AND bs.service_id = :sid AND b.deleted_at IS NULL
+         ORDER BY tpb.assigned_at DESC, tpb.project_beneficiary_id DESC LIMIT 1"
+    );
+    $q->execute([':bid' => $bid, ':sid' => tupadServiceId()]);
+    $r = $q->fetch();
+    if (!$r) error('This beneficiary is not currently assigned to a project.', 404);
+    if (!empty($r['exited_at'])) error('This beneficiary is already marked as withdrawn.', 409);
+    if ($r['project_status'] !== 'Ongoing') {
+        error($r['project_status'] === 'Planned'
+            ? 'This project has not started yet. Unassign the beneficiary instead.'
+            : 'This project is no longer ongoing, so the beneficiary cannot be withdrawn.', 409);
+    }
+    if ($date < substr($r['assigned_at'], 0, 10)) {
+        error('The date left cannot be before the beneficiary was assigned to the project.', 422);
+    }
+
+    db()->prepare(
+        "UPDATE tupad_project_beneficiaries
+         SET exited_at=:at, exit_reason=:why, exited_by=:uid
+         WHERE project_beneficiary_id=:id"
+    )->execute([':at' => $date . ' 00:00:00', ':why' => $reason, ':uid' => $uid, ':id' => (int) $r['project_beneficiary_id']]);
+
+    logActivity($uid, 'Withdraw Beneficiary', 'livelihood',
+        "Marked {$r['last_name']}, {$r['first_name']} as withdrawn from TUPAD project \"{$r['project_name']}\" (left {$date}): {$reason}");
+    json(['status' => 'ok', 'message' => 'Beneficiary marked as withdrawn.']);
 }
 
 // ─── Documents (applicant) ────────────────────────────────────────────────────

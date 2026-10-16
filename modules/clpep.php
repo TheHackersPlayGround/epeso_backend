@@ -403,6 +403,8 @@ function clpepProfileValidationError($d) {
     if (clpepNullStr($d['lastName'] ?? '') === null)  return 'Last name is required.';
     if (!in_array($d['sex'] ?? '', ['Male', 'Female'], true)) return 'Sex is required.';
     if (!clpepDate($d['birthdate'] ?? '')) return 'Birthdate is required.';
+    if (clpepDate($d['birthdate'] ?? '') > date('Y-m-d')) return 'Birthdate cannot be in the future.';
+    if (clpepDate($d['dateApplied'] ?? '') > date('Y-m-d')) return 'Date Applied cannot be in the future.';
     $bgyId = (!empty($d['barangayId']) && is_numeric($d['barangayId']) && (int) $d['barangayId'] > 0)
              ? (int) $d['barangayId'] : null;
     if (!$bgyId) return 'Barangay is required.';
@@ -440,8 +442,8 @@ function clpepInsertProfileRow($pdo, $uid, $d) {
     $school = in_array($d['schoolStatus'] ?? '', $validSchool, true) ? $d['schoolStatus'] : null;
 
     $s = $pdo->prepare(
-        "INSERT INTO beneficiaries(first_name,middle_name,last_name,suffix,sex,birth_date,civil_status,street_address,barangay_id,status)
-         VALUES(:fn,:mn,:ln,:sfx,:sex,:bdate,'Single',:street,:bgy,'Active') RETURNING beneficiary_id"
+        "INSERT INTO beneficiaries(first_name,middle_name,last_name,suffix,sex,birth_date,civil_status,street_address,barangay_id)
+         VALUES(:fn,:mn,:ln,:sfx,:sex,:bdate,'Single',:street,:bgy) RETURNING beneficiary_id"
     );
     $s->execute([
         ':fn' => trim($d['firstName']), ':mn' => clpepNullStr($d['middleName'] ?? ''), ':ln' => trim($d['lastName']),

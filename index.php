@@ -1,6 +1,12 @@
 <?php
 // Front controller: routes /api/{module}/{action}/{id} to a module
 
+// The whole app runs on Philippine time. php.ini ships with Europe/Berlin, which is
+// 6 hours behind: date('Y-m-d') would still be "yesterday" in the early morning, so
+// "cannot be in the future" checks would reject today's date, and date-only defaults
+// would be off by a day. Matches the database session timezone (UTC+8).
+date_default_timezone_set('Asia/Manila');
+
 include_once __DIR__ . '/core/cors.php';
 include_once __DIR__ . '/core/db.php';
 include_once __DIR__ . '/core/response.php';
