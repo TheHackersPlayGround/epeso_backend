@@ -130,7 +130,7 @@ function tupadFormatProject($r) {
     ];
 }
 
-function tupadValidateProjectInput($d) {
+function tupadValidateProjectInput($d, $excludeId = null) {
     $title = trim($d['title'] ?? '');
     if ($title === '') error('Activity title is required.', 422);
 
@@ -140,6 +140,23 @@ function tupadValidateProjectInput($d) {
     // Number of Participants is the project's slot count: required, whole number >= 1.
     $slots = wholeNumberOrNull($d['participants'] ?? null);
     if ($slots === null || $slots < 1) error('Number of Participants must be a whole number of at least 1.', 422);
+
+    // The same kind of work can run on the same day in different places, but not twice in
+    // the same place on the same day: block a project whose title (ignoring case and
+    // spacing), date and location all match an existing one. Deleted projects (Recycle Bin)
+    // don't count. A project with no location counts as one place too.
+    $location = tupadNullStr($d['location'] ?? '');
+    $sameS = db()->prepare(
+        "SELECT 1 FROM tupad_projects
+         WHERE deleted_at IS NULL AND lower(btrim(title)) = lower(:t) AND project_date = :d
+           AND lower(btrim(location)) IS NOT DISTINCT FROM lower(:l)" . ($excludeId ? " AND project_id != :ex" : "") . " LIMIT 1"
+    );
+    $sameS->bindValue(':t', $title);
+    $sameS->bindValue(':d', $date);
+    $sameS->bindValue(':l', $location === null ? null : trim($location), $location === null ? PDO::PARAM_NULL : PDO::PARAM_STR);
+    if ($excludeId) $sameS->bindValue(':ex', $excludeId, PDO::PARAM_INT);
+    $sameS->execute();
+    if ($sameS->fetchColumn()) error('A project with this title, date and location already exists.', 409);
 
     return [$title, $date];
 }
@@ -175,7 +192,7 @@ function tupadUpdateProject($id) {
     $id  = (int) $id;
     $uid = requireLogin();
     $d = body();
-    [$title, $date] = tupadValidateProjectInput($d);
+    [$title, $date] = tupadValidateProjectInput($d, $id);
 
     $valid  = ['Planned', 'Ongoing', 'Completed'];
     $status = in_array($d['status'] ?? '', $valid, true) ? $d['status'] : 'Planned';
@@ -272,7 +289,7 @@ function tupadGetProfile($id) {
 
 function tupadBuildProfile($bid) {
     $s = db()->prepare(
-        "SELECT b.*, bgy.barangay_name, c.city_name, p.province_name, r.region_name,
+        "SELECT b.*, bgy.barangay_name, c.city_id, c.city_name, p.province_id, p.province_name, r.region_name,
                 bs.beneficiary_service_id, bs.date_applied, bs.received_by, bs.remarks
          FROM beneficiaries b
          JOIN beneficiary_services bs ON bs.beneficiary_id = b.beneficiary_id
@@ -332,6 +349,8 @@ function tupadBuildProfile($bid) {
         'streetPurok'           => $b['street_address'] ?? '',
         'barangay'              => $b['barangay_name'] ?? '',
         'barangayId'            => (int) ($b['barangay_id'] ?? 0),
+        'cityId'      => (int) ($b['city_id'] ?? 0),
+        'provinceId'  => (int) ($b['province_id'] ?? 0),
         'cityMunicipality'      => $b['city_name'] ?? '',
         'province'              => $b['province_name'] ?? '',
         'region'                => $b['region_name'] ?? '',

@@ -319,6 +319,26 @@ function cdspGetActivityById($id) {
     return $r ? cdspFormatActivity($r) : null;
 }
 
+// The same session can run again on another day or in another place, but not twice in the
+// same place on the same day: block an activity whose service, title (ignoring case and
+// spacing), date and location all match an existing one. Deleted activities (Recycle Bin)
+// don't count. An activity with no location counts as one place too.
+function cdspAssertNoDuplicateActivity($serviceId, $title, $date, $location, $excludeId = null) {
+    $loc = cdspNullStr($location ?? '');
+    $s = db()->prepare(
+        "SELECT 1 FROM cdsp_activities
+         WHERE deleted_at IS NULL AND service_id = :sid AND lower(btrim(activity_title)) = lower(:t) AND activity_date = :d
+           AND lower(btrim(location)) IS NOT DISTINCT FROM lower(:l)" . ($excludeId ? " AND activity_id != :ex" : "") . " LIMIT 1"
+    );
+    $s->bindValue(':sid', (int) $serviceId, PDO::PARAM_INT);
+    $s->bindValue(':t', trim($title));
+    $s->bindValue(':d', $date);
+    $s->bindValue(':l', $loc === null ? null : trim($loc), $loc === null ? PDO::PARAM_NULL : PDO::PARAM_STR);
+    if ($excludeId) $s->bindValue(':ex', (int) $excludeId, PDO::PARAM_INT);
+    $s->execute();
+    if ($s->fetchColumn()) error('An activity with this title, date and location already exists.', 409);
+}
+
 function cdspCreateActivity() {
     $d = body();
     if (cdspNullStr($d['title'] ?? '') === null) error('Activity title is required.', 422);
@@ -330,6 +350,7 @@ function cdspCreateActivity() {
     if (!empty($d['serviceName'])) $sid = cdspServiceIdByName($d['serviceName']);
     elseif (!empty($d['serviceId'])) $sid = cdspIntOrNull($d['serviceId']);
     if (!$sid) error('Valid CDSP sub-service is required.', 422);
+    cdspAssertNoDuplicateActivity($sid, $d['title'], cdspDate($d['date']), $d['location'] ?? '');
     $valid  = ['Planned', 'Ongoing', 'Completed'];
     $status = in_array($d['status'] ?? '', $valid, true) ? $d['status'] : 'Planned';
     $s = db()->prepare(
@@ -352,9 +373,11 @@ function cdspUpdateActivity($id) {
     $valid  = ['Planned', 'Ongoing', 'Completed'];
     $status = in_array($d['status'] ?? '', $valid, true) ? $d['status'] : 'Planned';
 
-    $curS = db()->prepare("SELECT status FROM cdsp_activities WHERE activity_id=:id");
+    $curS = db()->prepare("SELECT status, service_id FROM cdsp_activities WHERE activity_id=:id");
     $curS->execute([':id' => (int)$id]);
-    $prevStatus = $curS->fetchColumn();
+    $cur = $curS->fetch();
+    $prevStatus = $cur ? $cur['status'] : false;
+    if ($cur) cdspAssertNoDuplicateActivity($cur['service_id'], $d['title'], cdspDate($d['date']), $d['location'] ?? '', (int)$id);
     // Only stamp completed_at on the actual Planned/Ongoing -> Completed transition,
     // so re-saving an already-completed activity doesn't keep bumping its completion date.
     $completedAt = ($status === 'Completed' && $prevStatus !== 'Completed') ? ',completed_at=now()' : '';

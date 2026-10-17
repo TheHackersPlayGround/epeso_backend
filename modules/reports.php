@@ -240,7 +240,7 @@ function reportsSummary()
         }
 
         if ($key === 'livelihood') {
-            $activities = reportsCountActivities('dilp_projects', 'date_released', $from, $to)
+            $activities = reportsCountActivities('dilp_projects', 'created_at::date', $from, $to)
                 + reportsCountActivities('tupad_projects', 'project_date', $from, $to)
                 + reportsCountActivities('slp_projects', 'date_started', $from, $to)
                 + reportsCountActivities('clpep_interventions', 'intervention_date', $from, $to);

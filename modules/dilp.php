@@ -151,7 +151,7 @@ function dilpFormatProject($r) {
     }
     return [
         'id'                   => (int) $r['dilp_project_id'],
-        'projectIdNumber'      => $r['project_id_number'],
+        'projectIdNumber'      => $r['project_id_number'] ?? '',
         'projectName'          => $r['project_name'],
         'typeOfProject'        => $r['project_type'],
         'programComponent'     => $r['program_component'],
@@ -164,6 +164,8 @@ function dilpFormatProject($r) {
         'streetPurok'          => $r['street_address'] ?? '',
         'assistanceAmount'     => $r['assistance_amount'] !== null ? (string) $r['assistance_amount'] : '',
         'dateReleased'         => $r['date_released'] ?? '',
+        // Day the project was entered; the reports place DILP projects by this date.
+        'createdDate'          => substr((string) ($r['created_at'] ?? ''), 0, 10),
         'status'               => $r['status'],
         'assignedCount'        => (int) $r['assigned_count'],
         'documents'            => dilpFetchProjectDocuments((int) $r['dilp_project_id']),
@@ -173,14 +175,20 @@ function dilpFormatProject($r) {
 function dilpValidateProjectInput($d, $excludeId = null) {
     $idNum = trim($d['projectIdNumber'] ?? '');
     $name  = trim($d['projectName'] ?? '');
-    if ($idNum === '') error('Project ID Number is required.', 422);
     if ($name === '')  error('Project Name is required.', 422);
 
-    $dupS = db()->prepare("SELECT dilp_project_id FROM dilp_projects WHERE project_id_number = :n" . ($excludeId ? " AND dilp_project_id != :ex" : ""));
-    $params = [':n' => $idNum];
-    if ($excludeId) $params[':ex'] = $excludeId;
-    $dupS->execute($params);
-    if ($dupS->fetchColumn()) error('A project with this Project ID Number already exists.', 409);
+    // Project ID Number is optional: DOLE assigns it, so staff often don't have it yet.
+    // Blank is stored as NULL (not '') so many projects can leave it empty -- the UNIQUE
+    // constraint only compares real values.
+    if ($idNum === '') {
+        $idNum = null;
+    } else {
+        $dupS = db()->prepare("SELECT dilp_project_id FROM dilp_projects WHERE project_id_number = :n" . ($excludeId ? " AND dilp_project_id != :ex" : ""));
+        $params = [':n' => $idNum];
+        if ($excludeId) $params[':ex'] = $excludeId;
+        $dupS->execute($params);
+        if ($dupS->fetchColumn()) error('A project with this Project ID Number already exists.', 409);
+    }
 
     $type = in_array($d['typeOfProject'] ?? '', ['Individual', 'Group'], true) ? $d['typeOfProject'] : null;
     if (!$type) error('Type of Project is required.', 422);
@@ -192,6 +200,22 @@ function dilpValidateProjectInput($d, $excludeId = null) {
     if (!$impl) error('Way of Implementation is required.', 422);
 
     $bgyId = (!empty($d['barangayId']) && is_numeric($d['barangayId']) && (int) $d['barangayId'] > 0) ? (int) $d['barangayId'] : null;
+    // Project location is required: the barangay is what tells same-named projects apart.
+    if (!$bgyId) error('Barangay is required.', 422);
+
+    // The same project name can run in many barangays, but not twice in the same one
+    // (names compared ignoring case and spacing; a project with no barangay counts as
+    // one place too). Deleted projects (Recycle Bin) don't count.
+    $sameS = db()->prepare(
+        "SELECT 1 FROM dilp_projects
+         WHERE deleted_at IS NULL AND lower(btrim(project_name)) = lower(:n)
+           AND barangay_id IS NOT DISTINCT FROM :b" . ($excludeId ? " AND dilp_project_id != :ex" : "") . " LIMIT 1"
+    );
+    $sameS->bindValue(':n', $name);
+    $sameS->bindValue(':b', $bgyId, $bgyId === null ? PDO::PARAM_NULL : PDO::PARAM_INT);
+    if ($excludeId) $sameS->bindValue(':ex', $excludeId, PDO::PARAM_INT);
+    $sameS->execute();
+    if ($sameS->fetchColumn()) error('A project with this name already exists in this barangay.', 409);
 
     return [$idNum, $name, $type, $component, $impl, $bgyId];
 }
@@ -325,7 +349,7 @@ function dilpGetProfile($id) {
 
 function dilpBuildProfile($bid) {
     $s = db()->prepare(
-        "SELECT b.*, bgy.barangay_name, c.city_name, p.province_name, r.region_name,
+        "SELECT b.*, bgy.barangay_name, c.city_id, c.city_name, p.province_id, p.province_name, r.region_name,
                 bs.beneficiary_service_id, bs.date_applied, bs.received_by, bs.remarks,
                 dpb.dilp_project_id AS assigned_project_id,
                 dproj.project_name AS assigned_project_name,
@@ -375,6 +399,8 @@ function dilpBuildProfile($bid) {
         'streetPurok'          => $b['street_address'] ?? '',
         'barangay'             => $b['barangay_name'] ?? '',
         'barangayId'           => (int) ($b['barangay_id'] ?? 0),
+        'cityId'     => (int) ($b['city_id'] ?? 0),
+        'provinceId' => (int) ($b['province_id'] ?? 0),
         'cityMunicipality'     => $b['city_name'] ?? '',
         'province'             => $b['province_name'] ?? '',
         'region'               => $b['region_name'] ?? '',
