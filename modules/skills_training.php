@@ -1,9 +1,16 @@
 <?php
-// Skills Training: batches (skills_training_batches) -> trainings/activities
-// (skills_training_activities) -> participants (skills_training_activity_participants),
-// plus profiles (beneficiary spine + skills_training_profiles + classification/
-// qualification/purpose junctions). Mirrors cdsp.php's batch->activity->participant
-// shape (the closest existing precedent) rather than GIP/SPES's flat single-batch model.
+// Skills Training: trainings/activities (skills_training_activities, each
+// carrying its own free-typed batch_name) -> participants
+// (skills_training_activity_participants), plus profiles (beneficiary spine +
+// skills_training_profiles + classification/qualification/purpose junctions).
+// Mirrors cdsp.php's activity->participant shape (the closest existing
+// precedent) rather than GIP/SPES's flat single-batch model.
+//
+// A training's batch used to point at a separate skills_training_batches
+// table by batch_id; migration 071 merged that table into this one (batch_name
+// is now just a plain required text field on the training) and dropped the
+// now-dead skills_training_profiles.batch_id column. See that migration for
+// the full rationale.
 //
 // Design notes (confirmed against the live schema before writing this):
 //  - skills_training_profiles has no derived "status" column for batch/activity
@@ -17,9 +24,6 @@
 //    stUpdateAttendance() below -- rows are inserted with attended=NULL and stay
 //    that way until staff mark it, and a Completed training only counts as a
 //    genuine completion (for Aging/job-placement eligibility) when attended=true.
-//  - skills_training_profiles.batch_id is kept in sync with whichever activity's
-//    batch the applicant is currently assigned to (denormalized convenience column
-//    already on the table), cleared back to NULL on unassign.
 
 include_once __DIR__ . '/../core/helpers.php';
 include_once __DIR__ . '/../core/guard.php';
@@ -28,11 +32,6 @@ include_once __DIR__ . '/../core/activity_log.php';
 function handle($action, $id, $method)
 {
     switch ($action) {
-        case 'listBatches':              requirePermission('skills-maintenance','Viewer'); return stListBatches();
-        case 'createBatch':              requirePermission('skills-maintenance','Editor'); return stCreateBatch();
-        case 'updateBatch':              requirePermission('skills-maintenance','Editor'); return stUpdateBatch($id);
-        case 'deleteBatch':              requirePermission('skills-maintenance','Editor'); return stDeleteBatch($id);
-
         case 'listActivities':           requirePermission('skills-maintenance','Viewer'); return stListActivities();
         case 'createActivity':           requirePermission('skills-maintenance','Editor'); return stCreateActivity();
         case 'updateActivity':           requirePermission('skills-maintenance','Editor'); return stUpdateActivity($id);
@@ -111,97 +110,12 @@ function stDenormalizeClassification($c) {
     return $c === 'Person with Disability' ? 'PWD' : $c;
 }
 
-// ─── Batches ──────────────────────────────────────────────────────────────────
-
-function stListBatches() {
-    $s = db()->query(
-        "SELECT b.batch_id, b.batch_name, b.description, b.is_active,
-                (SELECT COUNT(*) FROM skills_training_activities a WHERE a.batch_id = b.batch_id) AS training_count
-         FROM skills_training_batches b
-         WHERE b.deleted_at IS NULL
-         ORDER BY b.batch_name"
-    );
-    $out = array_map(function($r) {
-        return [
-            'id'            => (int)$r['batch_id'],
-            'batchName'     => $r['batch_name'],
-            'description'   => $r['description'] ?? '',
-            'isActive'      => (bool)$r['is_active'],
-            'trainingCount' => (int)$r['training_count'],
-        ];
-    }, $s->fetchAll());
-    json(['status' => 'ok', 'data' => $out]);
-}
-
-function stCreateBatch() {
-    $d = body();
-    $name = trim($d['batchName'] ?? '');
-    if ($name === '') error('Batch name is required.', 422);
-    $chk = db()->prepare("SELECT 1 FROM skills_training_batches WHERE batch_name=:n AND deleted_at IS NULL");
-    $chk->execute([':n' => $name]);
-    if ($chk->fetchColumn()) error('This batch already exists.', 409);
-    $s = db()->prepare("INSERT INTO skills_training_batches(batch_name,description,is_active,created_at,updated_at) VALUES(:n,:d,true,now(),now()) RETURNING batch_id");
-    $s->execute([':n' => $name, ':d' => stNullStr($d['description'] ?? '')]);
-    logActivity(currentUserId(), 'Create Batch', 'skills-maintenance', "Created batch: {$name}");
-    json(['status' => 'ok', 'message' => 'Batch added.', 'data' => ['id' => (int)$s->fetchColumn(), 'batchName' => $name]]);
-}
-
-// Renames a batch. Trainings and applicants point at a batch by batch_id, not by
-// name, so they all follow the new name automatically.
-function stUpdateBatch($id) {
-    if (!is_numeric($id)) error('Invalid batch id.', 422);
-    $id = (int)$id;
-    $d = body();
-    $name = trim($d['batchName'] ?? '');
-    if ($name === '') error('Batch name is required.', 422);
-
-    $cur = db()->prepare("SELECT batch_name FROM skills_training_batches WHERE batch_id=:id AND deleted_at IS NULL");
-    $cur->execute([':id' => $id]);
-    $oldName = $cur->fetchColumn();
-    if ($oldName === false) error('Batch not found.', 404);
-
-    // batch_name is UNIQUE across ALL rows, including batches sitting in the
-    // recycle bin, so check without the deleted_at filter to give a clear
-    // message instead of a raw database error.
-    // fetch() (not fetchColumn()): the selected value is itself a boolean, so
-    // fetchColumn()'s "false" would be indistinguishable from "no row found".
-    $dup = db()->prepare("SELECT deleted_at IS NOT NULL AS is_deleted FROM skills_training_batches WHERE batch_name=:n AND batch_id<>:id");
-    $dup->execute([':n' => $name, ':id' => $id]);
-    $dupRow = $dup->fetch();
-    if ($dupRow !== false) {
-        error($dupRow['is_deleted'] ? 'A deleted batch already uses this name. Restore it from the recycle bin or choose a different name.' : 'This batch already exists.', 409);
-    }
-
-    if ($name !== $oldName) {
-        db()->prepare("UPDATE skills_training_batches SET batch_name=:n, updated_at=now() WHERE batch_id=:id")->execute([':n' => $name, ':id' => $id]);
-        logActivity(currentUserId(), 'Update Batch', 'skills-maintenance', "Renamed batch \"{$oldName}\" to \"{$name}\"");
-    }
-    json(['status' => 'ok', 'message' => 'Batch updated.', 'data' => ['id' => $id, 'batchName' => $name]]);
-}
-
-function stDeleteBatch($id) {
-    if (!is_numeric($id)) error('Invalid batch id.', 422);
-    $id = (int)$id;
-    $cntS = db()->prepare("SELECT COUNT(*) FROM skills_training_activities WHERE batch_id=:id AND deleted_at IS NULL");
-    $cntS->execute([':id' => $id]);
-    $cnt = (int)$cntS->fetchColumn();
-    if ($cnt > 0) error("Cannot delete: $cnt training" . ($cnt === 1 ? '' : 's') . ' still under this batch.', 409);
-    $nameS = db()->prepare("SELECT batch_name FROM skills_training_batches WHERE batch_id=:id AND deleted_at IS NULL");
-    $nameS->execute([':id' => $id]);
-    $name = $nameS->fetchColumn();
-    if ($name === false) error('Batch not found.', 404);
-    db()->prepare("UPDATE skills_training_batches SET deleted_at=now(), deleted_by=:uid WHERE batch_id=:id")->execute([':uid' => currentUserId(), ':id' => $id]);
-    logActivity(currentUserId(), 'Delete Batch', 'skills-maintenance', "Deleted batch: {$name}");
-    json(['status' => 'ok', 'message' => 'Batch deleted.']);
-}
-
 // ─── Trainings / Activities ───────────────────────────────────────────────────
 
 function stFormatActivity($r) {
     return [
         'id'            => (int)$r['activity_id'],
-        'batchId'       => (int)$r['batch_id'],
-        'service'       => $r['batch_name'],
+        'batchName'     => $r['batch_name'],
         'program'       => 'Skills Training',
         'title'         => $r['activity_title'],
         'description'   => $r['description'] ?? '',
@@ -221,13 +135,12 @@ function stFormatActivity($r) {
 
 function stListActivities() {
     $s = db()->query(
-        "SELECT a.activity_id, a.batch_id, b.batch_name, a.activity_title, a.description,
+        "SELECT a.activity_id, a.batch_name, a.activity_title, a.description,
                 a.activity_date, a.venue, a.facilitator, a.participant_count, a.status,
                 (SELECT COUNT(*) FROM skills_training_activity_participants p WHERE p.activity_id = a.activity_id) AS assigned_count,
                 (SELECT COUNT(*) FROM skills_training_activity_participants p WHERE p.activity_id = a.activity_id AND p.attended = true) AS present_count,
                 (SELECT COUNT(*) FROM skills_training_activity_participants p WHERE p.activity_id = a.activity_id AND p.attended = false) AS absent_count
          FROM skills_training_activities a
-         JOIN skills_training_batches b ON b.batch_id = a.batch_id
          WHERE a.deleted_at IS NULL
          ORDER BY a.activity_date DESC, a.activity_id DESC"
     );
@@ -236,13 +149,12 @@ function stListActivities() {
 
 function stGetActivityById($id) {
     $s = db()->prepare(
-        "SELECT a.activity_id, a.batch_id, b.batch_name, a.activity_title, a.description,
+        "SELECT a.activity_id, a.batch_name, a.activity_title, a.description,
                 a.activity_date, a.venue, a.facilitator, a.participant_count, a.status,
                 (SELECT COUNT(*) FROM skills_training_activity_participants p WHERE p.activity_id = a.activity_id) AS assigned_count,
                 (SELECT COUNT(*) FROM skills_training_activity_participants p WHERE p.activity_id = a.activity_id AND p.attended = true) AS present_count,
                 (SELECT COUNT(*) FROM skills_training_activity_participants p WHERE p.activity_id = a.activity_id AND p.attended = false) AS absent_count
          FROM skills_training_activities a
-         JOIN skills_training_batches b ON b.batch_id = a.batch_id
          WHERE a.activity_id = :id"
     );
     $s->execute([':id' => $id]);
@@ -253,23 +165,19 @@ function stGetActivityById($id) {
 function stCreateActivity() {
     $d = body();
     if (stNullStr($d['title'] ?? '') === null) error('Training title is required.', 422);
-    $batchId = stIntOrNull($d['batchId'] ?? '');
-    if (!$batchId) error('Training batch is required.', 422);
+    $batchName = trim($d['batchName'] ?? '');
     // Number of Participants is the training's slot count: required, whole number >= 1.
     $slots = wholeNumberOrNull($d['participants'] ?? '');
     if ($slots === null || $slots < 1) error('Number of Participants must be a whole number of at least 1.', 422);
-    $chk = db()->prepare("SELECT 1 FROM skills_training_batches WHERE batch_id=:id AND deleted_at IS NULL");
-    $chk->execute([':id' => $batchId]);
-    if (!$chk->fetchColumn()) error('Selected batch not found.', 422);
 
     // New trainings always start Planned -- matches the maintenance form's Add
     // mode, which disables Ongoing/Completed until the record actually exists.
     $s = db()->prepare(
-        "INSERT INTO skills_training_activities(batch_id,activity_title,description,activity_date,venue,facilitator,participant_count,status,created_at,updated_at)
-         VALUES(:bid,:t,:desc,:date,:venue,:fac,:pc,'Planned',now(),now()) RETURNING activity_id"
+        "INSERT INTO skills_training_activities(batch_name,activity_title,description,activity_date,venue,facilitator,participant_count,status,created_at,updated_at)
+         VALUES(:bname,:t,:desc,:date,:venue,:fac,:pc,'Planned',now(),now()) RETURNING activity_id"
     );
     $s->execute([
-        ':bid' => $batchId, ':t' => trim($d['title']), ':desc' => stNullStr($d['description'] ?? ''),
+        ':bname' => $batchName, ':t' => trim($d['title']), ':desc' => stNullStr($d['description'] ?? ''),
         ':date' => stDate($d['date'] ?? '') ?? date('Y-m-d'), ':venue' => stNullStr($d['location'] ?? ''),
         ':fac' => stNullStr($d['facilitator'] ?? ''), ':pc' => $slots,
     ]);
@@ -282,8 +190,7 @@ function stUpdateActivity($id) {
     $id = (int)$id;
     $d = body();
     if (stNullStr($d['title'] ?? '') === null) error('Training title is required.', 422);
-    $batchId = stIntOrNull($d['batchId'] ?? '');
-    if (!$batchId) error('Training batch is required.', 422);
+    $batchName = trim($d['batchName'] ?? '');
     // Number of Participants is the training's slot count: required, whole number >= 1.
     $slots = wholeNumberOrNull($d['participants'] ?? '');
     if ($slots === null || $slots < 1) error('Number of Participants must be a whole number of at least 1.', 422);
@@ -299,11 +206,11 @@ function stUpdateActivity($id) {
 
     db()->prepare(
         "UPDATE skills_training_activities
-         SET batch_id=:bid, activity_title=:t, description=:desc, activity_date=:date,
+         SET batch_name=:bname, activity_title=:t, description=:desc, activity_date=:date,
              venue=:venue, facilitator=:fac, participant_count=:pc, status=:st, updated_at=now(){$completedAt}
          WHERE activity_id=:id"
     )->execute([
-        ':bid' => $batchId, ':t' => trim($d['title']), ':desc' => stNullStr($d['description'] ?? ''),
+        ':bname' => $batchName, ':t' => trim($d['title']), ':desc' => stNullStr($d['description'] ?? ''),
         ':date' => stDate($d['date'] ?? '') ?? date('Y-m-d'), ':venue' => stNullStr($d['location'] ?? ''),
         ':fac' => stNullStr($d['facilitator'] ?? ''), ':pc' => $slots,
         ':st' => $status, ':id' => $id,
@@ -392,10 +299,9 @@ function stUpdateAttendance() {
 function stListTrainingHistory($bsId) {
     if (!is_numeric($bsId)) error('Invalid beneficiary service id.', 422);
     $s = db()->prepare(
-        "SELECT a.activity_id, a.activity_title, a.activity_date, a.status, a.completed_at, b.batch_name, p.attended
+        "SELECT a.activity_id, a.activity_title, a.activity_date, a.status, a.completed_at, a.batch_name, p.attended
          FROM skills_training_activity_participants p
          JOIN skills_training_activities a ON a.activity_id = p.activity_id
-         JOIN skills_training_batches b ON b.batch_id = a.batch_id
          WHERE p.beneficiary_service_id = :bsid
          ORDER BY a.activity_date DESC, a.activity_id DESC"
     );
@@ -485,7 +391,7 @@ function stAddParticipant() {
         error('This applicant must be Accepted before they can be assigned to a training.', 409);
     }
 
-    $actS = db()->prepare("SELECT status, batch_id, participant_count FROM skills_training_activities WHERE activity_id=:a AND deleted_at IS NULL");
+    $actS = db()->prepare("SELECT status, participant_count FROM skills_training_activities WHERE activity_id=:a AND deleted_at IS NULL");
     $actS->execute([':a' => $actId]);
     $act = $actS->fetch();
     if (!$act) error('Training not found.', 404);
@@ -507,9 +413,8 @@ function stAddParticipant() {
         // A profile keeps every past assignment as history (PESO allows availing
         // more than one training) -- only the current/active one is ever removed
         // (see stRemoveParticipant), so re-assigning just adds a new row rather
-        // than deleting the old one. batch_id tracks whichever training is current.
+        // than deleting the old one.
         $pdo->prepare("INSERT INTO skills_training_activity_participants(activity_id,beneficiary_service_id,attended) VALUES(:a,:b,NULL)")->execute([':a' => $actId, ':b' => $bsId]);
-        $pdo->prepare("UPDATE skills_training_profiles SET batch_id=:bid, updated_at=now() WHERE beneficiary_service_id=:b")->execute([':bid' => $act['batch_id'], ':b' => $bsId]);
         $pdo->commit();
     } catch (Throwable $e) {
         $pdo->rollBack();
@@ -535,7 +440,6 @@ function stRemoveParticipant() {
     $pdo->beginTransaction();
     try {
         $pdo->prepare("DELETE FROM skills_training_activity_participants WHERE activity_id=:a AND beneficiary_service_id=:b")->execute([':a' => $actId, ':b' => $bsId]);
-        $pdo->prepare("UPDATE skills_training_profiles SET batch_id=NULL, updated_at=now() WHERE beneficiary_service_id=:b")->execute([':b' => $bsId]);
         $pdo->commit();
     } catch (Throwable $e) {
         $pdo->rollBack();
@@ -630,7 +534,7 @@ function stBuildProfile($bid) {
     $s = db()->prepare(
         "SELECT b.*, bgy.barangay_name, c.city_name, p.province_name, r.region_name,
                 bs.beneficiary_service_id, bs.date_applied, bs.received_by,
-                sp.skills_training_profile_id, sp.application_status, sp.batch_id
+                sp.skills_training_profile_id, sp.application_status
          FROM beneficiaries b
          JOIN beneficiary_services bs ON bs.beneficiary_id = b.beneficiary_id
          JOIN skills_training_profiles sp ON sp.beneficiary_service_id = bs.beneficiary_service_id
@@ -1098,7 +1002,6 @@ function stDeleteProfile($id) {
 function stRecycleMap() {
     return [
         'skillsTrainingApplicant' => ['beneficiaries', 'beneficiary_id'],
-        'skillsTrainingBatch'     => ['skills_training_batches', 'batch_id'],
         'skillsTrainingActivity'  => ['skills_training_activities', 'activity_id'],
     ];
 }
@@ -1122,8 +1025,6 @@ function stRecordName($type, $id) {
                     CASE WHEN middle_name IS NOT NULL THEN ' ' || LEFT(middle_name, 1) || '.' ELSE '' END)
              FROM beneficiaries WHERE beneficiary_id = :id"
         );
-    } elseif ($type === 'skillsTrainingBatch') {
-        $s = db()->prepare("SELECT batch_name FROM skills_training_batches WHERE batch_id = :id");
     } else {
         $s = db()->prepare("SELECT activity_title FROM skills_training_activities WHERE activity_id = :id");
     }
@@ -1152,21 +1053,6 @@ function stListDeleted() {
             'deletedBy' => $r['deleted_by'] ?? '', 'deletedAt' => $r['deleted_at'],
         ];
     }, $s->fetchAll());
-
-    $batchS = db()->prepare(
-        "SELECT b.batch_id AS id, b.batch_name AS name, b.deleted_at, u.username AS deleted_by
-         FROM skills_training_batches b
-         LEFT JOIN users u ON u.user_id = b.deleted_by
-         WHERE b.deleted_at IS NOT NULL"
-    );
-    $batchS->execute();
-    foreach ($batchS->fetchAll() as $r) {
-        $items[] = [
-            'recordType' => 'skillsTrainingBatch', 'id' => (int) $r['id'], 'name' => $r['name'],
-            'module' => 'Skills Training Batches', 'description' => 'Skills Training batch',
-            'deletedBy' => $r['deleted_by'] ?? '', 'deletedAt' => $r['deleted_at'],
-        ];
-    }
 
     $actS = db()->prepare(
         "SELECT a.activity_id AS id, a.activity_title AS name, a.deleted_at, u.username AS deleted_by
@@ -1204,8 +1090,6 @@ function stRestoreRecord() {
 function stHardDeleteByType($type, $id) {
     if ($type === 'skillsTrainingApplicant') {
         stHardDeleteApplicant($id);
-    } elseif ($type === 'skillsTrainingBatch') {
-        db()->prepare("DELETE FROM skills_training_batches WHERE batch_id=:id")->execute([':id' => $id]);
     } else {
         db()->prepare("DELETE FROM skills_training_activities WHERE activity_id=:id")->execute([':id' => $id]);
     }
@@ -1249,9 +1133,9 @@ function stPurgeExpired() {
         logActivity($uid, 'Auto-Purge Record', 'skills', "Automatically purged \"{$name}\" after " . RECYCLE_BIN_RETENTION_DAYS . "-day recycle bin retention");
     }
 
-    // Batches and Activities: standalone module-specific tables, no
-    // cross-module ambiguity -- safe to use the plain recycle-map-driven query.
-    foreach (['skillsTrainingBatch', 'skillsTrainingActivity'] as $type) {
+    // Activities: a standalone module-specific table, no cross-module
+    // ambiguity -- safe to use the plain recycle-map-driven query.
+    foreach (['skillsTrainingActivity'] as $type) {
         [$table, $pk] = stRecycleMap()[$type];
         $s = db()->prepare(
             "SELECT {$pk} AS id FROM {$table}

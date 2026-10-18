@@ -25,8 +25,10 @@ function requireSession()
 // Stop the request unless someone is logged in AND their account is still
 // Active. An administrator setting a user to Inactive (or deleting them) must
 // take effect on the very next request, not only at their next login -- the
-// session they already hold would otherwise stay valid. The detail code lets
-// the app show "your account has been deactivated" instead of a generic error.
+// session they already hold would otherwise stay valid. Deleted and merely-
+// deactivated are reported with different detail codes so the app can tell
+// the signed-out user which one actually happened, rather than a generic
+// "deactivated" for both.
 // Returns the user id.
 function requireLogin()
 {
@@ -39,8 +41,13 @@ function requireLogin()
         session_destroy();
         error('Not authenticated.', 401);
     }
-    // Deactivated, or deleted (soft-deleted -> in the Recycle Bin).
-    if ($row['status'] !== 'Active' || $row['deleted_at'] !== null) {
+    // Deleted (soft-deleted -> in the Recycle Bin) takes priority over the
+    // status check: a deleted account's status is irrelevant at that point.
+    if ($row['deleted_at'] !== null) {
+        session_destroy();
+        error('Your account has been deleted.', 401, ['code' => 'ACCOUNT_DELETED']);
+    }
+    if ($row['status'] !== 'Active') {
         session_destroy();
         error('Your account has been deactivated.', 401, ['code' => 'ACCOUNT_DEACTIVATED']);
     }
