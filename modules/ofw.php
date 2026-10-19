@@ -212,7 +212,7 @@ function ofwBuildProfile($bid) {
         "SELECT b.*, bgy.barangay_name, c.city_name, p.province_name, r.region_name,
                 bs.beneficiary_service_id, bs.received_by,
                 op.ofw_profile_id, op.reference_no, op.date_filed, op.employment_status,
-                op.desired_position, op.type_of_skill, op.status, op.remarks
+                op.desired_position, op.type_of_skill, op.status
          FROM beneficiaries b
          JOIN beneficiary_services bs ON bs.beneficiary_id = b.beneficiary_id
          JOIN ofw_profiles op ON op.beneficiary_service_id = bs.beneficiary_service_id
@@ -281,7 +281,6 @@ function ofwBuildProfile($bid) {
         'employmentStatus'        => $b['employment_status'] ?? '',
         'typeOfRequest'           => $typeOfRequest,
         'status'                  => $b['status'] ?? 'Pending',
-        'remarks'                 => $b['remarks'] ?? '',
         'desiredPosition'         => $b['desired_position'] ?? '',
         'typeOfSkill'             => $b['type_of_skill'] ?? '',
         'agencies'                => array_values($agencies),
@@ -409,13 +408,13 @@ function ofwCreateProfile() {
 
         try {
             $s3 = $pdo->prepare(
-                "INSERT INTO ofw_profiles(beneficiary_service_id,reference_no,date_filed,employment_status,desired_position,type_of_skill,status,remarks,created_at,updated_at)
-                 VALUES(:bsid,:refno,:filed,:emp,:dp,:tos,:st,:rmk,now(),now()) RETURNING ofw_profile_id"
+                "INSERT INTO ofw_profiles(beneficiary_service_id,reference_no,date_filed,employment_status,desired_position,type_of_skill,status,created_at,updated_at)
+                 VALUES(:bsid,:refno,:filed,:emp,:dp,:tos,:st,now(),now()) RETURNING ofw_profile_id"
             );
             $s3->execute([
                 ':bsid' => $bsId, ':refno' => $refNo, ':filed' => $filed, ':emp' => $emp,
                 ':dp' => ofwNullStr($d['desiredPosition'] ?? ''), ':tos' => ofwNullStr($d['typeOfSkill'] ?? ''),
-                ':st' => $status, ':rmk' => ofwNullStr($d['remarks'] ?? ''),
+                ':st' => $status,
             ]);
         } catch (Throwable $e) {
             if (strpos($e->getMessage(), 'ofw_profiles_reference_no_key') !== false) {
@@ -474,12 +473,12 @@ function ofwUpdateProfile($id) {
 
         try {
             $pdo->prepare(
-                "UPDATE ofw_profiles SET reference_no=:refno,date_filed=:filed,employment_status=:emp,desired_position=:dp,type_of_skill=:tos,status=:st,remarks=:rmk,updated_at=now()
+                "UPDATE ofw_profiles SET reference_no=:refno,date_filed=:filed,employment_status=:emp,desired_position=:dp,type_of_skill=:tos,status=:st,updated_at=now()
                  WHERE ofw_profile_id=:pid"
             )->execute([
                 ':refno' => $refNo, ':filed' => $filed, ':emp' => $emp,
                 ':dp' => ofwNullStr($d['desiredPosition'] ?? ''), ':tos' => ofwNullStr($d['typeOfSkill'] ?? ''),
-                ':st' => $status, ':rmk' => ofwNullStr($d['remarks'] ?? ''), ':pid' => $profileId,
+                ':st' => $status, ':pid' => $profileId,
             ]);
         } catch (Throwable $e) {
             if (strpos($e->getMessage(), 'ofw_profiles_reference_no_key') !== false) {
