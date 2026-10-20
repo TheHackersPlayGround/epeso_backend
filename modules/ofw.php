@@ -402,7 +402,7 @@ function ofwCreateProfile() {
 
         // OFW has a single date (the Date Filed on the paper form); date_applied is the
         // shared spine column every program's reports read, so it mirrors date_filed.
-        $s2 = $pdo->prepare("INSERT INTO beneficiary_services(beneficiary_id,service_id,status,date_applied,received_by) VALUES(:bid,:sid,'Active',:date,:rby) RETURNING beneficiary_service_id");
+        $s2 = $pdo->prepare("INSERT INTO beneficiary_services(beneficiary_id,service_id,date_applied,received_by) VALUES(:bid,:sid,:date,:rby) RETURNING beneficiary_service_id");
         $s2->execute([':bid' => $bid, ':sid' => ofwServiceId(), ':date' => $filed, ':rby' => ofwNullStr($d['receivedBy'] ?? '')]);
         $bsId = (int)$s2->fetchColumn();
 

@@ -178,7 +178,6 @@ function gipFormatWorkplace($r) {
         'workplaceName'      => $r['workplace_name'],
         'description'        => $r['description'] ?? '',
         'deploymentLocation' => $r['deployment_location'] ?? '',
-        'coordinator'        => $r['coordinator'],
         'supervisor'         => $r['supervisor'] ?? '',
         'assignedCount'      => (int) $r['active_count'],
         'fundingSource'      => $funding,
@@ -207,10 +206,10 @@ function gipCreateWorkplace() {
     $allowance = is_numeric($d['allowance'] ?? null) ? (float) $d['allowance'] : null;
 
     $s = db()->prepare(
-        "INSERT INTO gip_workplaces(workplace_name,description,deployment_location,coordinator,supervisor,funding_source,monthly_allowance,created_at,updated_at)
-         VALUES(:name,:desc,:loc,:coord,:sup,:funding,:allow,now(),now()) RETURNING workplace_id"
+        "INSERT INTO gip_workplaces(workplace_name,description,deployment_location,supervisor,funding_source,monthly_allowance,created_at,updated_at)
+         VALUES(:name,:desc,:loc,:sup,:funding,:allow,now(),now()) RETURNING workplace_id"
     );
-    $s->execute([':name'=>$name,':desc'=>gipNullStr($d['description']??''),':loc'=>$loc,':coord'=>gipNullStr($d['coordinator']??''),':sup'=>$sup,':funding'=>$funding,':allow'=>$allowance]);
+    $s->execute([':name'=>$name,':desc'=>gipNullStr($d['description']??''),':loc'=>$loc,':sup'=>$sup,':funding'=>$funding,':allow'=>$allowance]);
     $id = (int) $s->fetchColumn();
 
     gipSyncWorkplaceDocuments(db(), $id, $uid, $d['documents'] ?? []);
@@ -231,8 +230,8 @@ function gipUpdateWorkplace($id) {
     if (!$curS->fetchColumn()) error('Workplace not found.', 404);
 
     db()->prepare(
-        "UPDATE gip_workplaces SET workplace_name=:name,description=:desc,deployment_location=:loc,coordinator=:coord,supervisor=:sup,funding_source=:funding,monthly_allowance=:allow,updated_at=now() WHERE workplace_id=:id"
-    )->execute([':name'=>$name,':desc'=>gipNullStr($d['description']??''),':loc'=>$loc,':coord'=>gipNullStr($d['coordinator']??''),':sup'=>$sup,':funding'=>$funding,':allow'=>$allowance,':id'=>$id]);
+        "UPDATE gip_workplaces SET workplace_name=:name,description=:desc,deployment_location=:loc,supervisor=:sup,funding_source=:funding,monthly_allowance=:allow,updated_at=now() WHERE workplace_id=:id"
+    )->execute([':name'=>$name,':desc'=>gipNullStr($d['description']??''),':loc'=>$loc,':sup'=>$sup,':funding'=>$funding,':allow'=>$allowance,':id'=>$id]);
 
     gipSyncWorkplaceDocuments(db(), $id, $uid, $d['documents'] ?? []);
     logActivity($uid, 'Update Workplace', 'gip-maintenance', "Updated workplace: {$name}");
@@ -297,7 +296,7 @@ function gipGetProfile($id) {
 function gipBuildProfile($bid) {
     $s = db()->prepare(
         "SELECT b.*, bgy.barangay_name, c.city_name, p.province_name, r.region_name,
-                bs.beneficiary_service_id, bs.date_applied, bs.status AS bs_status, bs.received_by
+                bs.beneficiary_service_id, bs.date_applied, bs.received_by
          FROM beneficiaries b
          JOIN beneficiary_services bs ON bs.beneficiary_id = b.beneficiary_id
          LEFT JOIN barangays bgy ON bgy.barangay_id = b.barangay_id
@@ -456,7 +455,7 @@ function gipInsertProfileRow($pdo, $uid, $d) {
     $s->execute([':fn'=>trim($d['firstName']),':mn'=>gipNullStr($d['middleName']??''),':ln'=>trim($d['lastName']),':sex'=>$sex,':bdate'=>$birth,':civil'=>$civil,':street'=>gipNullStr($d['streetPurok']??''),':bgy'=>$bgyId,':contact'=>gipNullStr($d['contactNumber']??''),':email'=>gipNullStr($d['email']??''),':educ'=>gipMapEducation($d['highestEducation']??'')]);
     $bid = (int) $s->fetchColumn();
 
-    $s2 = $pdo->prepare("INSERT INTO beneficiary_services(beneficiary_id,service_id,status,date_applied,received_by) VALUES(:bid,:sid,'Active',:date,:rby) RETURNING beneficiary_service_id");
+    $s2 = $pdo->prepare("INSERT INTO beneficiary_services(beneficiary_id,service_id,date_applied,received_by) VALUES(:bid,:sid,:date,:rby) RETURNING beneficiary_service_id");
     $s2->execute([':bid'=>$bid,':sid'=>gipServiceId(),':date'=>gipDate($d['dateApplicationReceived']??'')??date('Y-m-d'),':rby'=>gipNullStr($d['receivedBy']??'')]);
     $bsId = (int) $s2->fetchColumn();
 

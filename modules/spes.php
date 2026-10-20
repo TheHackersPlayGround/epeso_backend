@@ -333,7 +333,7 @@ function spesGetProfile($id) {
 function spesBuildProfile($bid) {
     $s = db()->prepare(
         "SELECT b.*, bgy.barangay_name, c.city_name, p.province_name, r.region_name,
-                bs.beneficiary_service_id, bs.date_applied, bs.status AS bs_status, bs.received_by
+                bs.beneficiary_service_id, bs.date_applied, bs.received_by
          FROM beneficiaries b
          JOIN beneficiary_services bs ON bs.beneficiary_id = b.beneficiary_id
          LEFT JOIN barangays bgy ON bgy.barangay_id = b.barangay_id
@@ -471,7 +471,7 @@ function spesInsertProfileRow($pdo, $uid, $d) {
     $s->execute([':fn'=>trim($d['firstName']),':mn'=>spesNullStr($d['middleName']??''),':ln'=>trim($d['lastName']),':sex'=>$sex,':bdate'=>$birth,':civil'=>$civil,':street'=>spesNullStr($d['streetPurok']??''),':bgy'=>$bgyId,':contact'=>spesNullStr($d['contactNumber']??''),':email'=>spesNullStr($d['email']??'')]);
     $bid = (int) $s->fetchColumn();
 
-    $s2 = $pdo->prepare("INSERT INTO beneficiary_services(beneficiary_id,service_id,status,date_applied,received_by) VALUES(:bid,:sid,'Active',:date,:rby) RETURNING beneficiary_service_id");
+    $s2 = $pdo->prepare("INSERT INTO beneficiary_services(beneficiary_id,service_id,date_applied,received_by) VALUES(:bid,:sid,:date,:rby) RETURNING beneficiary_service_id");
     $s2->execute([':bid'=>$bid,':sid'=>spesServiceId(),':date'=>spesDate($d['dateApplicationReceived']??'')??date('Y-m-d'),':rby'=>spesNullStr($d['receivedBy']??'')]);
     $bsId = (int) $s2->fetchColumn();
 

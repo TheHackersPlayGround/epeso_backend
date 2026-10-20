@@ -2,7 +2,8 @@
 // Skills Training: trainings/activities (skills_training_activities, each
 // carrying its own free-typed batch_name) -> participants
 // (skills_training_activity_participants), plus profiles (beneficiary spine +
-// skills_training_profiles + classification/qualification/purpose junctions).
+// skills_training_profiles + classification and skills_training_profile_options -- the
+// qualification/purpose choices, which share skills_training_options told apart by option_type).
 // Mirrors cdsp.php's activity->participant shape (the closest existing
 // precedent) rather than GIP/SPES's flat single-batch model.
 //
@@ -451,16 +452,16 @@ function stRemoveParticipant() {
 // ─── Lookup lists (Qualifications / Purposes) ────────────────────────────────
 
 function stListQualifications() {
-    $s = db()->query("SELECT qualification_id, qualification_name FROM skills_training_qualifications WHERE is_active=true ORDER BY qualification_id");
+    $s = db()->query("SELECT option_id, option_name FROM skills_training_options WHERE option_type='Qualification' AND is_active=true ORDER BY option_id");
     json(['status' => 'ok', 'data' => array_map(function($r) {
-        return ['id' => (int)$r['qualification_id'], 'name' => $r['qualification_name']];
+        return ['id' => (int)$r['option_id'], 'name' => $r['option_name']];
     }, $s->fetchAll())]);
 }
 
 function stListPurposes() {
-    $s = db()->query("SELECT purpose_id, purpose_name FROM skills_training_purposes WHERE is_active=true ORDER BY purpose_id");
+    $s = db()->query("SELECT option_id, option_name FROM skills_training_options WHERE option_type='Purpose' AND is_active=true ORDER BY option_id");
     json(['status' => 'ok', 'data' => array_map(function($r) {
-        return ['id' => (int)$r['purpose_id'], 'name' => $r['purpose_name']];
+        return ['id' => (int)$r['option_id'], 'name' => $r['option_name']];
     }, $s->fetchAll())]);
 }
 
@@ -562,10 +563,11 @@ function stBuildProfile($bid) {
     }
 
     $qS = db()->prepare(
-        "SELECT q.qualification_name, pq.other_qualification
-         FROM skills_training_profile_qualifications pq
-         JOIN skills_training_qualifications q ON q.qualification_id = pq.qualification_id
-         WHERE pq.skills_training_profile_id = :pid"
+        "SELECT o.option_name AS qualification_name, po.other_specification AS other_qualification
+         FROM skills_training_profile_options po
+         JOIN skills_training_options o ON o.option_id = po.option_id
+         WHERE po.skills_training_profile_id = :pid AND o.option_type = 'Qualification'
+         ORDER BY po.profile_option_id"
     );
     $qS->execute([':pid' => $profileId]);
     $desiredQualification = [];
@@ -576,10 +578,11 @@ function stBuildProfile($bid) {
     }
 
     $puS = db()->prepare(
-        "SELECT pu.purpose_name, pp.other_purpose
-         FROM skills_training_profile_purposes pp
-         JOIN skills_training_purposes pu ON pu.purpose_id = pp.purpose_id
-         WHERE pp.skills_training_profile_id = :pid"
+        "SELECT o.option_name AS purpose_name, po.other_specification AS other_purpose
+         FROM skills_training_profile_options po
+         JOIN skills_training_options o ON o.option_id = po.option_id
+         WHERE po.skills_training_profile_id = :pid AND o.option_type = 'Purpose'
+         ORDER BY po.profile_option_id"
     );
     $puS->execute([':pid' => $profileId]);
     $purposeOfTraining = [];
@@ -726,12 +729,12 @@ function stSyncSelections($pdo, $bid, $profileId, $d) {
     }
 
     $qualMap = [];
-    foreach (db()->query("SELECT qualification_id, qualification_name FROM skills_training_qualifications")->fetchAll() as $r) {
-        $qualMap[$r['qualification_name']] = (int)$r['qualification_id'];
+    foreach (db()->query("SELECT option_id, option_name FROM skills_training_options WHERE option_type='Qualification'")->fetchAll() as $r) {
+        $qualMap[$r['option_name']] = (int)$r['option_id'];
     }
     $rawQual = is_array($d['desiredQualification'] ?? null) ? $d['desiredQualification'] : [];
     $qualOtherList = is_array($d['qualificationOther'] ?? null) ? array_filter($d['qualificationOther']) : [];
-    $insQual = $pdo->prepare("INSERT INTO skills_training_profile_qualifications(skills_training_profile_id,qualification_id,other_qualification) VALUES(:pid,:qid,:other)");
+    $insQual = $pdo->prepare("INSERT INTO skills_training_profile_options(skills_training_profile_id,option_id,other_specification) VALUES(:pid,:qid,:other)");
     foreach ($rawQual as $q) {
         if (isset($qualMap[$q])) $insQual->execute([':pid' => $profileId, ':qid' => $qualMap[$q], ':other' => null]);
     }
@@ -742,12 +745,12 @@ function stSyncSelections($pdo, $bid, $profileId, $d) {
     }
 
     $purMap = [];
-    foreach (db()->query("SELECT purpose_id, purpose_name FROM skills_training_purposes")->fetchAll() as $r) {
-        $purMap[$r['purpose_name']] = (int)$r['purpose_id'];
+    foreach (db()->query("SELECT option_id, option_name FROM skills_training_options WHERE option_type='Purpose'")->fetchAll() as $r) {
+        $purMap[$r['option_name']] = (int)$r['option_id'];
     }
     $rawPur = is_array($d['purposeOfTraining'] ?? null) ? $d['purposeOfTraining'] : [];
     $purOtherList = is_array($d['purposeOther'] ?? null) ? array_filter($d['purposeOther']) : [];
-    $insPur = $pdo->prepare("INSERT INTO skills_training_profile_purposes(skills_training_profile_id,purpose_id,other_purpose) VALUES(:pid,:puid,:other)");
+    $insPur = $pdo->prepare("INSERT INTO skills_training_profile_options(skills_training_profile_id,option_id,other_specification) VALUES(:pid,:puid,:other)");
     foreach ($rawPur as $p) {
         if (isset($purMap[$p])) $insPur->execute([':pid' => $profileId, ':puid' => $purMap[$p], ':other' => null]);
     }
@@ -797,7 +800,7 @@ function stInsertProfileRow($pdo, $uid, $d) {
     ]);
     $bid = (int)$s->fetchColumn();
 
-    $s2 = $pdo->prepare("INSERT INTO beneficiary_services(beneficiary_id,service_id,status,date_applied,received_by) VALUES(:bid,:sid,'Active',:date,:rby) RETURNING beneficiary_service_id");
+    $s2 = $pdo->prepare("INSERT INTO beneficiary_services(beneficiary_id,service_id,date_applied,received_by) VALUES(:bid,:sid,:date,:rby) RETURNING beneficiary_service_id");
     $s2->execute([':bid' => $bid, ':sid' => stServiceId(), ':date' => stDate($d['dateApplicationReceived'] ?? '') ?? date('Y-m-d'), ':rby' => stNullStr($d['receivedBy'] ?? '')]);
     $bsId = (int)$s2->fetchColumn();
 
@@ -952,8 +955,7 @@ function stUpdateProfile($id) {
             ->execute([':st' => $appStatus, ':pid' => $profileId]);
 
         $pdo->prepare("DELETE FROM beneficiary_classifications WHERE beneficiary_id=:bid")->execute([':bid' => $bid]);
-        $pdo->prepare("DELETE FROM skills_training_profile_qualifications WHERE skills_training_profile_id=:pid")->execute([':pid' => $profileId]);
-        $pdo->prepare("DELETE FROM skills_training_profile_purposes WHERE skills_training_profile_id=:pid")->execute([':pid' => $profileId]);
+        $pdo->prepare("DELETE FROM skills_training_profile_options WHERE skills_training_profile_id=:pid")->execute([':pid' => $profileId]);
         stSyncSelections($pdo, $bid, $profileId, $d);
 
         stSyncDocuments($pdo, $bid, $bsId, $uid, $d);
@@ -1165,8 +1167,7 @@ function stHardDeleteApplicant($bid) {
             $pidS->execute([':id' => $bsId]);
             $pid = $pidS->fetchColumn();
             if ($pid) {
-                $pdo->prepare("DELETE FROM skills_training_profile_qualifications WHERE skills_training_profile_id = :id")->execute([':id' => $pid]);
-                $pdo->prepare("DELETE FROM skills_training_profile_purposes WHERE skills_training_profile_id = :id")->execute([':id' => $pid]);
+                $pdo->prepare("DELETE FROM skills_training_profile_options WHERE skills_training_profile_id = :id")->execute([':id' => $pid]);
             }
             $pdo->prepare("DELETE FROM skills_training_profiles WHERE beneficiary_service_id = :id")->execute([':id' => $bsId]);
         }

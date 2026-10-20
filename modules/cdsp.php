@@ -437,11 +437,18 @@ function cdspDeleteActivity($id) {
 
 // ─── Participants ─────────────────────────────────────────────────────────────
 
+// Each participant's status is DERIVED, the same rule the CDSP profile list uses (see
+// cdspBuildProfile): Active while they are in any activity that is not Completed, Inactive
+// otherwise. (beneficiary_services.status is never updated after enrolment, so it is not read.)
 function cdspListActivityParticipants($activityId) {
     if (!is_numeric($activityId)) error('Invalid activity id.', 422);
     $s = db()->prepare(
         "SELECT b.beneficiary_id, b.first_name, b.last_name, b.middle_name, b.contact_no,
-                bs.beneficiary_service_id, bs.status AS bs_status,
+                bs.beneficiary_service_id,
+                EXISTS (SELECT 1 FROM cdsp_activity_participants cap2
+                        JOIN cdsp_activities ca2 ON ca2.activity_id = cap2.activity_id
+                        WHERE cap2.beneficiary_service_id = bs.beneficiary_service_id
+                          AND ca2.status <> 'Completed') AS has_open_activity,
                 sv.service_name AS service_availed, cap.attended,
                 array_agg(bc.classification) FILTER (WHERE bc.classification IS NOT NULL) AS cls
          FROM cdsp_activity_participants cap
@@ -451,7 +458,7 @@ function cdspListActivityParticipants($activityId) {
          LEFT JOIN beneficiary_classifications bc ON bc.beneficiary_id = b.beneficiary_id
          WHERE cap.activity_id = :aid
          GROUP BY b.beneficiary_id,b.first_name,b.last_name,b.middle_name,b.contact_no,
-                  bs.beneficiary_service_id,bs.status,sv.service_name,cap.attended
+                  bs.beneficiary_service_id,sv.service_name,cap.attended
          ORDER BY b.last_name, b.first_name"
     );
     $s->execute([':aid' => (int)$activityId]);
@@ -461,7 +468,7 @@ function cdspListActivityParticipants($activityId) {
             $cls = trim($cls, '{}');
             $cls = $cls === '' ? [] : array_map(function($v) { return trim($v, '"'); }, str_getcsv($cls));
         } else { $cls = []; }
-        return ['id'=>(int)$r['beneficiary_id'],'beneficiaryServiceId'=>(int)$r['beneficiary_service_id'],'lastName'=>$r['last_name'],'firstName'=>$r['first_name'],'middleName'=>$r['middle_name']??'','contactNumber'=>$r['contact_no']??'','serviceAvailed'=>$r['service_availed'],'classification'=>$cls,'status'=>$r['bs_status'],'attended'=>$r['attended'] === null ? null : (bool)$r['attended']];
+        return ['id'=>(int)$r['beneficiary_id'],'beneficiaryServiceId'=>(int)$r['beneficiary_service_id'],'lastName'=>$r['last_name'],'firstName'=>$r['first_name'],'middleName'=>$r['middle_name']??'','contactNumber'=>$r['contact_no']??'','serviceAvailed'=>$r['service_availed'],'classification'=>$cls,'status'=>in_array($r['has_open_activity'], [true, 't', 1, '1'], true) ? 'Active' : 'Inactive','attended'=>$r['attended'] === null ? null : (bool)$r['attended']];
     }, $s->fetchAll());
     json(['status' => 'ok', 'data' => $out]);
 }
@@ -644,7 +651,7 @@ function cdspBuildProfile($bid) {
     $s = db()->prepare(
         "SELECT b.*, bgy.barangay_name, c.city_name, p.province_name, r.region_name,
                 bs.beneficiary_service_id, bs.service_id AS enrolled_service_id,
-                bs.date_applied, bs.status AS bs_status, bs.received_by, sv.service_name AS service_availed
+                bs.date_applied, bs.received_by, sv.service_name AS service_availed
          FROM beneficiaries b
          JOIN beneficiary_services bs ON bs.beneficiary_id = b.beneficiary_id
          JOIN services sv ON sv.service_id = bs.service_id
@@ -737,11 +744,12 @@ function cdspBuildProfile($bid) {
     if (!empty($b['birth_date'])) {
         $age = (new DateTime($b['birth_date']))->diff(new DateTime('today'))->y;
     }
-    // Status is DERIVED from the current assignment, never read from a stored
-    // column (beneficiary_services.status / cdsp_profiles.status are not kept in
-    // sync): Active while the person's current activity is Planned/Ongoing,
-    // Inactive with no assignment or once that activity is Completed. Same rule
-    // as DILP/TUPAD/SLP/CLPEP, so the page, reports and exports all agree.
+    // Status is DERIVED from the current assignment rather than read from the stored
+    // column (cdsp_profiles.status mirrors this rule -- see cdspSyncProfileStatusWhere --
+    // and beneficiary_services.status is not used at all): Active while the person's
+    // current activity is Planned/Ongoing, Inactive with no assignment or once that
+    // activity is Completed. Same rule as DILP/TUPAD/SLP/CLPEP, so the page, reports
+    // and exports all agree.
     $frontendStatus = ($currentAct && $currentAct['activity_status'] !== 'Completed') ? 'Active' : 'Inactive';
 
     return [
@@ -828,7 +836,7 @@ function cdspInsertProfileRow($pdo, $uid, $d) {
     $s->execute([':fn'=>trim($d['firstName']),':mn'=>cdspNullStr($d['middleName']??''),':ln'=>trim($d['lastName']),':sex'=>$sex,':bdate'=>$birth,':civil'=>$civil,':street'=>cdspNullStr($d['streetPurok']??''),':bgy'=>$bgyId,':contact'=>cdspNullStr($d['contactNumber']??''),':email'=>cdspNullStr($d['email']??''),':educ'=>cdspMapEducation($d['highestEducation']??'')]);
     $bid = (int)$s->fetchColumn();
 
-    $s2 = $pdo->prepare("INSERT INTO beneficiary_services(beneficiary_id,service_id,status,date_applied,received_by) VALUES(:bid,:sid,'Active',:date,:rby) RETURNING beneficiary_service_id");
+    $s2 = $pdo->prepare("INSERT INTO beneficiary_services(beneficiary_id,service_id,date_applied,received_by) VALUES(:bid,:sid,:date,:rby) RETURNING beneficiary_service_id");
     $s2->execute([':bid'=>$bid,':sid'=>$serviceId,':date'=>cdspDate($d['dateApplicationReceived']??'')??date('Y-m-d'),':rby'=>cdspNullStr($d['receivedBy']??'')]);
     $bsId = (int)$s2->fetchColumn();
 

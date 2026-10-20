@@ -562,7 +562,7 @@ function slpInsertProfileRow($pdo, $uid, $d) {
     $bid = (int) $s->fetchColumn();
 
     $s2 = $pdo->prepare(
-        "INSERT INTO beneficiary_services(beneficiary_id,service_id,status,date_applied,received_by,remarks) VALUES(:bid,:sid,'Active',:date,:rby,:rmk) RETURNING beneficiary_service_id"
+        "INSERT INTO beneficiary_services(beneficiary_id,service_id,date_applied,received_by,remarks) VALUES(:bid,:sid,:date,:rby,:rmk) RETURNING beneficiary_service_id"
     );
     $s2->execute([
         ':bid' => $bid, ':sid' => slpServiceId(), ':date' => slpDate($d['dateApplied'] ?? '') ?? date('Y-m-d'),

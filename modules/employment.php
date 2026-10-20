@@ -7,7 +7,7 @@
 //   beneficiaries
 //   -> beneficiary_services (service = EF)
 //      -> employment_facilitation_profiles
-//   -> resume sub-tables (educations, trainings, eligibilities, licenses,
+//   -> resume sub-tables (educations, trainings, applicant_credentials [eligibilities + licenses],
 //      work_experiences, job_preferences, languages, skills)
 //
 // Fields the EF schema has no column for are NOT persisted yet: referred
@@ -46,6 +46,7 @@ function handle($action, $id, $method)
         case 'deleteApplicant':
             requirePermission('employment', 'Editor');
             return employmentDeleteApplicant($id);
+        case 'listIndustries':    requirePermission('employment', 'Viewer'); return efListIndustries();
         case 'listEmployers':
             requirePermission('employment', 'Viewer');
             return efListEmployers();
@@ -239,8 +240,8 @@ function employmentCreateApplicant()
 
         // Enroll in the Employment Facilitation service.
         $stmt = $pdo->prepare(
-            "INSERT INTO beneficiary_services (beneficiary_id, service_id, status, date_applied, received_by)
-             VALUES (:bid, :sid, 'Active', CURRENT_DATE, :uid)
+            "INSERT INTO beneficiary_services (beneficiary_id, service_id, date_applied, received_by)
+             VALUES (:bid, :sid, CURRENT_DATE, :uid)
              RETURNING beneficiary_service_id"
         );
         $stmt->execute([':bid' => $beneficiaryId, ':sid' => efServiceId(), ':uid' => $uid]);
@@ -296,8 +297,8 @@ function employmentImportApplicantsBulk()
             $beneficiaryId = employmentInsertBeneficiary($pdo, $d);
 
             $stmt = $pdo->prepare(
-                "INSERT INTO beneficiary_services (beneficiary_id, service_id, status, date_applied, received_by)
-                 VALUES (:bid, :sid, 'Active', CURRENT_DATE, :uid)
+                "INSERT INTO beneficiary_services (beneficiary_id, service_id, date_applied, received_by)
+                 VALUES (:bid, :sid, CURRENT_DATE, :uid)
                  RETURNING beneficiary_service_id"
             );
             $stmt->execute([':bid' => $beneficiaryId, ':sid' => efServiceId(), ':uid' => $uid]);
@@ -719,7 +720,8 @@ function employmentInsertResumeTables($pdo, $bid, $d)
 
     // Eligibilities.
     $eligInsert = $pdo->prepare(
-        "INSERT INTO eligibilities (beneficiary_id, eligibility_name, date_taken) VALUES (:bid, :name, :date)"
+        "INSERT INTO applicant_credentials (beneficiary_id, credential_type, credential_name, date_taken)
+         VALUES (:bid, 'Eligibility', :name, :date)"
     );
     foreach (($d['eligibilities'] ?? []) as $row) {
         if (is_array($row) && efNull($row['eligibility'] ?? '') !== null) {
@@ -733,7 +735,8 @@ function employmentInsertResumeTables($pdo, $bid, $d)
 
     // Professional licenses.
     $licInsert = $pdo->prepare(
-        "INSERT INTO licenses (beneficiary_id, license_name, valid_until) VALUES (:bid, :name, :valid)"
+        "INSERT INTO applicant_credentials (beneficiary_id, credential_type, credential_name, valid_until)
+         VALUES (:bid, 'License', :name, :valid)"
     );
     foreach (($d['professionalLicenses'] ?? []) as $row) {
         if (is_array($row) && efNull($row['license'] ?? '') !== null) {
@@ -923,8 +926,9 @@ function employmentBuildApplicant($bid)
     // Sub-tables.
     $educations   = employmentFetchAll("SELECT * FROM educations WHERE beneficiary_id = :id ORDER BY education_id", $bid);
     $trainings    = employmentFetchAll("SELECT * FROM trainings WHERE beneficiary_id = :id ORDER BY training_id", $bid);
-    $eligibilities = employmentFetchAll("SELECT * FROM eligibilities WHERE beneficiary_id = :id ORDER BY eligibility_id", $bid);
-    $licenses     = employmentFetchAll("SELECT * FROM licenses WHERE beneficiary_id = :id ORDER BY license_id", $bid);
+    // Eligibilities and professional licenses share one table, told apart by credential_type.
+    $eligibilities = employmentFetchAll("SELECT * FROM applicant_credentials WHERE beneficiary_id = :id AND credential_type = 'Eligibility' ORDER BY credential_id", $bid);
+    $licenses     = employmentFetchAll("SELECT * FROM applicant_credentials WHERE beneficiary_id = :id AND credential_type = 'License' ORDER BY credential_id", $bid);
     $workExp      = employmentFetchAll(
         "SELECT w.*, (c.city_name || ', ' || p.province_name) AS company_city_name
          FROM work_experiences w
@@ -1055,8 +1059,8 @@ function employmentBuildApplicant($bid)
         'currentlyInSchool' => !empty($ef['currently_in_school']) ? 'Yes' : 'No',
         'elementary' => $elem, 'secondary' => $sec, 'tertiary' => $tert, 'graduateStudies' => $grad,
         'trainings' => array_map(fn($t) => ['course' => $t['course'], 'hoursOfTraining' => $t['hours_of_training'] !== null ? (string) $t['hours_of_training'] : '', 'institution' => $t['institution'] ?? '', 'skillsAcquired' => $t['skills_acquired'] ?? '', 'certificateReceived' => $t['certificate_received'] ?? ''], $trainings),
-        'eligibilities' => array_map(fn($e) => ['eligibility' => $e['eligibility_name'], 'dateTaken' => $e['date_taken'] ?? ''], $eligibilities),
-        'professionalLicenses' => array_map(fn($l) => ['license' => $l['license_name'], 'validUntil' => $l['valid_until'] ?? ''], $licenses),
+        'eligibilities' => array_map(fn($e) => ['eligibility' => $e['credential_name'], 'dateTaken' => $e['date_taken'] ?? ''], $eligibilities),
+        'professionalLicenses' => array_map(fn($l) => ['license' => $l['credential_name'], 'validUntil' => $l['valid_until'] ?? ''], $licenses),
         'workExperiences' => array_map(fn($w) => [
             'companyName' => $w['company_name'] ?? '',
             'companyCity' => $w['company_city_name'] ?? '',
@@ -1210,7 +1214,7 @@ function employmentUpdateApplicant($id)
         $pdo->prepare("DELETE FROM employment_facilitation_profiles WHERE beneficiary_service_id = :id")->execute([':id' => $bsId]);
         employmentInsertEfProfile($pdo, $bsId, $d);
 
-        foreach (['educations', 'trainings', 'eligibilities', 'licenses', 'work_experiences', 'job_preferences', 'languages', 'skills'] as $t) {
+        foreach (['educations', 'trainings', 'applicant_credentials', 'work_experiences', 'job_preferences', 'languages', 'skills'] as $t) {
             $pdo->prepare("DELETE FROM {$t} WHERE beneficiary_id = :id")->execute([':id' => $bid]);
         }
         employmentInsertResumeTables($pdo, $bid, $d);
@@ -1325,7 +1329,7 @@ function employmentHardDeleteApplicant($bid)
             $pdo->prepare("DELETE FROM employment_facilitation_profiles WHERE beneficiary_service_id = :id")->execute([':id' => $bsId]);
         }
         employmentUnlinkDocs($pdo, $bid); // unlink all document files first
-        foreach (['educations', 'trainings', 'eligibilities', 'licenses', 'work_experiences', 'job_preferences', 'languages', 'skills', 'beneficiary_classifications', 'disabilities', 'attached_documents'] as $t) {
+        foreach (['educations', 'trainings', 'applicant_credentials', 'work_experiences', 'job_preferences', 'languages', 'skills', 'beneficiary_classifications', 'disabilities', 'attached_documents'] as $t) {
             $pdo->prepare("DELETE FROM {$t} WHERE beneficiary_id = :id")->execute([':id' => $bid]);
         }
         $pdo->prepare("DELETE FROM beneficiary_services WHERE beneficiary_id = :id")->execute([':id' => $bid]);
@@ -1342,21 +1346,24 @@ function employmentHardDeleteApplicant($bid)
 // EMPLOYERS
 // ═══════════════════════════════════════════════════════════════════════════════
 
-// ─── Industry helpers ────────────────────────────────────────────────────────
+// ─── Industry helpers (employers.industry is a plain text column) ────────────────────────────────────────────────────────
 
-// Upsert an industry by name; returns its id. Returns null for empty name.
-function efGetOrCreateIndustry($name)
+// Tidy an industry name before it is saved, so spelling variants don't pile up:
+//  - trim and collapse repeated spaces;
+//  - if it matches a standard name ignoring case ("retail"), save the standard spelling;
+//  - else if an employer already has the same name ignoring case ("mining" vs "Mining"),
+//    reuse that spelling; otherwise keep it as typed.
+function efNormalizeIndustry($name)
 {
-    $name = is_string($name) ? trim($name) : '';
+    $name = is_string($name) ? trim(preg_replace('/\s+/u', ' ', $name)) : '';
     if ($name === '') return null;
-    $pdo = db();
-    $sel = $pdo->prepare("SELECT industry_id FROM industries WHERE industry_name = :n LIMIT 1");
+    foreach (efStandardIndustries() as $std) {
+        if (mb_strtolower($std) === mb_strtolower($name)) return $std;
+    }
+    $sel = db()->prepare("SELECT industry FROM employers WHERE industry IS NOT NULL AND lower(industry) = lower(:n) ORDER BY employer_id LIMIT 1");
     $sel->execute([':n' => $name]);
-    $id = $sel->fetchColumn();
-    if ($id !== false) return (int) $id;
-    $ins = $pdo->prepare("INSERT INTO industries (industry_name, is_active) VALUES (:n, true) RETURNING industry_id");
-    $ins->execute([':n' => $name]);
-    return (int) $ins->fetchColumn();
+    $existing = $sel->fetchColumn();
+    return $existing !== false ? $existing : $name;
 }
 
 // Resolve the effective industry name from form data (handles the "Other" case).
@@ -1364,26 +1371,30 @@ function efResolveIndustryName($d)
 {
     $ind = efNull($d['industry'] ?? '');
     if ($ind === null) return null;
-    if ($ind === 'Other') return efNull($d['industryOther'] ?? '');
-    return $ind;
+    if (strcasecmp($ind, 'Other') === 0) return efNormalizeIndustry($d['industryOther'] ?? '');
+    return efNormalizeIndustry($ind);
 }
 
-// Map the frontend company-size label to the DB employer_size_enum.
-function efMapCompanySize($size)
+// GET /api/employment/listIndustries -- the choices for every industry dropdown and filter:
+// the standard names (the single list; the app has no other copy) plus any custom names that
+// employers currently use, so a custom industry such as "Mining" can be filtered on too.
+function efListIndustries()
 {
-    if (strpos((string) $size, 'Small') !== false) return 'Small';
-    if (strpos((string) $size, 'Medium') !== false) return 'Medium';
-    if (strpos((string) $size, 'Large') !== false) return 'Large';
-    return null; // nullable column
-}
-
-// Map the DB employer_size_enum back to the frontend label.
-function efExpandCompanySize($size)
-{
-    if ($size === 'Small') return 'Small (1-50 employees)';
-    if ($size === 'Medium') return 'Medium (51-200 employees)';
-    if ($size === 'Large') return 'Large (201+ employees)';
-    return $size ?? '';
+    $standard = efStandardIndustries();
+    $lower = array_map('mb_strtolower', $standard);
+    $rows = db()->query(
+        "SELECT DISTINCT industry FROM employers
+         WHERE deleted_at IS NULL AND industry IS NOT NULL AND btrim(industry) <> ''
+         ORDER BY industry"
+    )->fetchAll(PDO::FETCH_COLUMN);
+    $custom = [];
+    foreach ($rows as $name) {
+        $l = mb_strtolower($name);
+        if ($l === 'other' || in_array($l, $lower, true)) continue;
+        $custom[] = $name;
+    }
+    usort($custom, fn($a, $b) => strcasecmp($a, $b));
+    json(['status' => 'ok', 'data' => ['standard' => $standard, 'custom' => $custom]]);
 }
 
 // Standard industry names (used when reading back to detect "Other" case).
@@ -1393,21 +1404,32 @@ function efStandardIndustries()
             'Education', 'Construction', 'Hospitality', 'Transportation', 'Financial Services'];
 }
 
+// The standard spelling of an industry name when it matches a standard one ignoring case
+// ("agriculture" -> "Agriculture"), else null. Used when reading, so lists agree even for
+// names saved before names were tidied on save.
+function efStandardIndustryMatch($name)
+{
+    foreach (efStandardIndustries() as $std) {
+        if (strcasecmp($std, (string) $name) === 0) return $std;
+    }
+    return null;
+}
+
 // Build the frontend Employer object from a DB row (with joined fields).
 function efBuildEmployer($row)
 {
-    $industryName = $row['industry_name'] ?? '';
-    $standard     = efStandardIndustries();
-    $isStandard   = in_array($industryName, $standard, true);
+    $industryName  = $row['industry'] ?? '';
+    $standardMatch = efStandardIndustryMatch($industryName);   // the standard spelling, if it is one
 
     return [
         'id'                => (int) $row['employer_id'],
         'companyName'       => $row['company_name'],
-        'industry'          => $isStandard ? $industryName : ($industryName !== '' ? 'Other' : ''),
-        'industryOther'     => (!$isStandard && $industryName !== '') ? $industryName : '',
-        'companySize'       => efExpandCompanySize($row['company_size'] ?? ''),
+        // industry / industryOther drive the form's dropdown + "specify" box; industryName is
+        // the real name, for lists, filters and exports (a custom industry shows as itself).
+        'industry'          => $standardMatch ?? ($industryName !== '' ? 'Other' : ''),
+        'industryOther'     => ($standardMatch === null && $industryName !== '') ? $industryName : '',
+        'industryName'      => $standardMatch ?? $industryName,
         'businessType'      => $row['business_type'] ?? '',
-        'yearsInOperation'  => $row['years_in_operation'] !== null ? (string) $row['years_in_operation'] : '',
         'tinNumber'         => $row['tin_number'] ?? '',
         'contactPersonName' => $row['contact_person_name'] ?? '',
         'position'          => $row['contact_person_position'] ?? '',
@@ -1434,10 +1456,9 @@ function efBuildEmployer($row)
 function efListEmployers()
 {
     $stmt = db()->prepare(
-        "SELECT e.*, i.industry_name,
+        "SELECT e.*,
                 bgy.barangay_name, c.city_name, c.city_id, p.province_name, p.province_id, r.region_name
          FROM employers e
-         LEFT JOIN industries i   ON i.industry_id   = e.industry_id
          LEFT JOIN barangays  bgy ON bgy.barangay_id = e.barangay_id
          LEFT JOIN cities     c   ON c.city_id        = bgy.city_id
          LEFT JOIN provinces  p   ON p.province_id    = c.province_id
@@ -1462,20 +1483,22 @@ function efValidateEmployer($d)
     if (efNull($d['dateRegistered']   ?? '') === null) return 'Date registered is required.';
     if (efDateOrNull($d['dateRegistered'] ?? '') === null) return 'Invalid date registered format.';
     if (efDateOrNull($d['dateRegistered'] ?? '') > date('Y-m-d')) return 'Date registered cannot be in the future.';
+    // "Other" needs the industry typed in -- otherwise nothing would be saved, silently.
+    $ind = efNull($d['industry'] ?? '');
+    if ($ind !== null && strcasecmp($ind, 'Other') === 0) {
+        $other = trim(preg_replace('/\s+/u', ' ', (string) ($d['industryOther'] ?? '')));
+        if ($other === '' || strcasecmp($other, 'Other') === 0) return 'Please specify the industry when "Other" is selected.';
+    }
     return '';
 }
 
 function efBindEmployer($stmt, $d, $extra = [])
 {
     $industryName = efResolveIndustryName($d);
-    $industryId   = $industryName ? efGetOrCreateIndustry($industryName) : null;
-    $size         = efNull($d['companySize'] ?? '') ? efMapCompanySize($d['companySize']) : null;
 
     $params = array_merge([
         ':name'    => trim($d['companyName']),
-        ':iid'     => $industryId,
-        ':size'    => $size,
-        ':years'   => is_numeric($d['yearsInOperation'] ?? '') ? (int) $d['yearsInOperation'] : null,
+        ':industry' => $industryName,
         ':tin'     => efNull($d['tinNumber'] ?? ''),
         ':cname'   => trim($d['contactPersonName']),
         ':cpos'    => efNull($d['position'] ?? ''),
@@ -1505,11 +1528,11 @@ function efCreateEmployer()
         $pdo->beginTransaction();
         $stmt = $pdo->prepare(
             "INSERT INTO employers
-                (company_name, industry_id, company_size, years_in_operation, tin_number,
+                (company_name, industry, tin_number,
                  contact_person_name, contact_person_position, contact_number, email_address,
                  building_no, street, barangay_id, status, date_registered, remarks, business_type)
              VALUES
-                (:name, :iid, :size, :years, :tin,
+                (:name, :industry, :tin,
                  :cname, :cpos, :cnum, :email,
                  :bldg, :street, :bgid, :status, :dreg, :remarks, :btype)
              RETURNING employer_id"
@@ -1557,11 +1580,11 @@ function efImportEmployersBulk()
         foreach ($rows as $d) {
             $stmt = $pdo->prepare(
                 "INSERT INTO employers
-                    (company_name, industry_id, company_size, years_in_operation, tin_number,
+                    (company_name, industry, tin_number,
                      contact_person_name, contact_person_position, contact_number, email_address,
                      building_no, street, barangay_id, status, date_registered, remarks, business_type)
                  VALUES
-                    (:name, :iid, :size, :years, :tin,
+                    (:name, :industry, :tin,
                      :cname, :cpos, :cnum, :email,
                      :bldg, :street, :bgid, :status, :dreg, :remarks, :btype)
                  RETURNING employer_id"
@@ -1597,8 +1620,7 @@ function efUpdateEmployer($id)
     try {
         $stmt = db()->prepare(
             "UPDATE employers SET
-                company_name = :name, industry_id = :iid, company_size = :size,
-                years_in_operation = :years, tin_number = :tin,
+                company_name = :name, industry = :industry, tin_number = :tin,
                 contact_person_name = :cname, contact_person_position = :cpos,
                 contact_number = :cnum, email_address = :email,
                 building_no = :bldg, street = :street, barangay_id = :bgid,
@@ -1706,7 +1728,7 @@ function efBuildVacancy($row)
         'employerId'     => (int) $row['employer_id'],
         'vacanciesCount' => $remaining,   // remaining openings (derived)
         'slotsTotal'     => $slotsTotal,  // original openings solicited
-        'industry'       => $row['industry_name'] ?? '',
+        'industry'       => efStandardIndustryMatch($row['industry'] ?? '') ?? ($row['industry'] ?? ''),
         'jobType'        => $row['job_type'],
         'salaryMin'      => $min !== null ? (float) $min : null,
         'salaryMax'      => $max !== null ? (float) $max : null,
@@ -1725,12 +1747,11 @@ function efBuildVacancy($row)
 function efListVacancies()
 {
     $stmt = db()->prepare(
-        "SELECT v.*, e.company_name, i.industry_name,
+        "SELECT v.*, e.company_name, e.industry,
                 (SELECT COUNT(*) FROM employment_facilitation_placements p
                  WHERE p.vacancy_id = v.vacancy_id AND p.status = 'Active') AS active_placements
          FROM vacancies v
          JOIN employers e    ON e.employer_id  = v.employer_id
-         LEFT JOIN industries i ON i.industry_id = e.industry_id
          ORDER BY v.vacancy_id DESC"
     );
     $stmt->execute();
