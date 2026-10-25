@@ -5,6 +5,7 @@ include_once __DIR__ . '/../core/helpers.php';
 include_once __DIR__ . '/../core/guard.php';
 include_once __DIR__ . '/../core/activity_log.php';
 
+// Routes a GIP action to its handler function.
 function handle($action, $id, $method)
 {
     switch ($action) {
@@ -32,21 +33,26 @@ function handle($action, $id, $method)
 
 // ─── Helpers ─────────────────────────────────────────────────────────────────
 
+// Trims a string, converting empty/blank to null.
 function gipNullStr($v) {
     $s = is_string($v) ? trim($v) : $v;
     return ($s === '' || $s === null) ? null : $s;
 }
+// Validates and returns a YYYY-MM-DD date string, or null.
 function gipDate($v) {
     $s = is_string($v) ? trim($v) : '';
     return preg_match('/^\d{4}-\d{2}-\d{2}$/', $s) ? $s : null;
 }
+// Converts a numeric value to int, or null.
 function gipIntOrNull($v) { return is_numeric($v) ? (int)$v : null; }
+// Validates and returns a 4-digit year, or null.
 function gipYearOrNull($v) {
     if (!is_numeric($v)) return null;
     $y = (int)$v;
     return ($y >= 1900 && $y <= 2100) ? $y : null;
 }
 
+// Returns the GIP service_id (cached).
 function gipServiceId() {
     static $sid = null;
     if ($sid !== null) return $sid;
@@ -56,7 +62,7 @@ function gipServiceId() {
     return (int)$sid;
 }
 
-// Map frontend education labels to educational_attainment enum.
+// Maps a frontend education label to the educational_attainment enum.
 function gipMapEducation($v) {
     $map = [
         'Elementary Level'            => 'Elementary Level',
@@ -75,15 +81,7 @@ function gipMapEducation($v) {
     return isset($map[$v]) ? $map[$v] : null;
 }
 
-// Inverse of gipMapEducation() — the DB stores educational_attainment_enum
-// values, but the frontend's dropdown/conditional-field logic (educationFieldFlags
-// in GIPProfileForm.tsx) is keyed on the original form labels, so a read-back
-// must translate the enum value back or every existing record's Highest
-// Educational Attainment silently fails to match any option (and any update
-// that doesn't re-touch the dropdown would then also fail to re-map on save,
-// nulling out educational_attainment). "Master's Degree" is ambiguous (both
-// "Master's Level" and "Master's Graduate" map to it) — disambiguated by
-// whether a year_graduated value is on record.
+// Converts the stored education enum back to the frontend's form label.
 function gipReverseMapEducation($enumValue, $hasYearGraduated) {
     $map = [
         'Elementary Level'                  => 'Elementary Level',
@@ -102,7 +100,7 @@ function gipReverseMapEducation($enumValue, $hasYearGraduated) {
     return '';
 }
 
-// Strip parenthetical suffixes so values match the classification enum.
+// Strips parenthetical suffixes so values match the classification enum.
 function gipNormalizeClassification($c) {
     $map = [
         'Person with Disability (PWD)' => 'Person with Disability',
@@ -111,33 +109,36 @@ function gipNormalizeClassification($c) {
     return isset($map[$c]) ? $map[$c] : $c;
 }
 
+// Returns the valid classification values.
 function gipValidClassifications() {
     return ['Student','Fresh Graduate',
             'Out of School Youth','Person with Disability','Solo Parent',
             'Women','Senior Citizen','Returning OFW','Other','Indigenous People'];
 }
 
-// gip_workplaces.funding_source is a single free-text column; the frontend
-// shows a fixed dropdown + an "Others" free-text field. Split/join here so
-// editing a workplace round-trips correctly without a second DB column.
+// Returns the fixed funding source dropdown options.
 function gipFundingSourceOptions() {
     return ['DOLE', 'Local Government Unit (LGU)', 'Private / CSR'];
 }
+// Splits a stored funding_source value into [option, otherText].
 function gipSplitFunding($stored) {
     $stored = (string)($stored ?? '');
     if (in_array($stored, gipFundingSourceOptions(), true)) return [$stored, ''];
     return $stored === '' ? ['', ''] : ['Others', $stored];
 }
+// Joins a funding source option and its "Others" text into one stored value.
 function gipJoinFunding($fundingSource, $fundingSourceOther) {
     if ($fundingSource === 'Others') return trim((string)$fundingSourceOther);
     return trim((string)$fundingSource);
 }
 
+// Returns the base URL for serving uploaded files.
 function gipUploadBaseUrl() {
     $host = $_SERVER['HTTP_HOST'] ?? 'localhost';
     return 'http://' . $host . '/epeso_backend/';
 }
 
+// Formats a byte count as a human-readable size.
 function gipFormatBytes($bytes) {
     $bytes = (int) $bytes;
     if ($bytes <= 0) return '0 Bytes';
@@ -148,6 +149,7 @@ function gipFormatBytes($bytes) {
 
 // ─── Workplaces ─────────────────────────────────────────────────────────────
 
+// Returns the list of GIP workplaces.
 function gipListWorkplaces() {
     $s = db()->query(
         "SELECT w.*, (SELECT COUNT(*) FROM gip_profiles gp WHERE gp.workplace_id = w.workplace_id AND gp.status = 'Ongoing') AS active_count
@@ -158,6 +160,7 @@ function gipListWorkplaces() {
     json(['status' => 'ok', 'data' => array_map('gipFormatWorkplace', $s->fetchAll())]);
 }
 
+// Returns a single GIP workplace by id.
 function gipGetWorkplaceById($id) {
     $s = db()->prepare(
         "SELECT w.*, (SELECT COUNT(*) FROM gip_profiles gp WHERE gp.workplace_id = w.workplace_id AND gp.status = 'Ongoing') AS active_count
@@ -168,9 +171,7 @@ function gipGetWorkplaceById($id) {
     return $r ? gipFormatWorkplace($r) : null;
 }
 
-// A workplace is a permanent, reusable directory entry (like EF's Employer) —
-// it has no status and no capacity limit of its own. assignedCount is purely
-// informational (how many applicants are currently Active there).
+// Formats a GIP workplace row for the frontend.
 function gipFormatWorkplace($r) {
     [$funding, $fundingOther] = gipSplitFunding($r['funding_source'] ?? '');
     return [
@@ -187,6 +188,7 @@ function gipFormatWorkplace($r) {
     ];
 }
 
+// Validates GIP workplace input.
 function gipValidateWorkplaceInput($d) {
     $name = trim($d['workplaceName'] ?? '');
     if ($name === '') error('Workplace/office name is required.', 422);
@@ -199,6 +201,7 @@ function gipValidateWorkplaceInput($d) {
     return [$name, $loc, $sup, $funding];
 }
 
+// Creates a new GIP workplace.
 function gipCreateWorkplace() {
     $uid = requireLogin();
     $d = body();
@@ -217,6 +220,7 @@ function gipCreateWorkplace() {
     json(['status' => 'ok', 'message' => 'Workplace created.', 'data' => gipGetWorkplaceById($id)]);
 }
 
+// Updates a GIP workplace.
 function gipUpdateWorkplace($id) {
     if (!is_numeric($id)) error('Invalid workplace id.', 422);
     $id  = (int) $id;
@@ -238,6 +242,7 @@ function gipUpdateWorkplace($id) {
     json(['status' => 'ok', 'message' => 'Workplace updated.', 'data' => gipGetWorkplaceById($id)]);
 }
 
+// Deletes a GIP workplace.
 function gipDeleteWorkplace($id) {
     if (!is_numeric($id)) error('Invalid workplace id.', 422);
     $id = (int) $id;
@@ -268,6 +273,7 @@ function gipDeleteWorkplace($id) {
 
 // ─── Profiles ─────────────────────────────────────────────────────────────────
 
+// Returns the list of GIP profiles.
 function gipListProfiles() {
     $s = db()->prepare(
         "SELECT DISTINCT b.beneficiary_id
@@ -286,6 +292,7 @@ function gipListProfiles() {
     json(['status' => 'ok', 'data' => $out]);
 }
 
+// Returns a single GIP profile.
 function gipGetProfile($id) {
     if (!is_numeric($id)) error('Invalid id.', 422);
     $p = gipBuildProfile((int) $id);
@@ -293,6 +300,7 @@ function gipGetProfile($id) {
     json(['status' => 'ok', 'data' => $p]);
 }
 
+// Builds the full GIP profile for display.
 function gipBuildProfile($bid) {
     $s = db()->prepare(
         "SELECT b.*, bgy.barangay_name, c.city_name, p.province_name, r.region_name,
@@ -405,14 +413,7 @@ function gipBuildProfile($bid) {
     ];
 }
 
-// Non-exiting sibling of gipValidateProfileInput() below: returns an error
-// string (or '' if valid) instead of calling error()/exit, so the bulk
-// import can validate every row and collect all their problems instead of
-// aborting the whole request at the first bad row.
-//
-// Required fields mirror beneficiaries' real NOT NULL columns (sex, birth_date,
-// civil_status, barangay_id) so a bad request 422s cleanly instead of failing
-// as a raw DB constraint violation.
+// Validates GIP profile input, returning an error string or ''.
 function gipProfileValidationError($d) {
     if (gipNullStr($d['firstName'] ?? '') === null) return 'First name is required.';
     if (gipNullStr($d['lastName'] ?? '') === null)  return 'Last name is required.';
@@ -426,6 +427,7 @@ function gipProfileValidationError($d) {
     return '';
 }
 
+// Validates GIP profile input and returns [sex, birth, civil, bgyId].
 function gipValidateProfileInput($d) {
     $err = gipProfileValidationError($d);
     if ($err) error($err, 422);
@@ -442,8 +444,7 @@ function gipValidateProfileInput($d) {
     return [$sex, $birth, $civil, $bgyId];
 }
 
-// Insert one profile's full beneficiary spine. Shared by the single-record
-// create and the bulk import.
+// Inserts one profile's full beneficiary spine.
 function gipInsertProfileRow($pdo, $uid, $d) {
     $sex   = $d['sex'];
     $birth = gipDate($d['birthdate'] ?? '');
@@ -478,6 +479,7 @@ function gipInsertProfileRow($pdo, $uid, $d) {
     return $bid;
 }
 
+// Creates a new GIP profile.
 function gipCreateProfile() {
     $uid = requireLogin();
     $d = body();
@@ -497,11 +499,7 @@ function gipCreateProfile() {
     json(['status' => 'ok', 'message' => 'Profile saved.', 'data' => gipBuildProfile($bid)]);
 }
 
-// POST /api/gip/importProfilesBulk   body = { rows: object[] }
-//
-// All-or-nothing bulk import: every row is validated up front, then the
-// whole batch is written inside ONE transaction. If any row fails validation
-// or the insert throws partway through, everything is rolled back.
+// Bulk-imports GIP profiles.
 function gipImportProfilesBulk() {
     $uid  = requireLogin();
     $body = body();
@@ -538,6 +536,7 @@ function gipImportProfilesBulk() {
     json(['status' => 'ok', 'message' => 'Profiles saved.', 'data' => ['ids' => $ids, 'count' => count($ids)]]);
 }
 
+// Updates a GIP profile.
 function gipUpdateProfile($id) {
     if (!is_numeric($id)) error('Invalid id.', 422);
     $bid = (int) $id;
@@ -594,6 +593,7 @@ function gipUpdateProfile($id) {
     json(['status' => 'ok', 'message' => 'Profile updated.', 'data' => gipBuildProfile($bid)]);
 }
 
+// Soft-deletes a GIP applicant.
 function gipDeleteProfile($id) {
     if (!is_numeric($id)) error('Invalid id.', 422);
     $bid = (int) $id;
@@ -622,12 +622,7 @@ function gipDeleteProfile($id) {
     json(['status' => 'ok', 'message' => 'Applicant moved to recycle bin.']);
 }
 
-// Aging: for every applicant who has completed their (one-time) GIP
-// internship, how long since completion, and whether a job placement has
-// been recorded since. Unlike Skills Training/CDSP there's no participant-
-// history table to pick "the latest of several" from -- gip_profiles holds
-// at most one completed engagement per beneficiary, ever, so this is a
-// plain join rather than a LATERAL one.
+// Returns the Aging Report: time since last completed internship and placement status.
 function gipAgingReport() {
     $s = db()->prepare(
         "SELECT bs.beneficiary_service_id, b.last_name, b.first_name, b.middle_name, b.sex,
@@ -669,7 +664,7 @@ function gipAgingReport() {
 // is the only gate on assignment, not a workplace-level status. Each
 // applicant's own status/dates track their individual engagement there.
 
-// Resolves an applicant's gip_profile_id from their beneficiary id, or 404s.
+// Returns an applicant's GIP profile row, or 404s.
 function gipProfileIdFor($bid) {
     $bsS = db()->prepare(
         "SELECT bs.beneficiary_service_id FROM beneficiary_services bs
@@ -686,6 +681,7 @@ function gipProfileIdFor($bid) {
     return $gp;
 }
 
+// Assigns an applicant to a GIP workplace.
 function gipAssignWorkplace() {
     requireLogin();
     $d = body();
@@ -723,6 +719,7 @@ function gipAssignWorkplace() {
     json(['status' => 'ok', 'message' => 'Applicant assigned to workplace.']);
 }
 
+// Unassigns an applicant from a GIP workplace.
 function gipUnassignWorkplace() {
     requireLogin();
     $d = body();
@@ -746,10 +743,7 @@ function gipUnassignWorkplace() {
     json(['status' => 'ok', 'message' => 'Applicant unassigned from workplace.']);
 }
 
-// Marks one applicant's own engagement at their current workplace as
-// Completed — does not touch anyone else assigned there. This is final: a
-// GIP applicant only ever goes through the program once, so unlike an
-// assignment, there is deliberately no way to reopen a completed one.
+// Marks an applicant's GIP workplace assignment as completed.
 function gipCompleteAssignment() {
     requireLogin();
     $d = body();
@@ -766,12 +760,7 @@ function gipCompleteAssignment() {
     json(['status' => 'ok', 'message' => 'Applicant marked as completed.']);
 }
 
-// Records that an applicant LEFT their workplace/office internship before it
-// finished. Unlike unassign (a correction that clears the link) this KEEPS
-// workplace_id and the assignment date, sets the status to Withdrawn and
-// stores when/why/who. Counts that look at status = 'Ongoing' (the
-// workplace's active interns) stop including them automatically. Final, like
-// Completed: GIP is a one-time program, so a withdrawn record is not reopened.
+// Marks an applicant as withdrawn from their GIP workplace internship.
 function gipWithdrawFromWorkplace() {
     $uid = requireLogin();
     $d = body();
@@ -818,13 +807,9 @@ function gipWithdrawFromWorkplace() {
 }
 
 // ─── Documents (applicant) ────────────────────────────────────────────────────
-//   - savedDocuments entries WITH a base64 dataUrl  → new uploads (saved to disk + inserted)
-//   - entries WITHOUT a dataUrl (existing files)     → kept by their document_id
-//   - existing docs no longer in the list             → deleted (file unlinked)
 
+// Saves attachment uploads for a GIP applicant.
 function gipSyncDocuments($pdo, $bid, $bsId, $uid, $d) {
-    // The frontend's GIPApplicant type calls this field "attachedDocuments"
-    // (not "savedDocuments" — that name only applies to EF's ApplicantFormData).
     $docs = is_array($d['attachedDocuments'] ?? null) ? $d['attachedDocuments'] : [];
 
     $keep = [];
@@ -871,6 +856,7 @@ function gipSyncDocuments($pdo, $bid, $bsId, $uid, $d) {
     }
 }
 
+// Returns an applicant's saved attachments.
 function gipFetchSavedDocuments($bid) {
     $s = db()->prepare(
         "SELECT document_id, document_type, title, file_name, file_path, file_size
@@ -890,10 +876,8 @@ function gipFetchSavedDocuments($bid) {
 }
 
 // ─── Documents (workplace) ─────────────────────────────────────────────────────
-// Workplace files aren't tied to a beneficiary, so they key off
-// attached_documents.gip_workplace_id instead (nullable FK, ON DELETE
-// CASCADE) — same shared table, same pattern.
 
+// Saves attachment uploads for a GIP workplace.
 function gipSyncWorkplaceDocuments($pdo, $workplaceId, $uid, $docsPayload) {
     $docs = is_array($docsPayload) ? $docsPayload : [];
 
@@ -938,6 +922,7 @@ function gipSyncWorkplaceDocuments($pdo, $workplaceId, $uid, $docsPayload) {
     }
 }
 
+// Returns a workplace's saved attachments.
 function gipFetchWorkplaceDocuments($workplaceId) {
     $s = db()->prepare(
         "SELECT document_id, title, file_name, file_path, file_size
@@ -955,12 +940,10 @@ function gipFetchWorkplaceDocuments($workplaceId) {
 }
 
 // ═══════════════════════════════════════════════════════════════════════════════
-// RECYCLE BIN  (soft-deleted GIP applicants) — mirrors employment.php's pattern
-// so these records surface in the same Security > Activity Logs > Recycle Bin
-// screen alongside EF's applicants/employers/referrals.
+// RECYCLE BIN  (soft-deleted GIP applicants)
 // ═══════════════════════════════════════════════════════════════════════════════
 
-// recordType -> [table, primary-key column]. Only one type for GIP today.
+// Maps each recycle-bin record type to its table and primary key.
 function gipRecycleMap() {
     return [
         'gipApplicant'  => ['beneficiaries', 'beneficiary_id'],
@@ -968,7 +951,7 @@ function gipRecycleMap() {
     ];
 }
 
-// Read + validate { recordType, id } from the request body. Returns [type, id].
+// Reads and validates {recordType, id} from the request body.
 function gipRecycleTarget() {
     $d    = body();
     $type = $d['recordType'] ?? '';
@@ -978,9 +961,7 @@ function gipRecycleTarget() {
     return [$type, $id];
 }
 
-// A human-readable name for an activity log line -- "#9" means nothing to
-// whoever reads it later; the applicant's actual name (or workplace name)
-// does. Must be looked up BEFORE the record is hard-deleted.
+// Returns a recycle-bin record's display name.
 function gipRecordName($type, $id) {
     if ($type === 'gipApplicant') {
         $s = db()->prepare(
@@ -996,7 +977,7 @@ function gipRecordName($type, $id) {
     return $name !== false ? $name : "#{$id}";
 }
 
-// GET /api/gip/listDeleted
+// Returns the recycle bin contents for applicants and workplaces.
 function gipListDeleted() {
     gipPurgeExpired();
 
@@ -1045,7 +1026,7 @@ function gipListDeleted() {
     json(['status' => 'ok', 'data' => $items]);
 }
 
-// POST /api/gip/restoreRecord  { recordType, id }  — undo a soft delete.
+// Restores a record from the recycle bin.
 function gipRestoreRecord() {
     [$type, $id] = gipRecycleTarget();
     [$table, $pk] = gipRecycleMap()[$type];
@@ -1059,10 +1040,7 @@ function gipRestoreRecord() {
     json(['status' => 'ok', 'message' => 'Record restored.']);
 }
 
-// Single place that knows how to actually hard-delete each recordType --
-// shared by gipPurgeRecord() (one record, explicit admin action) and
-// gipPurgeExpired() (bulk, automatic 30-day retention purge) so there's
-// never a second, drifting copy of this dispatch.
+// Permanently deletes a recycle-bin record by type.
 function gipHardDeleteByType($type, $id) {
     if ($type === 'gipApplicant') {
         gipHardDeleteApplicant($id);
@@ -1071,8 +1049,7 @@ function gipHardDeleteByType($type, $id) {
     }
 }
 
-// POST /api/gip/purgeRecord  { recordType, id }  — permanent delete.
-// Only acts on records already in the recycle bin (deleted_at IS NOT NULL).
+// Permanently deletes a recycle-bin record.
 function gipPurgeRecord() {
     [$type, $id] = gipRecycleTarget();
     [$table, $pk] = gipRecycleMap()[$type];
@@ -1087,11 +1064,7 @@ function gipPurgeRecord() {
     json(['status' => 'ok', 'message' => 'Record permanently deleted.']);
 }
 
-// Auto-purges anything past the recycle bin's retention window (see
-// RECYCLE_BIN_RETENTION_DAYS in core/helpers.php). Called from
-// gipListDeleted() so simply viewing the recycle bin enforces the "N days
-// left" countdown the UI already shows -- that display was cosmetic only
-// until this existed.
+// Called from gipListDeleted() to purge rows past the RECYCLE_BIN_RETENTION_DAYS window.
 function gipPurgeExpired() {
     $uid = currentUserId();
 
@@ -1131,10 +1104,7 @@ function gipPurgeExpired() {
     }
 }
 
-// Permanently remove a GIP workplace and its uploaded files. Only reachable
-// for an already soft-deleted workplace, which gipDeleteWorkplace's in-use
-// guard already guaranteed has zero linked profiles -- no cascade cleanup
-// needed there.
+// Permanently deletes a GIP workplace and its uploaded files.
 function gipHardDeleteWorkplace($id) {
     $docs = db()->prepare("SELECT file_path FROM attached_documents WHERE gip_workplace_id=:id");
     $docs->execute([':id' => $id]);
@@ -1147,10 +1117,7 @@ function gipHardDeleteWorkplace($id) {
     db()->prepare("DELETE FROM gip_workplaces WHERE workplace_id=:id")->execute([':id' => $id]);
 }
 
-// Permanently remove a GIP applicant and its GIP-specific data (uploaded
-// files, gip_profiles row, classifications, service enrollment). Used by the
-// recycle bin's permanent-delete action; not reachable except for an
-// already soft-deleted row. Mirrors employmentHardDeleteApplicant.
+// Permanently deletes a GIP applicant and all related data.
 function gipHardDeleteApplicant($bid) {
     $pdo = db();
     try {

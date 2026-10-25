@@ -1,34 +1,14 @@
 <?php
 // OFW: profiles (beneficiary spine + ofw_profiles) + request types + agencies +
 // attachments (ELPOR forms / OWWA Welfare Case form / generic documents, all
-// via the universal `documents` table).
-//
-// Design notes (confirmed against the live schema before writing this):
-//  - No batch/project/assignment concept exists for OFW (unlike every other
-//    Livelihood/GIP/SPES-style module) -- it's a flat case-record list, closer
-//    in shape to DILP/TUPAD (beneficiary spine + one profile row) than to
-//    anything with an assign/unassign flow. No delete guard needed beyond the
-//    standard soft-delete.
-//  - ofw_profiles.status (Pending/Approved/Ongoing/Completed/Rejected) is a
-//    real, manually-set stored column -- not derived, since there's nothing
-//    to derive it from.
-//  - Type of Request is multi-select against the ofw_request_types lookup via
-//    ofw_profile_request_types, mirroring CDSP/DILP's classification pattern.
-//    The two "please specify" checkboxes (inquiry / other DOLE program) each
-//    write their free text into that same junction row's other_specification
-//    column -- no separate columns needed.
-//  - Agencies is a repeatable free-text list (the frontend's "+ Add Agency"
-//    adds another blank text input, not a pick from a fixed list) -> its own
-//    child table (ofw_profile_agencies), not a lookup+junction pair.
-//  - ELPOR Forms (5 named slots) and the OWWA Welfare Case form are each a
-//    single named attachment slot, not a list -- stored in the universal
-//    `documents` table keyed by a fixed `document_type` value per slot
-//    (document_source='OFW'), same table generic "Attached Documents" also uses.
+// via the universal `documents` table). Flat case-record list, no batch/project
+// concept. Agencies and Type of Request are stored as repeatable child rows.
 
 include_once __DIR__ . '/../core/helpers.php';
 include_once __DIR__ . '/../core/guard.php';
 include_once __DIR__ . '/../core/activity_log.php';
 
+// Routes an OFW action to its handler function.
 function handle($action, $id, $method)
 {
     switch ($action) {
@@ -51,15 +31,18 @@ function handle($action, $id, $method)
 
 // ─── Helpers ─────────────────────────────────────────────────────────────────
 
+// Trims a string, converting empty/blank to null.
 function ofwNullStr($v) {
     $s = is_string($v) ? trim($v) : $v;
     return ($s === '' || $s === null) ? null : $s;
 }
+// Validates and returns a YYYY-MM-DD date string, or null.
 function ofwDate($v) {
     $s = is_string($v) ? trim($v) : '';
     return preg_match('/^\d{4}-\d{2}-\d{2}$/', $s) ? $s : null;
 }
 
+// Returns the OFW service_id (cached).
 function ofwServiceId() {
     static $sid = null;
     if ($sid !== null) return $sid;
@@ -69,11 +52,13 @@ function ofwServiceId() {
     return (int)$sid;
 }
 
+// Returns the base URL for serving uploaded files.
 function ofwUploadBaseUrl() {
     $host = $_SERVER['HTTP_HOST'] ?? 'localhost';
     return 'http://' . $host . '/epeso_backend/';
 }
 
+// Formats a byte count as a human-readable size.
 function ofwFormatBytes($bytes) {
     $bytes = (int) $bytes;
     if ($bytes <= 0) return '0 Bytes';
@@ -82,15 +67,14 @@ function ofwFormatBytes($bytes) {
     return round($bytes / pow(1024, $i), 2) . ' ' . $units[$i];
 }
 
-// The 5 ELPOR form slots + the OWWA Welfare Case form each occupy a fixed,
-// reserved document_type value in the universal `documents` table -- anything
-// else stored for this beneficiary is a generic "attached document".
+// Returns the fixed named attachment slot types (ELPOR forms, OWWA form).
 function ofwNamedAttachmentTypes() {
     return ['ELPOR Form A', 'ELPOR Form A2', 'ELPOR Form B', 'ELPOR Form B1', 'ELPOR Form C', 'OWWA Welfare Case Form'];
 }
 
 // ─── Request Types (lookup) ──────────────────────────────────────────────────
 
+// Returns the list of OFW request types.
 function ofwListRequestTypes() {
     $s = db()->query("SELECT request_type_id, request_type_name FROM ofw_request_types ORDER BY request_type_id");
     json(['status' => 'ok', 'data' => array_map(function($r) {
@@ -99,13 +83,8 @@ function ofwListRequestTypes() {
 }
 
 // ─── Documents (applicant) ────────────────────────────────────────────────────
-//
-// $d['namedAttachments'] -> { [documentType]: { fileName, dataUrl } | null }
-//   one entry per slot in ofwNamedAttachmentTypes(); a slot with no dataUrl and
-//   no existing row is simply absent/null (nothing to keep or create).
-// $d['attachedDocuments'] -> [{ id?, name, fileName, dataUrl? }] generic list,
-//   same shape/rules as every other module's attachment editor.
 
+// Saves named and generic attachment uploads for an OFW applicant.
 function ofwSyncDocuments($pdo, $bid, $bsId, $uid, $d) {
     $named = is_array($d['namedAttachments'] ?? null) ? $d['namedAttachments'] : [];
     $generic = is_array($d['attachedDocuments'] ?? null) ? $d['attachedDocuments'] : [];
@@ -179,6 +158,7 @@ function ofwSyncDocuments($pdo, $bid, $bsId, $uid, $d) {
     }
 }
 
+// Returns an applicant's named and generic attachments.
 function ofwFetchDocuments($bid) {
     $s = db()->prepare(
         "SELECT document_id, document_type, title, file_name, file_path, file_size
@@ -207,6 +187,7 @@ function ofwFetchDocuments($bid) {
 
 // ─── Profiles ─────────────────────────────────────────────────────────────────
 
+// Builds the full OFW profile for display.
 function ofwBuildProfile($bid) {
     $s = db()->prepare(
         "SELECT b.*, bgy.barangay_name, c.city_name, p.province_name, r.region_name,
@@ -293,6 +274,7 @@ function ofwBuildProfile($bid) {
     ];
 }
 
+// Returns the list of OFW profiles.
 function ofwListProfiles() {
     $s = db()->prepare(
         "SELECT b.beneficiary_id
@@ -310,6 +292,7 @@ function ofwListProfiles() {
     json(['status' => 'ok', 'data' => $out]);
 }
 
+// Returns a single OFW profile.
 function ofwGetProfile($id) {
     if (!is_numeric($id)) error('Invalid id.', 422);
     $p = ofwBuildProfile((int)$id);
@@ -317,8 +300,7 @@ function ofwGetProfile($id) {
     json(['status' => 'ok', 'data' => $p]);
 }
 
-// Insert request-type + agency rows for a profile. Shared by create + update
-// (update calls this after clearing old rows).
+// Inserts request-type and agency rows for a profile.
 function ofwSyncSelections($pdo, $profileId, $d) {
     $rtMap = [];
     foreach (db()->query("SELECT request_type_id, request_type_name FROM ofw_request_types")->fetchAll() as $r) {
@@ -343,6 +325,7 @@ function ofwSyncSelections($pdo, $profileId, $d) {
     }
 }
 
+// Validates OFW profile input.
 function ofwValidateProfileInput($d) {
     if (ofwNullStr($d['firstName'] ?? '') === null) error('First name is required.', 422);
     if (ofwNullStr($d['lastName'] ?? '')  === null) error('Last name is required.', 422);
@@ -376,6 +359,7 @@ function ofwValidateProfileInput($d) {
     return [$sex, $birth, $civil, $bgyId, $emp, $refNo, $filed];
 }
 
+// Creates a new OFW profile.
 function ofwCreateProfile() {
     $uid = requireLogin();
     $d = body();
@@ -400,8 +384,7 @@ function ofwCreateProfile() {
         ]);
         $bid = (int)$s->fetchColumn();
 
-        // OFW has a single date (the Date Filed on the paper form); date_applied is the
-        // shared spine column every program's reports read, so it mirrors date_filed.
+        // date_applied (shared spine column) is set to the Date Filed value.
         $s2 = $pdo->prepare("INSERT INTO beneficiary_services(beneficiary_id,service_id,date_applied,received_by) VALUES(:bid,:sid,:date,:rby) RETURNING beneficiary_service_id");
         $s2->execute([':bid' => $bid, ':sid' => ofwServiceId(), ':date' => $filed, ':rby' => ofwNullStr($d['receivedBy'] ?? '')]);
         $bsId = (int)$s2->fetchColumn();
@@ -436,6 +419,7 @@ function ofwCreateProfile() {
     json(['status' => 'ok', 'message' => 'Profile saved.', 'data' => ofwBuildProfile($bid)]);
 }
 
+// Updates an OFW profile.
 function ofwUpdateProfile($id) {
     if (!is_numeric($id)) error('Invalid id.', 422);
     $uid = requireLogin();
@@ -502,6 +486,7 @@ function ofwUpdateProfile($id) {
     json(['status' => 'ok', 'message' => 'Profile updated.', 'data' => ofwBuildProfile($bid)]);
 }
 
+// Updates an OFW profile's status.
 function ofwUpdateStatus($id) {
     if (!is_numeric($id)) error('Invalid id.', 422);
     $bid = (int)$id;
@@ -521,6 +506,7 @@ function ofwUpdateStatus($id) {
     json(['status' => 'ok', 'message' => 'Status updated.', 'data' => ofwBuildProfile($bid)]);
 }
 
+// Soft-deletes an OFW profile.
 function ofwDeleteProfile($id) {
     if (!is_numeric($id)) error('Invalid id.', 422);
     $bid = (int)$id;
@@ -536,13 +522,15 @@ function ofwDeleteProfile($id) {
 }
 
 // ═══════════════════════════════════════════════════════════════════════════════
-// RECYCLE BIN (soft-deleted OFW profiles) — mirrors cdsp.php/skills_training.php's pattern.
+// RECYCLE BIN (soft-deleted OFW profiles)
 // ═══════════════════════════════════════════════════════════════════════════════
 
+// Maps the OFW recycle-bin record type to its table and primary key.
 function ofwRecycleMap() {
     return ['ofwProfile' => ['beneficiaries', 'beneficiary_id']];
 }
 
+// Reads and validates {recordType, id} from the request body.
 function ofwRecycleTarget() {
     $d    = body();
     $type = $d['recordType'] ?? '';
@@ -552,9 +540,7 @@ function ofwRecycleTarget() {
     return [$type, $id];
 }
 
-// A human-readable name for an activity log line -- "#9" means nothing to
-// whoever reads it later; the applicant's actual name does. Must be looked
-// up BEFORE the record is hard-deleted.
+// Returns an applicant's display name for the activity log.
 function ofwRecordName($id) {
     $s = db()->prepare(
         "SELECT CONCAT(last_name, ', ', first_name,
@@ -566,6 +552,7 @@ function ofwRecordName($id) {
     return $name !== false ? $name : "#{$id}";
 }
 
+// Returns the recycle bin contents for OFW profiles.
 function ofwListDeleted() {
     ofwPurgeExpired();
     $s = db()->prepare(
@@ -589,6 +576,7 @@ function ofwListDeleted() {
     json(['status' => 'ok', 'data' => $items]);
 }
 
+// Restores an OFW profile from the recycle bin.
 function ofwRestoreRecord() {
     [$type, $id] = ofwRecycleTarget();
     [$table, $pk] = ofwRecycleMap()[$type];
@@ -600,6 +588,7 @@ function ofwRestoreRecord() {
     json(['status' => 'ok', 'message' => 'Record restored.']);
 }
 
+// Permanently deletes a recycle-bin OFW profile.
 function ofwPurgeRecord() {
     [$type, $id] = ofwRecycleTarget();
     [$table, $pk] = ofwRecycleMap()[$type];
@@ -612,16 +601,7 @@ function ofwPurgeRecord() {
     json(['status' => 'ok', 'message' => 'Record permanently deleted.']);
 }
 
-// Auto-purges anything past the recycle bin's retention window (see
-// RECYCLE_BIN_RETENTION_DAYS in core/helpers.php). Called from
-// ofwListDeleted() so simply viewing the recycle bin enforces the "N days
-// left" countdown the UI already shows -- that display was cosmetic only
-// until this existed.
-//
-// beneficiaries.deleted_at is a SHARED column (one row per person, not
-// per-service) -- an unscoped query would pick up EVERY soft-deleted
-// beneficiary system-wide, regardless of which module they actually
-// belong to. Scoped exactly like ofwListDeleted().
+// Purges OFW recycle bin rows past RECYCLE_BIN_RETENTION_DAYS.
 function ofwPurgeExpired() {
     $uid = currentUserId();
     $s = db()->prepare(
@@ -639,6 +619,7 @@ function ofwPurgeExpired() {
     }
 }
 
+// Permanently deletes an OFW applicant and all related data.
 function ofwHardDeleteApplicant($bid) {
     $pdo = db();
     try {

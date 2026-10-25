@@ -5,6 +5,7 @@ include_once __DIR__ . '/../core/helpers.php';
 include_once __DIR__ . '/../core/guard.php';
 include_once __DIR__ . '/../core/activity_log.php';
 
+// Routes a SPES action to its handler function.
 function handle($action, $id, $method)
 {
     switch ($action) {
@@ -31,24 +32,27 @@ function handle($action, $id, $method)
 
 // ─── Helpers ─────────────────────────────────────────────────────────────────
 
+// Trims a string, converting empty/blank to null.
 function spesNullStr($v) {
     $s = is_string($v) ? trim($v) : $v;
     return ($s === '' || $s === null) ? null : $s;
 }
+// Validates and returns a YYYY-MM-DD date string, or null.
 function spesDate($v) {
     $s = is_string($v) ? trim($v) : '';
     return preg_match('/^\d{4}-\d{2}-\d{2}$/', $s) ? $s : null;
 }
+// Converts a numeric value to int, or null.
 function spesIntOrNull($v) { return is_numeric($v) ? (int)$v : null; }
 
-// Frontend sends money formatted with thousands separators (e.g. "80,000");
-// annual_family_income is a plain numeric(12,2) column.
+// Parses a currency-formatted string into a float, or null.
 function spesMoneyOrNull($v) {
     if ($v === null) return null;
     $s = trim(str_replace([',', '₱', ' '], '', (string)$v));
     return ($s === '' || !is_numeric($s)) ? null : (float)$s;
 }
 
+// Returns the SPES service_id (cached).
 function spesServiceId() {
     static $sid = null;
     if ($sid !== null) return $sid;
@@ -58,34 +62,36 @@ function spesServiceId() {
     return (int)$sid;
 }
 
+// Returns the valid classification values.
 function spesValidClassifications() {
     return ['Student','Fresh Graduate',
             'Out of School Youth','Person with Disability','Solo Parent',
             'Women','Senior Citizen','Returning OFW','Other','Indigenous People'];
 }
 
-// spes_batches.funding_source is a single free-text column; the frontend
-// shows a fixed dropdown ending in an "Other" sentinel + a free-text field.
-// Split/join here so editing a batch round-trips correctly without a second
-// DB column.
+// Returns the fixed funding source dropdown options.
 function spesFundingSourceOptions() {
     return ['DOLE', 'LGU', 'DOLE + LGU', 'Partner Agency'];
 }
+// Splits a stored funding_source value into [option, otherText].
 function spesSplitFunding($stored) {
     $stored = (string)($stored ?? '');
     if (in_array($stored, spesFundingSourceOptions(), true)) return [$stored, ''];
     return $stored === '' ? ['', ''] : ['Other', $stored];
 }
+// Joins a funding source option and its "Other" text into one stored value.
 function spesJoinFunding($fundingSource, $fundingSourceOther) {
     if ($fundingSource === 'Other') return trim((string)$fundingSourceOther);
     return trim((string)$fundingSource);
 }
 
+// Returns the base URL for serving uploaded files.
 function spesUploadBaseUrl() {
     $host = $_SERVER['HTTP_HOST'] ?? 'localhost';
     return 'http://' . $host . '/epeso_backend/';
 }
 
+// Formats a byte count as a human-readable size.
 function spesFormatBytes($bytes) {
     $bytes = (int) $bytes;
     if ($bytes <= 0) return '0 Bytes';
@@ -96,6 +102,7 @@ function spesFormatBytes($bytes) {
 
 // ─── Batches ──────────────────────────────────────────────────────────────────
 
+// Returns the list of SPES batches.
 function spesListBatches() {
     $s = db()->query(
         "SELECT b.*, (SELECT COUNT(*) FROM spes_profiles sp WHERE sp.batch_id = b.batch_id AND sp.status::text <> 'Withdrawn') AS assigned_count
@@ -106,6 +113,7 @@ function spesListBatches() {
     json(['status' => 'ok', 'data' => array_map('spesFormatBatch', $s->fetchAll())]);
 }
 
+// Returns a single SPES batch by id.
 function spesGetBatchById($id) {
     $s = db()->prepare(
         "SELECT b.*, (SELECT COUNT(*) FROM spes_profiles sp WHERE sp.batch_id = b.batch_id AND sp.status::text <> 'Withdrawn') AS assigned_count
@@ -116,6 +124,7 @@ function spesGetBatchById($id) {
     return $r ? spesFormatBatch($r) : null;
 }
 
+// Formats a SPES batch row for the frontend.
 function spesFormatBatch($r) {
     [$funding, $fundingOther] = spesSplitFunding($r['funding_source'] ?? '');
     return [
@@ -136,6 +145,7 @@ function spesFormatBatch($r) {
     ];
 }
 
+// Validates SPES batch input.
 function spesValidateBatchInput($d) {
     $name = trim($d['batchName'] ?? '');
     if ($name === '') error('Batch name is required.', 422);
@@ -162,12 +172,7 @@ function spesValidateBatchInput($d) {
     return [$name, $progStart, $progEnd, $slots, $employer, $loc, $coord, $funding];
 }
 
-// Applies the side effects of a batch status transition: stamps/clears
-// spes_batches.completed_at and cascades spes_profiles.status for its
-// beneficiaries. Shared by spesCreateBatch/spesUpdateBatch (full-form save)
-// and spesUpdateBatchStatus (quick status wizard) so both paths stay in sync
-// — completed_at reflects the moment the batch was *actually* marked done,
-// not its (mutable, originally-planned) program_end_date.
+// Stamps completed_at and cascades profile status for a batch status transition.
 function spesCascadeBatchStatus($pdo, $id, $prevStatus, $newStatus) {
     if ($newStatus === 'Completed' && $prevStatus !== 'Completed') {
         $pdo->prepare("UPDATE spes_batches SET completed_at=now() WHERE batch_id=:id")->execute([':id' => $id]);
@@ -180,6 +185,7 @@ function spesCascadeBatchStatus($pdo, $id, $prevStatus, $newStatus) {
     }
 }
 
+// Creates a new SPES batch.
 function spesCreateBatch() {
     $uid = requireLogin();
     $d = body();
@@ -210,6 +216,7 @@ function spesCreateBatch() {
     json(['status' => 'ok', 'message' => 'Batch created.', 'data' => spesGetBatchById($id)]);
 }
 
+// Updates a SPES batch.
 function spesUpdateBatch($id) {
     if (!is_numeric($id)) error('Invalid batch id.', 422);
     $id  = (int) $id;
@@ -249,6 +256,7 @@ function spesUpdateBatch($id) {
     json(['status' => 'ok', 'message' => 'Batch updated.', 'data' => spesGetBatchById($id)]);
 }
 
+// Updates a SPES batch's status.
 function spesUpdateBatchStatus($id) {
     if (!is_numeric($id)) error('Invalid batch id.', 422);
     $id = (int) $id;
@@ -277,6 +285,7 @@ function spesUpdateBatchStatus($id) {
     json(['status' => 'ok', 'message' => 'Status updated.', 'data' => spesGetBatchById($id)]);
 }
 
+// Deletes a SPES batch.
 function spesDeleteBatch($id) {
     if (!is_numeric($id)) error('Invalid batch id.', 422);
     $id = (int) $id;
@@ -305,6 +314,7 @@ function spesDeleteBatch($id) {
 
 // ─── Profiles ─────────────────────────────────────────────────────────────────
 
+// Returns the list of SPES profiles.
 function spesListProfiles() {
     $s = db()->prepare(
         "SELECT DISTINCT b.beneficiary_id
@@ -323,6 +333,7 @@ function spesListProfiles() {
     json(['status' => 'ok', 'data' => $out]);
 }
 
+// Returns a single SPES profile.
 function spesGetProfile($id) {
     if (!is_numeric($id)) error('Invalid id.', 422);
     $p = spesBuildProfile((int) $id);
@@ -330,6 +341,7 @@ function spesGetProfile($id) {
     json(['status' => 'ok', 'data' => $p]);
 }
 
+// Builds the full SPES profile for display.
 function spesBuildProfile($bid) {
     $s = db()->prepare(
         "SELECT b.*, bgy.barangay_name, c.city_name, p.province_name, r.region_name,
@@ -424,14 +436,7 @@ function spesBuildProfile($bid) {
     ];
 }
 
-// Non-exiting sibling of spesValidateProfileInput() below: returns an error
-// string (or '' if valid) instead of calling error()/exit, so the bulk
-// import can validate every row and collect all their problems instead of
-// aborting the whole request at the first bad row.
-//
-// Required fields mirror beneficiaries' real NOT NULL columns (sex, birth_date,
-// civil_status, barangay_id) so a bad request 422s cleanly instead of failing
-// as a raw DB constraint violation.
+// Validates SPES profile input, returning an error string or ''.
 function spesProfileValidationError($d) {
     if (spesNullStr($d['firstName'] ?? '') === null) return 'First name is required.';
     if (spesNullStr($d['lastName'] ?? '') === null)  return 'Last name is required.';
@@ -445,6 +450,7 @@ function spesProfileValidationError($d) {
     return '';
 }
 
+// Validates SPES profile input and returns [sex, birth, civil, bgyId].
 function spesValidateProfileInput($d) {
     $err = spesProfileValidationError($d);
     if ($err) error($err, 422);
@@ -458,8 +464,7 @@ function spesValidateProfileInput($d) {
     return [$sex, $birth, $civil, $bgyId];
 }
 
-// Insert one profile's full beneficiary spine. Shared by the single-record
-// create and the bulk import.
+// Inserts one profile's full beneficiary spine.
 function spesInsertProfileRow($pdo, $uid, $d) {
     $sex   = $d['sex'];
     $birth = spesDate($d['birthdate'] ?? '');
@@ -498,6 +503,7 @@ function spesInsertProfileRow($pdo, $uid, $d) {
     return $bid;
 }
 
+// Creates a new SPES profile.
 function spesCreateProfile() {
     $uid = requireLogin();
     $d = body();
@@ -517,11 +523,7 @@ function spesCreateProfile() {
     json(['status' => 'ok', 'message' => 'Profile saved.', 'data' => spesBuildProfile($bid)]);
 }
 
-// POST /api/spes/importProfilesBulk   body = { rows: object[] }
-//
-// All-or-nothing bulk import: every row is validated up front, then the
-// whole batch is written inside ONE transaction. If any row fails validation
-// or the insert throws partway through, everything is rolled back.
+// Bulk-imports SPES profiles.
 function spesImportProfilesBulk() {
     $uid  = requireLogin();
     $body = body();
@@ -558,6 +560,7 @@ function spesImportProfilesBulk() {
     json(['status' => 'ok', 'message' => 'Profiles saved.', 'data' => ['ids' => $ids, 'count' => count($ids)]]);
 }
 
+// Updates a SPES profile.
 function spesUpdateProfile($id) {
     if (!is_numeric($id)) error('Invalid id.', 422);
     $bid = (int) $id;
@@ -619,6 +622,7 @@ function spesUpdateProfile($id) {
     json(['status' => 'ok', 'message' => 'Profile updated.', 'data' => spesBuildProfile($bid)]);
 }
 
+// Soft-deletes a SPES applicant.
 function spesDeleteProfile($id) {
     if (!is_numeric($id)) error('Invalid id.', 422);
     $bid = (int) $id;
@@ -649,6 +653,7 @@ function spesDeleteProfile($id) {
 
 // ─── Assign / Unassign batch ──────────────────────────────────────────────────
 
+// Assigns an applicant to a SPES batch.
 function spesAssignBatch() {
     requireLogin();
     $d = body();
@@ -702,6 +707,7 @@ function spesAssignBatch() {
     json(['status' => 'ok', 'message' => 'Applicant assigned to batch.']);
 }
 
+// Unassigns an applicant from a SPES batch.
 function spesUnassignBatch() {
     requireLogin();
     $d = body();
@@ -733,13 +739,7 @@ function spesUnassignBatch() {
     json(['status' => 'ok', 'message' => 'Applicant unassigned from batch.']);
 }
 
-// Records that an applicant LEFT an already-started batch early. Unlike
-// unassign (a correction, only possible while the batch is still Planned, and
-// it clears the link), this KEEPS batch_id so the history survives, sets the
-// status to Withdrawn and stores when/why/who. Only meaningful once the batch
-// is Ongoing: while Planned nobody has started, so Unassign is the right tool.
-// Batch completion only flips 'Active' people to 'Completed', so a withdrawn
-// applicant is never counted as having completed.
+// Marks an applicant as withdrawn from their SPES batch.
 function spesWithdrawFromBatch() {
     $uid = requireLogin();
     $d = body();
@@ -791,13 +791,9 @@ function spesWithdrawFromBatch() {
 }
 
 // ─── Documents (applicant) ────────────────────────────────────────────────────
-//   - savedDocuments entries WITH a base64 dataUrl  → new uploads (saved to disk + inserted)
-//   - entries WITHOUT a dataUrl (existing files)     → kept by their document_id
-//   - existing docs no longer in the list             → deleted (file unlinked)
 
+// Saves attachment uploads for a SPES applicant.
 function spesSyncDocuments($pdo, $bid, $bsId, $uid, $d) {
-    // The frontend's SPESApplicant type calls this field "attachedDocuments"
-    // (not "savedDocuments" — that name only applies to EF's ApplicantFormData).
     $docs = is_array($d['attachedDocuments'] ?? null) ? $d['attachedDocuments'] : [];
 
     $keep = [];
@@ -844,6 +840,7 @@ function spesSyncDocuments($pdo, $bid, $bsId, $uid, $d) {
     }
 }
 
+// Returns an applicant's saved attachments.
 function spesFetchSavedDocuments($bid) {
     $s = db()->prepare(
         "SELECT document_id, document_type, title, file_name, file_path, file_size
@@ -863,10 +860,8 @@ function spesFetchSavedDocuments($bid) {
 }
 
 // ─── Documents (batch) ────────────────────────────────────────────────────────
-// Batch files aren't tied to a beneficiary, so they key off
-// documents.spes_batch_id instead (nullable FK, ON DELETE CASCADE) — same
-// shared table, same pattern GIP uses via documents.gip_batch_id.
 
+// Saves attachment uploads for a SPES batch.
 function spesSyncBatchDocuments($pdo, $batchId, $uid, $docsPayload) {
     $docs = is_array($docsPayload) ? $docsPayload : [];
 
@@ -911,6 +906,7 @@ function spesSyncBatchDocuments($pdo, $batchId, $uid, $docsPayload) {
     }
 }
 
+// Returns a batch's saved attachments.
 function spesFetchBatchDocuments($batchId) {
     $s = db()->prepare(
         "SELECT document_id, file_name, file_path, file_size
@@ -928,12 +924,10 @@ function spesFetchBatchDocuments($batchId) {
 }
 
 // ═══════════════════════════════════════════════════════════════════════════════
-// RECYCLE BIN  (soft-deleted SPES applicants) — mirrors gip.php's pattern so
-// these records surface in the same Security > Activity Logs > Recycle Bin
-// screen alongside EF/GIP/CDSP applicants.
+// RECYCLE BIN  (soft-deleted SPES applicants)
 // ═══════════════════════════════════════════════════════════════════════════════
 
-// recordType -> [table, primary-key column]. Only one type for SPES today.
+// Maps each recycle-bin record type to its table and primary key.
 function spesRecycleMap() {
     return [
         'spesApplicant' => ['beneficiaries', 'beneficiary_id'],
@@ -941,7 +935,7 @@ function spesRecycleMap() {
     ];
 }
 
-// Read + validate { recordType, id } from the request body. Returns [type, id].
+// Reads and validates {recordType, id} from the request body.
 function spesRecycleTarget() {
     $d    = body();
     $type = $d['recordType'] ?? '';
@@ -951,9 +945,7 @@ function spesRecycleTarget() {
     return [$type, $id];
 }
 
-// A human-readable name for an activity log line -- "#9" means nothing to
-// whoever reads it later; the applicant's actual name (or batch name) does.
-// Must be looked up BEFORE the record is hard-deleted.
+// Returns a recycle-bin record's display name.
 function spesRecordName($type, $id) {
     if ($type === 'spesApplicant') {
         $s = db()->prepare(
@@ -969,7 +961,7 @@ function spesRecordName($type, $id) {
     return $name !== false ? $name : "#{$id}";
 }
 
-// GET /api/spes/listDeleted
+// Returns the recycle bin contents for applicants and batches.
 function spesListDeleted() {
     spesPurgeExpired();
     $s = db()->prepare(
@@ -1017,7 +1009,7 @@ function spesListDeleted() {
     json(['status' => 'ok', 'data' => $items]);
 }
 
-// POST /api/spes/restoreRecord  { recordType, id }  — undo a soft delete.
+// Restores a record from the recycle bin.
 function spesRestoreRecord() {
     [$type, $id] = spesRecycleTarget();
     [$table, $pk] = spesRecycleMap()[$type];
@@ -1031,12 +1023,7 @@ function spesRestoreRecord() {
     json(['status' => 'ok', 'message' => 'Record restored.']);
 }
 
-// POST /api/spes/purgeRecord  { recordType, id }  — permanent delete.
-// Only acts on records already in the recycle bin (deleted_at IS NOT NULL).
-// Single place that knows how to actually hard-delete each recordType --
-// shared by spesPurgeRecord() (one record, explicit admin action) and
-// spesPurgeExpired() (bulk, automatic 30-day retention purge) so there's
-// never a second, drifting copy of this dispatch.
+// Permanently deletes a recycle-bin record by type.
 function spesHardDeleteByType($type, $id) {
     if ($type === 'spesApplicant') {
         spesHardDeleteApplicant($id);
@@ -1045,6 +1032,7 @@ function spesHardDeleteByType($type, $id) {
     }
 }
 
+// Permanently deletes a recycle-bin record.
 function spesPurgeRecord() {
     [$type, $id] = spesRecycleTarget();
     [$table, $pk] = spesRecycleMap()[$type];
@@ -1059,11 +1047,7 @@ function spesPurgeRecord() {
     json(['status' => 'ok', 'message' => 'Record permanently deleted.']);
 }
 
-// Auto-purges anything past the recycle bin's retention window (see
-// RECYCLE_BIN_RETENTION_DAYS in core/helpers.php). Called from
-// spesListDeleted() so simply viewing the recycle bin enforces the "N days
-// left" countdown the UI already shows -- that display was cosmetic only
-// until this existed.
+// Called from spesListDeleted() to sweep out recycle bin rows past RECYCLE_BIN_RETENTION_DAYS.
 function spesPurgeExpired() {
     $uid = currentUserId();
 
@@ -1101,9 +1085,7 @@ function spesPurgeExpired() {
     }
 }
 
-// Permanently remove a SPES batch and its uploaded files. Only reachable for
-// an already soft-deleted batch, which spesDeleteBatch's in-use guard already
-// guaranteed has zero linked profiles.
+// Permanently deletes a SPES batch and its uploaded files.
 function spesHardDeleteBatch($id) {
     $docs = db()->prepare("SELECT file_path FROM attached_documents WHERE spes_batch_id=:id");
     $docs->execute([':id' => $id]);
@@ -1114,10 +1096,7 @@ function spesHardDeleteBatch($id) {
     db()->prepare("DELETE FROM spes_batches WHERE batch_id=:id")->execute([':id' => $id]);
 }
 
-// Permanently remove a SPES applicant and its SPES-specific data (uploaded
-// files, spes_profiles row, service enrollment). Used by the recycle bin's
-// permanent-delete action; not reachable except for an already soft-deleted
-// row. Mirrors gipHardDeleteApplicant.
+// Permanently deletes a SPES applicant and all related data.
 function spesHardDeleteApplicant($bid) {
     $pdo = db();
     try {

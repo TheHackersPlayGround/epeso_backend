@@ -1,28 +1,17 @@
 <?php
-// SLP: projects (slp_projects) + profiles (slp_profiles, dedicated table,
-// 1:1 with beneficiary_services via UNIQUE beneficiary_service_id).
-//
-// Like TUPAD/CLPEP, slp_project_beneficiaries is unique on (project_id,
-// beneficiary_service_id) only -- a beneficiary can carry a running history
-// of project assignments. "Current" is the most recently assigned row;
-// assigning never deletes older rows.
-//
-// slp_profiles.status is a stored column, but written by this module the
-// same way DILP/TUPAD derive it -- never accepted directly from the client:
-// Inactive (no assignment), Active (Planned/Ongoing), Completed (Completed).
-//
-// Sector Classification reuses the shared beneficiary_classifications table
-// (multi-row, one per selected sector) instead of a dedicated column, and
-// PWD's "specify disability" reuses the shared disabilities table -- both
-// already exist and are used the same way by DILP/GIP/SPES/CDSP/employment.
-// Educational Attainment reuses beneficiaries.educational_attainment (the
-// shared enum column) rather than the old unconstrained
-// slp_profiles.educational_attainment_id, which has been dropped.
+// SLP: projects (slp_projects) + profiles (slp_profiles, 1:1 with
+// beneficiary_services via UNIQUE beneficiary_service_id). slp_project_beneficiaries
+// keeps a running history of assignments; "current" is the most recent row.
+// slp_profiles.status is stored but always server-derived, never client-set.
+// Sector Classification and PWD disability detail reuse the shared
+// beneficiary_classifications/disabilities tables; Educational Attainment
+// reuses beneficiaries.educational_attainment.
 
 include_once __DIR__ . '/../core/helpers.php';
 include_once __DIR__ . '/../core/guard.php';
 include_once __DIR__ . '/../core/activity_log.php';
 
+// Routes an SLP action to its handler function.
 function handle($action, $id, $method)
 {
     switch ($action) {
@@ -50,23 +39,29 @@ function handle($action, $id, $method)
 
 // ─── Helpers ─────────────────────────────────────────────────────────────────
 
+// Trims a string, converting empty/blank to null.
 function slpNullStr($v) {
     $s = is_string($v) ? trim($v) : $v;
     return ($s === '' || $s === null) ? null : $s;
 }
+// Validates and returns a YYYY-MM-DD date string, or null.
 function slpDate($v) {
     $s = is_string($v) ? trim($v) : '';
     return preg_match('/^\d{4}-\d{2}-\d{2}$/', $s) ? $s : null;
 }
+// Converts a numeric value to int, or null.
 function slpIntOrNull($v) { return is_numeric($v) ? (int)$v : null; }
+// Converts a numeric value to float, or null.
 function slpNumOrNull($v) { return is_numeric($v) ? (float)$v : null; }
 
+// Parses a currency-formatted string into a float, or null.
 function slpMoneyOrNull($v) {
     if ($v === null) return null;
     $s = trim(str_replace([',', '₱', ' '], '', (string)$v));
     return ($s === '' || !is_numeric($s)) ? null : (float)$s;
 }
 
+// Returns the SLP service_id (cached).
 function slpServiceId() {
     static $sid = null;
     if ($sid !== null) return $sid;
@@ -76,18 +71,20 @@ function slpServiceId() {
     return (int) $sid;
 }
 
-// Same derivation rule as DILP/TUPAD/CLPEP.
+// Derives a beneficiary's status from their project's status.
 function slpDeriveStatus($projectStatus) {
     if ($projectStatus === 'Completed') return 'Completed';
     if ($projectStatus === 'Planned' || $projectStatus === 'Ongoing') return 'Active';
     return 'Inactive';
 }
 
+// Returns the base URL for serving uploaded files.
 function slpUploadBaseUrl() {
     $host = $_SERVER['HTTP_HOST'] ?? 'localhost';
     return 'http://' . $host . '/epeso_backend/';
 }
 
+// Formats a byte count as a human-readable size.
 function slpFormatBytes($bytes) {
     $bytes = (int) $bytes;
     if ($bytes <= 0) return '0 Bytes';
@@ -96,8 +93,7 @@ function slpFormatBytes($bytes) {
     return round($bytes / pow(1024, $i), 2) . ' ' . $units[$i];
 }
 
-// Sector checkbox label <-> shared beneficiary_classification_enum value.
-// 'Not Applicable' has no enum value -- it simply means no row is written.
+// Maps sector checkbox labels to beneficiary_classification_enum values.
 function slpSectorMap() {
     return [
         'Indigenous People (IP)'             => 'Indigenous People',
@@ -111,9 +107,11 @@ function slpSectorMap() {
         'Others'                               => 'Other',
     ];
 }
+// Returns the classification enum value for a sector label.
 function slpSectorToClassification($label) {
     return slpSectorMap()[$label] ?? null;
 }
+// Returns the sector label for a classification enum value.
 function slpClassificationToSector($classification) {
     $reverse = array_flip(slpSectorMap());
     return $reverse[$classification] ?? null;
@@ -121,6 +119,7 @@ function slpClassificationToSector($classification) {
 
 // ─── Projects ─────────────────────────────────────────────────────────────────
 
+// Returns the list of SLP projects.
 function slpListProjects() {
     $s = db()->query(
         "SELECT p.*, (SELECT COUNT(*) FROM slp_project_beneficiaries pb WHERE pb.project_id = p.project_id AND pb.exited_at IS NULL) AS assigned_count
@@ -131,6 +130,7 @@ function slpListProjects() {
     json(['status' => 'ok', 'data' => array_map('slpFormatProject', $s->fetchAll())]);
 }
 
+// Returns a single SLP project by id.
 function slpGetProjectById($id) {
     $s = db()->prepare(
         "SELECT p.*, (SELECT COUNT(*) FROM slp_project_beneficiaries pb WHERE pb.project_id = p.project_id AND pb.exited_at IS NULL) AS assigned_count
@@ -141,6 +141,7 @@ function slpGetProjectById($id) {
     return $r ? slpFormatProject($r) : null;
 }
 
+// Formats an SLP project row for the frontend.
 function slpFormatProject($r) {
     return [
         'id'               => (int) $r['project_id'],
@@ -158,6 +159,7 @@ function slpFormatProject($r) {
     ];
 }
 
+// Validates SLP project input.
 function slpValidateProjectInput($d) {
     $name = trim($d['projectName'] ?? '');
     if ($name === '') error('Project Name is required.', 422);
@@ -175,6 +177,7 @@ function slpValidateProjectInput($d) {
     return [$name, $date, $facilitator, $track];
 }
 
+// Creates a new SLP project.
 function slpCreateProject() {
     $uid = requireLogin();
     $d = body();
@@ -204,6 +207,7 @@ function slpCreateProject() {
     json(['status' => 'ok', 'message' => 'Project created.', 'data' => slpGetProjectById($id)]);
 }
 
+// Updates an SLP project.
 function slpUpdateProject($id) {
     if (!is_numeric($id)) error('Invalid project id.', 422);
     $id  = (int) $id;
@@ -233,6 +237,7 @@ function slpUpdateProject($id) {
     json(['status' => 'ok', 'message' => 'Project updated.', 'data' => slpGetProjectById($id)]);
 }
 
+// Updates an SLP project's status.
 function slpUpdateProjectStatus($id) {
     if (!is_numeric($id)) error('Invalid project id.', 422);
     $id = (int) $id;
@@ -257,6 +262,7 @@ function slpUpdateProjectStatus($id) {
     json(['status' => 'ok', 'message' => 'Status updated.', 'data' => slpGetProjectById($id)]);
 }
 
+// Updates the stored status for every beneficiary currently linked to a project.
 function slpRefreshDerivedStatusForProject($projectId, $projectStatus) {
     $derived = slpDeriveStatus($projectStatus);
     db()->prepare(
@@ -267,6 +273,7 @@ function slpRefreshDerivedStatusForProject($projectId, $projectStatus) {
     )->execute([':st' => $derived, ':pid' => $projectId]);
 }
 
+// Deletes an SLP project.
 function slpDeleteProject($id) {
     if (!is_numeric($id)) error('Invalid project id.', 422);
     $id = (int) $id;
@@ -292,6 +299,7 @@ function slpDeleteProject($id) {
 
 // ─── Profiles ─────────────────────────────────────────────────────────────────
 
+// Returns the list of SLP profiles.
 function slpListProfiles() {
     $s = db()->prepare(
         "SELECT DISTINCT b.beneficiary_id
@@ -310,6 +318,7 @@ function slpListProfiles() {
     json(['status' => 'ok', 'data' => $out]);
 }
 
+// Returns a single SLP profile.
 function slpGetProfile($id) {
     if (!is_numeric($id)) error('Invalid id.', 422);
     $p = slpBuildProfile((int) $id);
@@ -317,6 +326,7 @@ function slpGetProfile($id) {
     json(['status' => 'ok', 'data' => $p]);
 }
 
+// Builds the full SLP profile for display.
 function slpBuildProfile($bid) {
     $s = db()->prepare(
         "SELECT b.*, bgy.barangay_name, c.city_name, p.province_name, r.region_name,
@@ -437,13 +447,7 @@ function slpBuildProfile($bid) {
     ];
 }
 
-// Non-exiting sibling of slpValidateProfileInput() below: returns an error
-// string (or '' if valid) instead of calling error()/exit, so the bulk
-// import can validate every row and collect all their problems instead of
-// aborting the whole request at the first bad row.
-//
-// Required fields mirror beneficiaries' real NOT NULL columns (sex,
-// birth_date, civil_status, barangay_id).
+// Validates SLP profile input, returning an error string or ''.
 function slpProfileValidationError($d) {
     if (slpNullStr($d['firstName'] ?? '') === null) return 'First name is required.';
     if (slpNullStr($d['lastName'] ?? '') === null)  return 'Last name is required.';
@@ -463,9 +467,7 @@ function slpProfileValidationError($d) {
     return '';
 }
 
-// participant_type/eligibility_type/slp_track are NOT NULL on slp_profiles
-// but have no required marker in the UI, so an empty value falls back to a
-// sensible default rather than blocking the save.
+// Validates SLP profile input and returns the normalized field tuple.
 function slpValidateProfileInput($d) {
     $err = slpProfileValidationError($d);
     if ($err) error($err, 422);
@@ -497,6 +499,7 @@ function slpValidateProfileInput($d) {
     return [$sex, $birth, $civil, $bgyId, $eligibility, $track, $severity, $assessment, $edu];
 }
 
+// Replaces a beneficiary's sector classifications and disability detail.
 function slpSyncClassifications($pdo, $bid, $d) {
     $pdo->prepare("DELETE FROM beneficiary_classifications WHERE beneficiary_id=:bid")->execute([':bid' => $bid]);
 
@@ -517,11 +520,7 @@ function slpSyncClassifications($pdo, $bid, $d) {
     }
 }
 
-// Insert one profile's full beneficiary spine. Shared by the single-record
-// create and the bulk import. Recomputes the same enum defaults
-// slpValidateProfileInput() does, since that function's tuple return isn't
-// reused here (the bulk import validates via slpProfileValidationError()
-// instead, which doesn't compute these derived defaults).
+// Inserts one profile's full beneficiary spine.
 function slpInsertProfileRow($pdo, $uid, $d) {
     $sex   = $d['sex'];
     $birth = slpDate($d['birthdate'] ?? '');
@@ -589,6 +588,7 @@ function slpInsertProfileRow($pdo, $uid, $d) {
     return $bid;
 }
 
+// Creates a new SLP profile.
 function slpCreateProfile() {
     $uid = requireLogin();
     $d = body();
@@ -608,11 +608,7 @@ function slpCreateProfile() {
     json(['status' => 'ok', 'message' => 'Profile saved.', 'data' => slpBuildProfile($bid)]);
 }
 
-// POST /api/slp/importProfilesBulk   body = { rows: object[] }
-//
-// All-or-nothing bulk import: every row is validated up front, then the
-// whole batch is written inside ONE transaction. If any row fails validation
-// or the insert throws partway through, everything is rolled back.
+// Bulk-imports SLP profiles.
 function slpImportProfilesBulk() {
     $uid  = requireLogin();
     $body = body();
@@ -649,6 +645,7 @@ function slpImportProfilesBulk() {
     json(['status' => 'ok', 'message' => 'Profiles saved.', 'data' => ['ids' => $ids, 'count' => count($ids)]]);
 }
 
+// Updates an SLP profile.
 function slpUpdateProfile($id) {
     if (!is_numeric($id)) error('Invalid id.', 422);
     $bid = (int) $id;
@@ -706,6 +703,7 @@ function slpUpdateProfile($id) {
     json(['status' => 'ok', 'message' => 'Profile updated.', 'data' => slpBuildProfile($bid)]);
 }
 
+// Soft-deletes an SLP beneficiary.
 function slpDeleteProfile($id) {
     if (!is_numeric($id)) error('Invalid id.', 422);
     $bid = (int) $id;
@@ -737,12 +735,8 @@ function slpDeleteProfile($id) {
 }
 
 // ─── Update Assessment Result (quick action) ──────────────────────────────────
-// Changes only slp_profiles.assessment_result, so staff don't have to reopen
-// the whole Edit form. Assigning a project requires 'Qualified', so switching
-// to 'Not Qualified' is refused while the beneficiary's current project is
-// Planned (they can unassign first -- see slpUnassignProject) or Ongoing (they
-// can't unassign, and should simply stay Qualified while it runs). A Completed
-// project stays on record and does not block a later change.
+
+// Updates a beneficiary's assessment result.
 function slpUpdateAssessmentResult() {
     $uid = requireLogin();
     $d = body();
@@ -798,6 +792,7 @@ function slpUpdateAssessmentResult() {
 
 // ─── Assign / Unassign project ────────────────────────────────────────────────
 
+// Assigns a beneficiary to an SLP project.
 function slpAssignProject() {
     requireLogin();
     $d = body();
@@ -852,6 +847,7 @@ function slpAssignProject() {
     json(['status' => 'ok', 'message' => 'Beneficiary assigned to project.']);
 }
 
+// Unassigns a beneficiary from an SLP project.
 function slpUnassignProject() {
     requireLogin();
     $d = body();
@@ -894,12 +890,7 @@ function slpUnassignProject() {
     json(['status' => 'ok', 'message' => 'Beneficiary unassigned from project.']);
 }
 
-// Records that a beneficiary LEFT an already-started project early. Unlike
-// unassign (a correction, only while the project is still Planned, which
-// deletes the link), this KEEPS the assignment row and marks it with when/why/
-// who, and sets the stored profile status to Withdrawn. The project-status
-// cascade skips exited rows, so completing the project never turns them into
-// Completed. Only meaningful for an Ongoing project.
+// Marks a beneficiary as withdrawn from their SLP project.
 function slpWithdrawFromProject() {
     $uid = requireLogin();
     $d = body();
@@ -963,6 +954,7 @@ function slpWithdrawFromProject() {
 
 // ─── Documents (applicant) ────────────────────────────────────────────────────
 
+// Saves attachment uploads for an SLP applicant.
 function slpSyncDocuments($pdo, $bid, $bsId, $uid, $d) {
     $docs = is_array($d['attachedDocuments'] ?? null) ? $d['attachedDocuments'] : [];
 
@@ -1007,6 +999,7 @@ function slpSyncDocuments($pdo, $bid, $bsId, $uid, $d) {
     }
 }
 
+// Returns an applicant's saved attachments.
 function slpFetchSavedDocuments($bid) {
     $s = db()->prepare(
         "SELECT document_id, file_name, file_path, file_size
@@ -1025,6 +1018,7 @@ function slpFetchSavedDocuments($bid) {
 
 // ─── Documents (project) ──────────────────────────────────────────────────────
 
+// Saves attachment uploads for an SLP project.
 function slpSyncProjectDocuments($pdo, $projectId, $uid, $docsPayload) {
     $docs = is_array($docsPayload) ? $docsPayload : [];
 
@@ -1069,6 +1063,7 @@ function slpSyncProjectDocuments($pdo, $projectId, $uid, $docsPayload) {
     }
 }
 
+// Returns a project's saved attachments.
 function slpFetchProjectDocuments($projectId) {
     $s = db()->prepare(
         "SELECT document_id, file_name, file_path, file_size, mime_type
@@ -1086,9 +1081,10 @@ function slpFetchProjectDocuments($projectId) {
 }
 
 // ═══════════════════════════════════════════════════════════════════════════════
-// RECYCLE BIN  (soft-deleted SLP beneficiaries) — mirrors tupad.php's pattern.
+// RECYCLE BIN  (soft-deleted SLP beneficiaries)
 // ═══════════════════════════════════════════════════════════════════════════════
 
+// Maps each recycle-bin record type to its table and primary key.
 function slpRecycleMap() {
     return [
         'slpApplicant' => ['beneficiaries', 'beneficiary_id'],
@@ -1096,6 +1092,7 @@ function slpRecycleMap() {
     ];
 }
 
+// Reads and validates {recordType, id} from the request body.
 function slpRecycleTarget() {
     $d    = body();
     $type = $d['recordType'] ?? '';
@@ -1105,9 +1102,7 @@ function slpRecycleTarget() {
     return [$type, $id];
 }
 
-// A human-readable name for an activity log line -- "#9" means nothing to
-// whoever reads it later; the applicant's actual name (or project name)
-// does. Must be looked up BEFORE the record is hard-deleted.
+// Returns a recycle-bin record's display name.
 function slpRecordName($type, $id) {
     if ($type === 'slpApplicant') {
         $s = db()->prepare(
@@ -1123,6 +1118,7 @@ function slpRecordName($type, $id) {
     return $name !== false ? $name : "#{$id}";
 }
 
+// Returns the recycle bin contents for beneficiaries and projects.
 function slpListDeleted() {
     slpPurgeExpired();
     $s = db()->prepare(
@@ -1170,6 +1166,7 @@ function slpListDeleted() {
     json(['status' => 'ok', 'data' => $items]);
 }
 
+// Restores a record from the recycle bin.
 function slpRestoreRecord() {
     [$type, $id] = slpRecycleTarget();
     [$table, $pk] = slpRecycleMap()[$type];
@@ -1183,10 +1180,7 @@ function slpRestoreRecord() {
     json(['status' => 'ok', 'message' => 'Record restored.']);
 }
 
-// Single place that knows how to actually hard-delete each recordType --
-// shared by slpPurgeRecord() (one record, explicit admin action) and
-// slpPurgeExpired() (bulk, automatic 30-day retention purge) so there's
-// never a second, drifting copy of this dispatch.
+// Permanently deletes a recycle-bin record by type.
 function slpHardDeleteByType($type, $id) {
     if ($type === 'slpApplicant') {
         slpHardDeleteApplicant($id);
@@ -1195,6 +1189,7 @@ function slpHardDeleteByType($type, $id) {
     }
 }
 
+// Permanently deletes a recycle-bin record.
 function slpPurgeRecord() {
     [$type, $id] = slpRecycleTarget();
     [$table, $pk] = slpRecycleMap()[$type];
@@ -1209,11 +1204,7 @@ function slpPurgeRecord() {
     json(['status' => 'ok', 'message' => 'Record permanently deleted.']);
 }
 
-// Auto-purges anything past the recycle bin's retention window (see
-// RECYCLE_BIN_RETENTION_DAYS in core/helpers.php). Called from
-// slpListDeleted() so simply viewing the recycle bin enforces the "N days
-// left" countdown the UI already shows -- that display was cosmetic only
-// until this existed.
+// Hard-deletes expired recycle bin rows (RECYCLE_BIN_RETENTION_DAYS); called by slpListDeleted().
 function slpPurgeExpired() {
     $uid = currentUserId();
 
@@ -1251,9 +1242,7 @@ function slpPurgeExpired() {
     }
 }
 
-// Permanently remove an SLP project and its uploaded files. Only reachable
-// for an already soft-deleted project, which slpDeleteProject's in-use guard
-// already guaranteed has zero linked beneficiaries.
+// Permanently deletes an SLP project and its uploaded files.
 function slpHardDeleteProject($id) {
     $docs = db()->prepare("SELECT file_path FROM attached_documents WHERE slp_project_id=:id");
     $docs->execute([':id' => $id]);
@@ -1264,6 +1253,7 @@ function slpHardDeleteProject($id) {
     db()->prepare("DELETE FROM slp_projects WHERE project_id=:id")->execute([':id' => $id]);
 }
 
+// Permanently deletes an SLP applicant and all related data.
 function slpHardDeleteApplicant($bid) {
     $pdo = db();
     try {

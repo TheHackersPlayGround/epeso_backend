@@ -7,6 +7,7 @@ include_once __DIR__ . '/../core/helpers.php';
 include_once __DIR__ . '/../core/guard.php';
 include_once __DIR__ . '/../core/activity_log.php';
 
+// Routes a documents action to its handler function.
 function handle($action, $id, $method)
 {
     switch ($action) {
@@ -28,12 +29,14 @@ function handle($action, $id, $method)
 
 // ─── Helpers ─────────────────────────────────────────────────────────────────
 
+// Returns the base URL for serving uploaded files.
 function docsUploadBaseUrl()
 {
     $host = $_SERVER['HTTP_HOST'] ?? 'localhost';
     return 'http://' . $host . '/epeso_backend/';
 }
 
+// Formats a byte count as a human-readable size.
 function docsFormatBytes($bytes)
 {
     $bytes = (int) $bytes;
@@ -43,9 +46,7 @@ function docsFormatBytes($bytes)
     return round($bytes / pow(1024, $i), 2) . ' ' . $units[$i];
 }
 
-// Resolves the frontend's 'root' | '<folder_id>' sentinel into a real
-// [parent_folder_id or null, parent's folder_level or 0], validating that a
-// non-root parent actually exists and isn't itself in the recycle bin.
+// Resolves a parent folder sentinel into [parentId, parentLevel].
 function docsResolveParent($parentId)
 {
     if (!$parentId || $parentId === 'root') return [null, 0];
@@ -57,10 +58,7 @@ function docsResolveParent($parentId)
     return [(int) $row['folder_id'], (int) $row['folder_level']];
 }
 
-// True if a non-deleted folder already has this name under this parent
-// (NULL-safe: PHP's ":pid" bound as null with "= :pid" never matches in SQL,
-// so root-level comparisons use "IS NULL" instead). $excludeId lets a rename
-// check against every sibling except itself.
+// Checks whether a folder name is already used under a parent.
 function docsFolderNameTaken($name, $parentId, $excludeId = null)
 {
     $sql = "SELECT 1 FROM folders WHERE deleted_at IS NULL AND folder_name = :name AND "
@@ -76,7 +74,7 @@ function docsFolderNameTaken($name, $parentId, $excludeId = null)
     return (bool) $s->fetchColumn();
 }
 
-// Same idea as docsFolderNameTaken(), for documents within a folder.
+// Checks whether a document name is already used within a folder.
 function docsDocumentNameTaken($name, $folderId, $excludeId = null)
 {
     $sql = "SELECT 1 FROM document_library WHERE deleted_at IS NULL AND file_name = :name AND "
@@ -94,6 +92,7 @@ function docsDocumentNameTaken($name, $folderId, $excludeId = null)
 
 // ─── Folders ─────────────────────────────────────────────────────────────────
 
+// Returns the list of folders.
 function docsListFolders()
 {
     $s = db()->query(
@@ -112,6 +111,7 @@ function docsListFolders()
     json(['status' => 'ok', 'data' => $data]);
 }
 
+// Creates a new folder.
 function docsCreateFolder()
 {
     $d    = body();
@@ -142,6 +142,7 @@ function docsCreateFolder()
     ]]);
 }
 
+// Renames a folder.
 function docsRenameFolder($id)
 {
     $id = (int) $id;
@@ -168,10 +169,7 @@ function docsRenameFolder($id)
     json(['status' => 'ok', 'message' => 'Folder renamed.']);
 }
 
-// Blocks deleting a folder that still has active (non-deleted) files or
-// subfolders in it, rather than warning-and-cascading — a folder can hold
-// several levels of real documents, and a "delete anyway" option risks
-// wiping out files the user forgot were even in there.
+// Deletes a folder, if it has no active files or subfolders.
 function docsDeleteFolder($id)
 {
     $id = (int) $id;
@@ -206,6 +204,7 @@ function docsDeleteFolder($id)
 
 // ─── Documents ────────────────────────────────────────────────────────────────
 
+// Returns the list of documents.
 function docsListDocuments()
 {
     $s = db()->query(
@@ -231,8 +230,7 @@ function docsListDocuments()
     json(['status' => 'ok', 'data' => $data]);
 }
 
-// Body: { folderId, fileName, dataUrl }. dataUrl is a base64 data URL, same
-// convention as employmentSavePhoto/employmentSyncDocuments.
+// Uploads a new document.
 function docsUploadDocument()
 {
     $d       = body();
@@ -276,6 +274,7 @@ function docsUploadDocument()
     json(['status' => 'ok', 'message' => 'Document uploaded.', 'data' => ['id' => (string) $newId]]);
 }
 
+// Renames a document.
 function docsRenameDocument($id)
 {
     $id = (int) $id;
@@ -311,6 +310,7 @@ function docsRenameDocument($id)
     json(['status' => 'ok', 'message' => 'Document renamed.']);
 }
 
+// Moves a document to a different folder.
 function docsMoveDocument($id)
 {
     $id = (int) $id;
@@ -341,6 +341,7 @@ function docsMoveDocument($id)
     json(['status' => 'ok', 'message' => 'Document moved.']);
 }
 
+// Soft-deletes a document.
 function docsDeleteDocument($id)
 {
     $id = (int) $id;
@@ -360,6 +361,7 @@ function docsDeleteDocument($id)
 
 // ─── Recycle bin ──────────────────────────────────────────────────────────────
 
+// Maps each recycle-bin record type to its table and primary key.
 function docsRecycleMap()
 {
     return [
@@ -368,9 +370,7 @@ function docsRecycleMap()
     ];
 }
 
-// Read + validate { recordType, id } from the request body. Returns [type, id, body]
-// — the decoded body is returned too so callers needing extra fields (e.g.
-// purgeRecord's "force") don't have to re-read php://input a second time.
+// Reads and validates {recordType, id} from the request body.
 function docsRecycleTarget()
 {
     $d    = body();
@@ -381,12 +381,7 @@ function docsRecycleTarget()
     return [$type, $id, $d];
 }
 
-// How many document_library rows still reference this folder, regardless of
-// deleted_at. docsDeleteFolder's guard already guarantees zero *active* files
-// at soft-delete time, so any count here is entirely leftover recycle-bin
-// files — document_library.folder_id has no ON DELETE action (defaults to
-// RESTRICT), so purging the folder while these still point at it would
-// otherwise fail with a raw FK violation.
+// Counts document_library rows referencing a folder, active or deleted.
 function docsFolderFileCount($folderId)
 {
     $s = db()->prepare("SELECT COUNT(*) FROM document_library WHERE folder_id = :id");
@@ -394,6 +389,7 @@ function docsFolderFileCount($folderId)
     return (int) $s->fetchColumn();
 }
 
+// Returns the recycle bin contents for folders and documents.
 function docsListDeleted()
 {
     docsPurgeExpired();
@@ -449,6 +445,7 @@ function docsListDeleted()
     json(['status' => 'ok', 'data' => $items]);
 }
 
+// Returns a recycle-bin record's display name.
 function docsRecordName($type, $id)
 {
     $nameCol = $type === 'documentsFolder' ? 'folder_name' : 'file_name';
@@ -459,9 +456,7 @@ function docsRecordName($type, $id)
     return $name !== false ? $name : "#{$id}";
 }
 
-// After a restore, if another active record in the same folder already uses this
-// name, rename the restored one to "base (N).ext" (first free N). Returns the new
-// name, or null if no rename was needed.
+// Renames a restored record if its name is already taken in the destination.
 function docsRenameIfTakenAfterRestore($type, $id, $name)
 {
     if ($type === 'documentsFolder') {
@@ -497,6 +492,7 @@ function docsRenameIfTakenAfterRestore($type, $id, $name)
     return $newName;
 }
 
+// Restores a folder or document from the recycle bin.
 function docsRestoreRecord()
 {
     [$type, $id] = docsRecycleTarget();
@@ -536,21 +532,13 @@ function docsRestoreRecord()
     json(['status' => 'ok', 'message' => 'Record restored.', 'data' => ['renamedTo' => $renamedTo]]);
 }
 
-// Only acts on records already in the recycle bin (deleted_at IS NOT NULL).
-// For folders that still have files parked in them (soft-deleted files whose
-// folder_id was never cleared — see docsFolderFileCount): blocked with a 409
-// (detail: {code:'has_files', count}) unless force=true is passed. The
-// frontend re-submits with force after the user confirms a specific
-// "this will also delete N file(s)" warning.
-// Hard-deletes a folder, assuming any leftover recycle-bin files inside it
-// have already been dealt with by the caller (either confirmed via "force",
-// or found to have none). Subfolders clean up on their own
-// (folders.parent_folder_id is ON DELETE CASCADE).
+// Permanently deletes a folder row.
 function docsHardDeleteFolder($id)
 {
     db()->prepare("DELETE FROM folders WHERE folder_id = :id")->execute([':id' => $id]);
 }
 
+// Permanently deletes a recycle-bin record.
 function docsPurgeRecord()
 {
     [$type, $id, $body] = docsRecycleTarget();
@@ -587,20 +575,7 @@ function docsPurgeRecord()
     json(['status' => 'ok', 'message' => 'Record permanently deleted.']);
 }
 
-// Auto-purges anything past the recycle bin's retention window (see
-// RECYCLE_BIN_RETENTION_DAYS in core/helpers.php). Called from
-// docsListDeleted() so simply viewing the recycle bin enforces the "N days
-// left" countdown the UI already shows -- that display was cosmetic only
-// until this existed.
-//
-// A folder that still has leftover recycle-bin files inside it is
-// deliberately SKIPPED, exactly like docsPurgeRecord()'s force guard for a
-// manual purge -- destroying those files too should stay a conscious admin
-// action, never something that happens silently in the background. It
-// simply stays in the recycle bin past its nominal 30 days until an admin
-// reviews it (likely because those files are also individually expired and
-// will be purged in their own right, after which the folder becomes
-// purgeable on the next sweep).
+// Purges recycle bin rows past RECYCLE_BIN_RETENTION_DAYS, skipping folders with leftover files.
 function docsPurgeExpired()
 {
     $uid = currentUserId();
@@ -625,6 +600,7 @@ function docsPurgeExpired()
     }
 }
 
+// Permanently deletes a document and its uploaded file.
 function docsHardDeleteDocument($id)
 {
     $s = db()->prepare("SELECT file_path FROM document_library WHERE document_id = :id");

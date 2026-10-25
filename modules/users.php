@@ -30,8 +30,7 @@ function handle($action, $id, $method)
     }
 }
 
-// Is the currently logged-in actor a true Administrator?
-// Used to stop non-admins from creating/elevating/deleting Administrator accounts.
+// Returns whether the logged-in actor is a true Administrator.
 function actorIsAdmin()
 {
     $id = currentUserId();
@@ -43,8 +42,7 @@ function actorIsAdmin()
     return $stmt->fetchColumn() === 'Administrator';
 }
 
-// The view-/manage- permission names the current actor personally holds.
-// Administrators hold the full set.
+// Returns the permission names the current actor personally holds.
 function actorPermissionNames()
 {
     $id = currentUserId();
@@ -83,7 +81,7 @@ function guardGrantablePermissions($requested)
     }
 }
 
-// GET /api/users/list  -> all users, each with their permission name list.
+// Returns all users with their permission lists.
 function usersList()
 {
     $users = db()->query(
@@ -123,7 +121,7 @@ function usersList()
     json(['status' => 'ok', 'users' => $out]);
 }
 
-// POST /api/users/create  { firstName, lastName, username, password, role, status, permissions[] }
+// Creates a new user account.
 function usersCreate()
 {
     $d        = body();
@@ -208,7 +206,7 @@ function usersCreate()
     json(['status' => 'ok', 'user' => fetchUser($userId)], 201);
 }
 
-// POST /api/users/update/{id}  { firstName, lastName, username, role, status, permissions[], newPassword? }
+// Updates a user account.
 function usersUpdate($id)
 {
     $id = (int) $id;
@@ -307,7 +305,7 @@ function usersUpdate($id)
     json(['status' => 'ok', 'user' => fetchUser($id)]);
 }
 
-// DELETE /api/users/delete/{id}
+// Soft-deletes a user account.
 function usersDelete($id)
 {
     $id = (int) $id;
@@ -338,16 +336,8 @@ function usersDelete($id)
         error('Cannot delete the last administrator account.', 409);
     }
 
-    // Soft delete: the row (and their permission rows) stay so every record
-    // that points at this user keeps pointing at a real person. There is
-    // deliberately NO restore or purge in the app -- to everyone using the
-    // system it behaves like a hard delete, and the row only records who
-    // deleted it and when. requireLogin() refuses a deleted account on the
-    // very next request, so any open session ends.
-    // The username is renamed to "<name> (deleted #<id>)": it frees the name for a
-    // new account and keeps old log / "uploaded by" entries unmistakable (they
-    // would otherwise read exactly like the new account's). username is
-    // varchar(50), so the original is trimmed to leave room for the suffix.
+    // Soft delete (no restore/purge for users). Rename username so the slot
+    // frees up while old log/"uploaded by" entries stay distinguishable.
     $suffix  = " (deleted #{$id})";
     $renamed = mb_substr($user['username'], 0, max(1, 50 - mb_strlen($suffix))) . $suffix;
     db()->prepare("UPDATE users SET username = :name, deleted_at = now(), deleted_by = :by, updated_at = now() WHERE user_id = :id")
@@ -359,9 +349,7 @@ function usersDelete($id)
 
 // ── helpers ──────────────────────────────────────────────────────────────────
 
-// Replace a user's permissions, storing ONE row per module with the real level.
-// The frontend sends names like 'view-cdsp' / 'manage-cdsp'. We collapse them per
-// module: 'manage-X' present => Editor, otherwise 'view-X' => Viewer.
+// Replaces a user's stored permissions from a view-/manage- permission name list.
 function syncUserPermissions($userId, $permissionNames)
 {
     $pdo = db();
@@ -454,8 +442,7 @@ function fetchUser($userId)
     return $pub;
 }
 
-// Full view-/manage- name set (used to grant Administrators full access).
-// Derived from the 11 module rows: each module yields view-X and manage-X.
+// Returns the full view-/manage- permission name set.
 function allPermissionNames()
 {
     $modules = db()->query("SELECT permission_name FROM permissions ORDER BY permission_id")
@@ -468,6 +455,7 @@ function allPermissionNames()
     return $names;
 }
 
+// Counts active Administrator accounts.
 function countAdmins()
 {
     return (int) db()->query("SELECT count(*) FROM users WHERE role = 'Administrator' AND status = 'Active' AND deleted_at IS NULL")->fetchColumn();

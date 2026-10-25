@@ -1,25 +1,17 @@
 <?php
 // CLPEP: interventions (clpep_interventions) + profiles (clpep_profiles,
-// dedicated table, 1:1 with beneficiary_services via UNIQUE beneficiary_service_id).
-//
-// Like TUPAD/SLP (and unlike DILP/GIP/SPES), clpep_intervention_beneficiaries
-// is unique on (intervention_id, beneficiary_service_id) only -- a beneficiary
-// can carry a running history of intervention assignments. "Current" is the
-// most recently assigned row; assigning never deletes older rows.
-//
-// clpep_profiles.status is a stored column (unlike DILP/TUPAD, which have no
-// profile table to store it on), but it is written by this module the same
-// way DILP/TUPAD derive it -- never accepted directly from the client:
-// Inactive (no assignment), Active (Planned/Ongoing), Completed (Completed).
-//
-// CLPEP is a minors-only program: the applicant form collects no Civil
-// Status, Contact Number, or Email -- civil_status is hardcoded to 'Single'
-// on insert since beneficiaries.civil_status is NOT NULL.
+// 1:1 with beneficiary_services via UNIQUE beneficiary_service_id).
+// clpep_intervention_beneficiaries keeps a running history of assignments;
+// "current" is the most recently assigned row. clpep_profiles.status is
+// stored but always server-derived from the current assignment, never
+// client-set. Minors-only program: civil_status is hardcoded to 'Single'
+// since the applicant form collects no Civil Status.
 
 include_once __DIR__ . '/../core/helpers.php';
 include_once __DIR__ . '/../core/guard.php';
 include_once __DIR__ . '/../core/activity_log.php';
 
+// Routes a CLPEP action to its handler function.
 function handle($action, $id, $method)
 {
     switch ($action) {
@@ -45,26 +37,28 @@ function handle($action, $id, $method)
 
 // ─── Helpers ─────────────────────────────────────────────────────────────────
 
+// Trims a string, converting empty/blank to null.
 function clpepNullStr($v) {
     $s = is_string($v) ? trim($v) : $v;
     return ($s === '' || $s === null) ? null : $s;
 }
+// Validates and returns a YYYY-MM-DD date string, or null.
 function clpepDate($v) {
     $s = is_string($v) ? trim($v) : '';
     return preg_match('/^\d{4}-\d{2}-\d{2}$/', $s) ? $s : null;
 }
+// Converts a numeric value to int, or null.
 function clpepIntOrNull($v) { return is_numeric($v) ? (int)$v : null; }
+// Converts a numeric value to float, or null.
 function clpepNumOrNull($v) { return is_numeric($v) ? (float)$v : null; }
-// Returns the string literals 'true'/'false' rather than PHP booleans --
-// PDO (with ATTR_EMULATE_PREPARES off) binds PHP false as an empty string
-// for a real Postgres boolean column, which Postgres rejects. Same fix as
-// dilp.php's is4PsBeneficiary binding.
+// Converts a boolean-like value to the string 'true'/'false', or null.
 function clpepBoolOrNull($v) {
     if ($v === true || $v === 'true' || $v === 1 || $v === '1') return 'true';
     if ($v === false || $v === 'false' || $v === 0 || $v === '0') return 'false';
     return null;
 }
 
+// Returns the CLPEP service_id (cached).
 function clpepServiceId() {
     static $sid = null;
     if ($sid !== null) return $sid;
@@ -74,21 +68,20 @@ function clpepServiceId() {
     return (int) $sid;
 }
 
-// Same derivation rule as DILP/TUPAD: Active while Planned/Ongoing, Completed
-// once Completed, Inactive otherwise (no assignment, or the intervention was
-// Cancelled -- clpep_intervention_status_enum has a Cancelled state DILP's
-// project_status_enum shares, so that falls back to Inactive too).
+// Derives a beneficiary's status from their intervention's status.
 function clpepDeriveStatus($interventionStatus) {
     if ($interventionStatus === 'Completed') return 'Completed';
     if ($interventionStatus === 'Planned' || $interventionStatus === 'Ongoing') return 'Active';
     return 'Inactive';
 }
 
+// Returns the base URL for serving uploaded files.
 function clpepUploadBaseUrl() {
     $host = $_SERVER['HTTP_HOST'] ?? 'localhost';
     return 'http://' . $host . '/epeso_backend/';
 }
 
+// Formats a byte count as a human-readable size.
 function clpepFormatBytes($bytes) {
     $bytes = (int) $bytes;
     if ($bytes <= 0) return '0 Bytes';
@@ -99,6 +92,7 @@ function clpepFormatBytes($bytes) {
 
 // ─── Interventions ─────────────────────────────────────────────────────────────
 
+// Returns the list of CLPEP interventions.
 function clpepListInterventions() {
     $s = db()->query(
         "SELECT i.*, (SELECT COUNT(*) FROM clpep_intervention_beneficiaries ib WHERE ib.intervention_id = i.intervention_id) AS assigned_count
@@ -109,6 +103,7 @@ function clpepListInterventions() {
     json(['status' => 'ok', 'data' => array_map('clpepFormatIntervention', $s->fetchAll())]);
 }
 
+// Returns a single CLPEP intervention by id.
 function clpepGetInterventionById($id) {
     $s = db()->prepare(
         "SELECT i.*, (SELECT COUNT(*) FROM clpep_intervention_beneficiaries ib WHERE ib.intervention_id = i.intervention_id) AS assigned_count
@@ -119,6 +114,7 @@ function clpepGetInterventionById($id) {
     return $r ? clpepFormatIntervention($r) : null;
 }
 
+// Formats a CLPEP intervention row for the frontend.
 function clpepFormatIntervention($r) {
     return [
         'id'                       => (int) $r['intervention_id'],
@@ -138,6 +134,7 @@ function clpepFormatIntervention($r) {
     ];
 }
 
+// Validates CLPEP intervention input.
 function clpepValidateInterventionInput($d) {
     $name = trim($d['interventionName'] ?? '');
     if ($name === '') error('Intervention Name is required.', 422);
@@ -158,6 +155,7 @@ function clpepValidateInterventionInput($d) {
     return [$name, $date, $officer, $category];
 }
 
+// Creates a new CLPEP intervention.
 function clpepCreateIntervention() {
     $uid = requireLogin();
     $d = body();
@@ -186,6 +184,7 @@ function clpepCreateIntervention() {
     json(['status' => 'ok', 'message' => 'Intervention created.', 'data' => clpepGetInterventionById($id)]);
 }
 
+// Updates a CLPEP intervention.
 function clpepUpdateIntervention($id) {
     if (!is_numeric($id)) error('Invalid intervention id.', 422);
     $id  = (int) $id;
@@ -217,6 +216,7 @@ function clpepUpdateIntervention($id) {
     json(['status' => 'ok', 'message' => 'Intervention updated.', 'data' => clpepGetInterventionById($id)]);
 }
 
+// Updates a CLPEP intervention's status.
 function clpepUpdateInterventionStatus($id) {
     if (!is_numeric($id)) error('Invalid intervention id.', 422);
     $id = (int) $id;
@@ -241,6 +241,7 @@ function clpepUpdateInterventionStatus($id) {
     json(['status' => 'ok', 'message' => 'Status updated.', 'data' => clpepGetInterventionById($id)]);
 }
 
+// Updates the stored status for every beneficiary linked to an intervention.
 function clpepRefreshDerivedStatusForIntervention($interventionId, $interventionStatus) {
     $derived = clpepDeriveStatus($interventionStatus);
     db()->prepare(
@@ -251,6 +252,7 @@ function clpepRefreshDerivedStatusForIntervention($interventionId, $intervention
     )->execute([':st' => $derived, ':iid' => $interventionId]);
 }
 
+// Deletes a CLPEP intervention.
 function clpepDeleteIntervention($id) {
     if (!is_numeric($id)) error('Invalid intervention id.', 422);
     $id = (int) $id;
@@ -276,6 +278,7 @@ function clpepDeleteIntervention($id) {
 
 // ─── Profiles ─────────────────────────────────────────────────────────────────
 
+// Returns the list of CLPEP profiles.
 function clpepListProfiles() {
     $s = db()->prepare(
         "SELECT DISTINCT b.beneficiary_id
@@ -294,6 +297,7 @@ function clpepListProfiles() {
     json(['status' => 'ok', 'data' => $out]);
 }
 
+// Returns a single CLPEP profile.
 function clpepGetProfile($id) {
     if (!is_numeric($id)) error('Invalid id.', 422);
     $p = clpepBuildProfile((int) $id);
@@ -301,6 +305,7 @@ function clpepGetProfile($id) {
     json(['status' => 'ok', 'data' => $p]);
 }
 
+// Builds the full CLPEP profile for display.
 function clpepBuildProfile($bid) {
     $s = db()->prepare(
         "SELECT b.*, bgy.barangay_name, c.city_name, p.province_name, r.region_name,
@@ -388,16 +393,7 @@ function clpepBuildProfile($bid) {
     ];
 }
 
-// Non-exiting sibling of clpepValidateProfileInput() below: returns an error
-// string (or '' if valid) instead of calling error()/exit, so the bulk
-// import can validate every row and collect all their problems instead of
-// aborting the whole request at the first bad row.
-//
-// Required fields mirror beneficiaries' real NOT NULL columns (sex, birth_date,
-// barangay_id -- civil_status is hardcoded, not user input, since CLPEP is
-// minors-only and the form doesn't collect it). child_labor_status is also
-// NOT NULL on clpep_profiles but has no required marker in the UI, so an
-// empty value defaults to 'Not Yet Assessed' rather than blocking the save.
+// Validates CLPEP profile input, returning an error string or ''.
 function clpepProfileValidationError($d) {
     if (clpepNullStr($d['firstName'] ?? '') === null) return 'First name is required.';
     if (clpepNullStr($d['lastName'] ?? '') === null)  return 'Last name is required.';
@@ -411,6 +407,7 @@ function clpepProfileValidationError($d) {
     return '';
 }
 
+// Validates CLPEP profile input and returns [sex, birth, bgyId, childLabor, school].
 function clpepValidateProfileInput($d) {
     $err = clpepProfileValidationError($d);
     if ($err) error($err, 422);
@@ -428,8 +425,7 @@ function clpepValidateProfileInput($d) {
     return [$sex, $birth, $bgyId, $childLabor, $school];
 }
 
-// Insert one profile's full beneficiary spine. Shared by the single-record
-// create and the bulk import.
+// Inserts one profile's full beneficiary spine.
 function clpepInsertProfileRow($pdo, $uid, $d) {
     $sex   = $d['sex'];
     $birth = clpepDate($d['birthdate'] ?? '');
@@ -477,6 +473,7 @@ function clpepInsertProfileRow($pdo, $uid, $d) {
     return $bid;
 }
 
+// Creates a new CLPEP profile.
 function clpepCreateProfile() {
     $uid = requireLogin();
     $d = body();
@@ -496,11 +493,7 @@ function clpepCreateProfile() {
     json(['status' => 'ok', 'message' => 'Profile saved.', 'data' => clpepBuildProfile($bid)]);
 }
 
-// POST /api/clpep/importProfilesBulk   body = { rows: object[] }
-//
-// All-or-nothing bulk import: every row is validated up front, then the
-// whole batch is written inside ONE transaction. If any row fails validation
-// or the insert throws partway through, everything is rolled back.
+// Bulk-imports CLPEP profiles.
 function clpepImportProfilesBulk() {
     $uid  = requireLogin();
     $body = body();
@@ -537,6 +530,7 @@ function clpepImportProfilesBulk() {
     json(['status' => 'ok', 'message' => 'Profiles saved.', 'data' => ['ids' => $ids, 'count' => count($ids)]]);
 }
 
+// Updates a CLPEP profile.
 function clpepUpdateProfile($id) {
     if (!is_numeric($id)) error('Invalid id.', 422);
     $bid = (int) $id;
@@ -590,6 +584,7 @@ function clpepUpdateProfile($id) {
     json(['status' => 'ok', 'message' => 'Profile updated.', 'data' => clpepBuildProfile($bid)]);
 }
 
+// Soft-deletes a CLPEP beneficiary.
 function clpepDeleteProfile($id) {
     if (!is_numeric($id)) error('Invalid id.', 422);
     $bid = (int) $id;
@@ -621,12 +616,8 @@ function clpepDeleteProfile($id) {
 }
 
 // ─── Assign / Unassign intervention ────────────────────────────────────────────
-// clpep_intervention_beneficiaries is unique on (intervention_id,
-// beneficiary_service_id) only -- assigning always inserts (or refreshes an
-// existing identical link), never deletes an older assignment, so completed
-// interventions remain in history. clpep_profiles.status is written here to
-// reflect the new assignment (derived, never accepted from the client).
 
+// Assigns a beneficiary to a CLPEP intervention.
 function clpepAssignIntervention() {
     requireLogin();
     $d = body();
@@ -683,6 +674,7 @@ function clpepAssignIntervention() {
     json(['status' => 'ok', 'message' => 'Beneficiary assigned to intervention.']);
 }
 
+// Unassigns a beneficiary from a CLPEP intervention.
 function clpepUnassignIntervention() {
     requireLogin();
     $d = body();
@@ -729,6 +721,7 @@ function clpepUnassignIntervention() {
 
 // ─── Documents (applicant) ────────────────────────────────────────────────────
 
+// Saves attachment uploads for a CLPEP applicant.
 function clpepSyncDocuments($pdo, $bid, $bsId, $uid, $d) {
     $docs = is_array($d['attachedDocuments'] ?? null) ? $d['attachedDocuments'] : [];
 
@@ -773,6 +766,7 @@ function clpepSyncDocuments($pdo, $bid, $bsId, $uid, $d) {
     }
 }
 
+// Returns an applicant's saved attachments.
 function clpepFetchSavedDocuments($bid) {
     $s = db()->prepare(
         "SELECT document_id, file_name, file_path, file_size
@@ -791,6 +785,7 @@ function clpepFetchSavedDocuments($bid) {
 
 // ─── Documents (intervention) ─────────────────────────────────────────────────
 
+// Saves attachment uploads for a CLPEP intervention.
 function clpepSyncInterventionDocuments($pdo, $interventionId, $uid, $docsPayload) {
     $docs = is_array($docsPayload) ? $docsPayload : [];
 
@@ -835,6 +830,7 @@ function clpepSyncInterventionDocuments($pdo, $interventionId, $uid, $docsPayloa
     }
 }
 
+// Returns an intervention's saved attachments.
 function clpepFetchInterventionDocuments($interventionId) {
     $s = db()->prepare(
         "SELECT document_id, file_name, file_path, file_size, mime_type
@@ -852,9 +848,10 @@ function clpepFetchInterventionDocuments($interventionId) {
 }
 
 // ═══════════════════════════════════════════════════════════════════════════════
-// RECYCLE BIN  (soft-deleted CLPEP beneficiaries) — mirrors tupad.php's pattern.
+// RECYCLE BIN  (soft-deleted CLPEP beneficiaries)
 // ═══════════════════════════════════════════════════════════════════════════════
 
+// Maps each recycle-bin record type to its table and primary key.
 function clpepRecycleMap() {
     return [
         'clpepApplicant'    => ['beneficiaries', 'beneficiary_id'],
@@ -862,6 +859,7 @@ function clpepRecycleMap() {
     ];
 }
 
+// Reads and validates {recordType, id} from the request body.
 function clpepRecycleTarget() {
     $d    = body();
     $type = $d['recordType'] ?? '';
@@ -871,9 +869,7 @@ function clpepRecycleTarget() {
     return [$type, $id];
 }
 
-// A human-readable name for an activity log line -- "#9" means nothing to
-// whoever reads it later; the applicant's actual name (or intervention name)
-// does. Must be looked up BEFORE the record is hard-deleted.
+// Returns a recycle-bin record's display name.
 function clpepRecordName($type, $id) {
     if ($type === 'clpepApplicant') {
         $s = db()->prepare(
@@ -889,6 +885,7 @@ function clpepRecordName($type, $id) {
     return $name !== false ? $name : "#{$id}";
 }
 
+// Returns the recycle bin contents for beneficiaries and interventions.
 function clpepListDeleted() {
     clpepPurgeExpired();
     $s = db()->prepare(
@@ -936,6 +933,7 @@ function clpepListDeleted() {
     json(['status' => 'ok', 'data' => $items]);
 }
 
+// Restores a record from the recycle bin.
 function clpepRestoreRecord() {
     [$type, $id] = clpepRecycleTarget();
     [$table, $pk] = clpepRecycleMap()[$type];
@@ -949,10 +947,7 @@ function clpepRestoreRecord() {
     json(['status' => 'ok', 'message' => 'Record restored.']);
 }
 
-// Single place that knows how to actually hard-delete each recordType --
-// shared by clpepPurgeRecord() (one record, explicit admin action) and
-// clpepPurgeExpired() (bulk, automatic 30-day retention purge) so there's
-// never a second, drifting copy of this dispatch.
+// Permanently deletes a recycle-bin record by type.
 function clpepHardDeleteByType($type, $id) {
     if ($type === 'clpepApplicant') {
         clpepHardDeleteApplicant($id);
@@ -961,6 +956,7 @@ function clpepHardDeleteByType($type, $id) {
     }
 }
 
+// Permanently deletes a recycle-bin record.
 function clpepPurgeRecord() {
     [$type, $id] = clpepRecycleTarget();
     [$table, $pk] = clpepRecycleMap()[$type];
@@ -975,11 +971,7 @@ function clpepPurgeRecord() {
     json(['status' => 'ok', 'message' => 'Record permanently deleted.']);
 }
 
-// Auto-purges anything past the recycle bin's retention window (see
-// RECYCLE_BIN_RETENTION_DAYS in core/helpers.php). Called from
-// clpepListDeleted() so simply viewing the recycle bin enforces the "N days
-// left" countdown the UI already shows -- that display was cosmetic only
-// until this existed.
+// Sweeps the recycle bin for rows past RECYCLE_BIN_RETENTION_DAYS; called by clpepListDeleted().
 function clpepPurgeExpired() {
     $uid = currentUserId();
 
@@ -1017,10 +1009,7 @@ function clpepPurgeExpired() {
     }
 }
 
-// Permanently remove a CLPEP intervention and its uploaded files. Only
-// reachable for an already soft-deleted intervention, which
-// clpepDeleteIntervention's in-use guard already guaranteed has zero linked
-// beneficiaries.
+// Permanently deletes a CLPEP intervention and its uploaded files.
 function clpepHardDeleteIntervention($id) {
     $docs = db()->prepare("SELECT file_path FROM attached_documents WHERE clpep_intervention_id=:id");
     $docs->execute([':id' => $id]);
@@ -1031,6 +1020,7 @@ function clpepHardDeleteIntervention($id) {
     db()->prepare("DELETE FROM clpep_interventions WHERE intervention_id=:id")->execute([':id' => $id]);
 }
 
+// Permanently deletes a CLPEP applicant and all related data.
 function clpepHardDeleteApplicant($bid) {
     $pdo = db();
     try {

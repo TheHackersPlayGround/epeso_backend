@@ -5,6 +5,7 @@ include_once __DIR__ . '/../core/helpers.php';
 include_once __DIR__ . '/../core/guard.php';
 include_once __DIR__ . '/../core/activity_log.php';
 
+// Routes a CDSP action to its handler function.
 function handle($action, $id, $method)
 {
     switch ($action) {
@@ -34,15 +35,19 @@ function handle($action, $id, $method)
 
 // ─── Helpers ─────────────────────────────────────────────────────────────────
 
+// Trims a string, converting empty/blank to null.
 function cdspNullStr($v) {
     $s = is_string($v) ? trim($v) : $v;
     return ($s === '' || $s === null) ? null : $s;
 }
+// Validates and returns a YYYY-MM-DD date string, or null.
 function cdspDate($v) {
     $s = is_string($v) ? trim($v) : '';
     return preg_match('/^\d{4}-\d{2}-\d{2}$/', $s) ? $s : null;
 }
+// Converts a numeric value to int, or null.
 function cdspIntOrNull($v) { return is_numeric($v) ? (int)$v : null; }
+// Validates and returns a 4-digit year, or null.
 function cdspYearOrNull($v) {
     if (!is_numeric($v)) return null;
     $y = (int)$v;
@@ -69,12 +74,7 @@ function cdspMapEducation($v) {
     return isset($map[$v]) ? $map[$v] : null;
 }
 
-// Inverse of cdspMapEducation() — the DB stores educational_attainment_enum
-// values, but the frontend's dropdown/conditional-field logic (eduFieldFlags
-// in CDSPProfileForm.tsx) is keyed on the original form labels. "Master's
-// Degree" and "Doctorate Degree" each collapse two form labels (Level vs
-// Graduate) into one enum value, so $hasYearGraduated disambiguates on read,
-// mirroring gipReverseMapEducation() in gip.php.
+// Converts the stored education enum back to the frontend's form label.
 function cdspReverseMapEducation($enumValue, $hasYearGraduated) {
     $map = [
         'Elementary Level'                 => 'Elementary Level',
@@ -102,12 +102,14 @@ function cdspNormalizeClassification($c) {
     return isset($map[$c]) ? $map[$c] : $c;
 }
 
+// Returns the valid classification values.
 function cdspValidClassifications() {
     return ['Student','Fresh Graduate',
             'Out of School Youth','Person with Disability','Solo Parent',
             'Women','Senior Citizen','Returning OFW','Other','Indigenous People'];
 }
 
+// Returns the CDSP parent service_id (cached).
 function cdspParentServiceId() {
     static $sid = null;
     if ($sid !== null) return $sid;
@@ -117,6 +119,7 @@ function cdspParentServiceId() {
     return (int)$sid;
 }
 
+// Returns a CDSP sub-service's service_id by name.
 function cdspServiceIdByName($name) {
     $s = db()->prepare("SELECT service_id FROM services WHERE service_name=:n AND parent_service_id=:p LIMIT 1");
     $s->execute([':n' => $name, ':p' => cdspParentServiceId()]);
@@ -124,11 +127,13 @@ function cdspServiceIdByName($name) {
     return $id !== false ? (int)$id : null;
 }
 
+// Returns the base URL for serving uploaded files.
 function cdspUploadBaseUrl() {
     $host = $_SERVER['HTTP_HOST'] ?? 'localhost';
     return 'http://' . $host . '/epeso_backend/';
 }
 
+// Formats a byte count as a human-readable size.
 function cdspFormatBytes($bytes) {
     $bytes = (int) $bytes;
     if ($bytes <= 0) return '0 Bytes';
@@ -138,12 +143,8 @@ function cdspFormatBytes($bytes) {
 }
 
 // ─── Documents (applicant) ────────────────────────────────────────────────────
-//   - attachedDocuments entries WITH a base64 dataUrl  → new uploads (saved to disk + inserted)
-//   - entries WITHOUT a dataUrl (existing files)        → kept by their document_id
-//   - existing docs no longer in the list                → deleted (file unlinked)
-// Mirrors gipSyncDocuments/spesSyncDocuments — the frontend's CDSPApplicant
-// type calls this field "attachedDocuments", not "savedDocuments".
 
+// Saves attachment uploads for a CDSP applicant.
 function cdspSyncDocuments($pdo, $bid, $bsId, $uid, $d) {
     $docs = is_array($d['attachedDocuments'] ?? null) ? $d['attachedDocuments'] : [];
 
@@ -191,6 +192,7 @@ function cdspSyncDocuments($pdo, $bid, $bsId, $uid, $d) {
     }
 }
 
+// Returns an applicant's saved attachments.
 function cdspFetchSavedDocuments($bid) {
     $s = db()->prepare(
         "SELECT document_id, document_type, title, file_name, file_path, file_size
@@ -211,6 +213,7 @@ function cdspFetchSavedDocuments($bid) {
 
 // ─── Sub-services ─────────────────────────────────────────────────────────────
 
+// Returns the list of CDSP sub-services.
 function cdspListServices() {
     $s = db()->prepare("SELECT service_id,service_code,service_name FROM services WHERE parent_service_id=:p AND is_active=true ORDER BY service_id");
     $s->execute([':p' => cdspParentServiceId()]);
@@ -226,17 +229,8 @@ function cdspListServices() {
 // ─── Activities ───────────────────────────────────────────────────────────────
 
 // ─── Stored profile status (kept in step with the derived display status) ─────
-// The status a person SHOWS is derived from their activity assignments (see
-// cdspBuildProfile): Active while any assigned activity is Planned/Ongoing,
-// Inactive with none or once all are Completed. cdsp_profiles.status mirrors
-// that rule so SQL, exports and external tools can read it directly. The
-// derived value stays the source of truth for the screens -- if a code path
-// ever forgets to call these, the mirror is stale but the display is not.
-//
-// Call after ANYTHING that changes assignments or an activity's status:
-// add/remove participant, update activity, update activity status, and
-// profile creation. (Deleting an activity is blocked while it has
-// participants, so delete/restore of an activity never changes anyone.)
+
+// Updates cdsp_profiles.status to match the derived rule for matching rows.
 function cdspSyncProfileStatusWhere($where, $params) {
     db()->prepare(
         "UPDATE cdsp_profiles cp SET status = s.new_status, updated_at = now()
@@ -256,12 +250,12 @@ function cdspSyncProfileStatusWhere($where, $params) {
     )->execute($params);
 }
 
-// One person (identified by their CDSP beneficiary_service_id).
+// Updates one person's stored CDSP status.
 function cdspSyncProfileStatus($bsId) {
     cdspSyncProfileStatusWhere('p.beneficiary_service_id = :bs', [':bs' => (int) $bsId]);
 }
 
-// Everyone assigned to one activity (its status or details just changed).
+// Updates the stored status for everyone assigned to an activity.
 function cdspSyncActivityParticipantsStatus($activityId) {
     cdspSyncProfileStatusWhere(
         'p.beneficiary_service_id IN (SELECT beneficiary_service_id FROM cdsp_activity_participants WHERE activity_id = :a)',
@@ -269,6 +263,7 @@ function cdspSyncActivityParticipantsStatus($activityId) {
     );
 }
 
+// Returns the list of CDSP activities.
 function cdspListActivities() {
     $s = db()->prepare(
         "SELECT ca.activity_id, ca.service_id, sv.service_name,
@@ -285,6 +280,7 @@ function cdspListActivities() {
     json(['status' => 'ok', 'data' => array_map('cdspFormatActivity', $s->fetchAll())]);
 }
 
+// Formats a CDSP activity row for the frontend.
 function cdspFormatActivity($r) {
     return [
         'id'              => (int)$r['activity_id'],
@@ -303,6 +299,7 @@ function cdspFormatActivity($r) {
     ];
 }
 
+// Returns a single CDSP activity by id.
 function cdspGetActivityById($id) {
     $s = db()->prepare(
         "SELECT ca.activity_id, ca.service_id, sv.service_name,
@@ -319,10 +316,7 @@ function cdspGetActivityById($id) {
     return $r ? cdspFormatActivity($r) : null;
 }
 
-// The same session can run again on another day or in another place, but not twice in the
-// same place on the same day: block an activity whose service, title (ignoring case and
-// spacing), date and location all match an existing one. Deleted activities (Recycle Bin)
-// don't count. An activity with no location counts as one place too.
+// Errors if a matching activity already exists.
 function cdspAssertNoDuplicateActivity($serviceId, $title, $date, $location, $excludeId = null) {
     $loc = cdspNullStr($location ?? '');
     $s = db()->prepare(
@@ -339,6 +333,7 @@ function cdspAssertNoDuplicateActivity($serviceId, $title, $date, $location, $ex
     if ($s->fetchColumn()) error('An activity with this title, date and location already exists.', 409);
 }
 
+// Creates a new CDSP activity.
 function cdspCreateActivity() {
     $d = body();
     if (cdspNullStr($d['title'] ?? '') === null) error('Activity title is required.', 422);
@@ -362,6 +357,7 @@ function cdspCreateActivity() {
     json(['status' => 'ok', 'message' => 'Activity created.', 'data' => cdspGetActivityById((int)$s->fetchColumn())]);
 }
 
+// Updates a CDSP activity.
 function cdspUpdateActivity($id) {
     if (!is_numeric($id)) error('Invalid activity id.', 422);
     $d = body();
@@ -390,6 +386,7 @@ function cdspUpdateActivity($id) {
     json(['status' => 'ok', 'message' => 'Activity updated.', 'data' => cdspGetActivityById((int)$id)]);
 }
 
+// Updates a CDSP activity's status.
 function cdspUpdateActivityStatus($id) {
     if (!is_numeric($id)) error('Invalid activity id.', 422);
     $d = body();
@@ -411,14 +408,13 @@ function cdspUpdateActivityStatus($id) {
     json(['status' => 'ok', 'message' => 'Status updated.']);
 }
 
+// Deletes a CDSP activity.
 function cdspDeleteActivity($id) {
     if (!is_numeric($id)) error('Invalid activity id.', 422);
     $id = (int)$id;
 
-    // Blocks deletion regardless of status (Planned/Ongoing/Completed) - a
-    // Completed activity's participant rows are real historical attendance
-    // records, not just in-progress state, so they deserve the same
-    // protection as an active one. Mirrors cdspDeleteProfile's lock spirit.
+    // Blocks deletion regardless of status - Completed activities still have
+    // real historical attendance rows that need the same protection.
     $chk = db()->prepare("SELECT COUNT(*) FROM cdsp_activity_participants WHERE activity_id = :id");
     $chk->execute([':id' => $id]);
     if ((int)$chk->fetchColumn() > 0) {
@@ -437,9 +433,7 @@ function cdspDeleteActivity($id) {
 
 // ─── Participants ─────────────────────────────────────────────────────────────
 
-// Each participant's status is DERIVED, the same rule the CDSP profile list uses (see
-// cdspBuildProfile): Active while they are in any activity that is not Completed, Inactive
-// otherwise. (beneficiary_services.status is never updated after enrolment, so it is not read.)
+// Returns the participants assigned to a CDSP activity.
 function cdspListActivityParticipants($activityId) {
     if (!is_numeric($activityId)) error('Invalid activity id.', 422);
     $s = db()->prepare(
@@ -473,6 +467,7 @@ function cdspListActivityParticipants($activityId) {
     json(['status' => 'ok', 'data' => $out]);
 }
 
+// Assigns an applicant to a CDSP activity.
 function cdspAddParticipant() {
     $d = body();
     $actId = cdspIntOrNull($d['activityId'] ?? '');
@@ -518,6 +513,7 @@ function cdspAddParticipant() {
     json(['status' => 'ok', 'message' => 'Participant added.']);
 }
 
+// Unassigns an applicant from a CDSP activity.
 function cdspRemoveParticipant() {
     $d = body();
     $actId = cdspIntOrNull($d['activityId'] ?? '');
@@ -539,6 +535,7 @@ function cdspRemoveParticipant() {
     json(['status' => 'ok', 'message' => 'Participant removed.']);
 }
 
+// Records a participant's attendance for a CDSP activity.
 function cdspUpdateAttendance() {
     $d      = body();
     $actId  = cdspIntOrNull($d['activityId'] ?? '');
@@ -550,24 +547,8 @@ function cdspUpdateAttendance() {
     json(['status' => 'ok', 'message' => 'Attendance updated.']);
 }
 
-// Aging: for every beneficiary who has genuinely finished at least one CDSP
-// activity (status Completed AND attended -- same rule used everywhere else
-// in this file), how long since their most recent completion, and whether a
-// job placement has been recorded since. Unlike Skills Training, CDSP has
-// sub-services (Career Coaching / Pre-Employment Coaching / Labor Employment
-// for Graduating Students), so each row also carries which one the
-// beneficiary is enrolled under, for the report's by-sub-service breakdown.
-// One row per beneficiary_service_id, using LATERAL joins (not a plain
-// JOIN+DISTINCT ON) so picking "their latest completed activity" and "their
-// latest job placement" independently can't cross-multiply into duplicate/
-// mismatched rows when someone has more than one of either.
+// Returns the Aging Report: time since last completed activity and placement status.
 function cdspAgingReport() {
-    // sub_service is resolved from lc.service_id (the sub-service of the
-    // activity actually shown as "last completed"), NOT from the
-    // beneficiary's current beneficiary_services.service_id -- those can
-    // disagree once someone has completed activities under one sub-service
-    // and later been (re)enrolled under another, and showing mismatched
-    // sub-service/activity pairs would be misleading.
     $s = db()->prepare(
         "SELECT bs.beneficiary_service_id, b.last_name, b.first_name, b.middle_name, b.sex,
                 svc.service_name AS sub_service,
@@ -621,6 +602,7 @@ function cdspAgingReport() {
 
 // ─── Profiles ─────────────────────────────────────────────────────────────────
 
+// Returns the list of CDSP profiles.
 function cdspListProfiles() {
     $s = db()->prepare(
         "SELECT DISTINCT b.beneficiary_id
@@ -640,6 +622,7 @@ function cdspListProfiles() {
     json(['status' => 'ok', 'data' => $out]);
 }
 
+// Returns a single CDSP profile.
 function cdspGetProfile($id) {
     if (!is_numeric($id)) error('Invalid id.', 422);
     $p = cdspBuildProfile((int)$id);
@@ -647,6 +630,7 @@ function cdspGetProfile($id) {
     json(['status' => 'ok', 'data' => $p]);
 }
 
+// Builds the full CDSP profile for display.
 function cdspBuildProfile($bid) {
     $s = db()->prepare(
         "SELECT b.*, bgy.barangay_name, c.city_name, p.province_name, r.region_name,
@@ -708,10 +692,8 @@ function cdspBuildProfile($bid) {
     }
     if (!$currentAct && !empty($participants)) $currentAct = end($participants);
 
-    // An activity marked Completed only counts as completed for beneficiaries who
-    // actually attended -- someone marked absent (or never marked) should not be
-    // eligible for Record Job Placement or completion-based reporting. Mirrors
-    // the identical rule in skills_training.php's stBuildProfile.
+    // A Completed activity only counts for beneficiaries who actually attended
+    // (same rule as skills_training.php's stBuildProfile).
     $currentActStatus = null;
     if ($currentAct) {
         $currentActStatus = ($currentAct['activity_status'] === 'Completed' && !(bool)$currentAct['attended'])
@@ -744,12 +726,8 @@ function cdspBuildProfile($bid) {
     if (!empty($b['birth_date'])) {
         $age = (new DateTime($b['birth_date']))->diff(new DateTime('today'))->y;
     }
-    // Status is DERIVED from the current assignment rather than read from the stored
-    // column (cdsp_profiles.status mirrors this rule -- see cdspSyncProfileStatusWhere --
-    // and beneficiary_services.status is not used at all): Active while the person's
-    // current activity is Planned/Ongoing, Inactive with no assignment or once that
-    // activity is Completed. Same rule as DILP/TUPAD/SLP/CLPEP, so the page, reports
-    // and exports all agree.
+    // Status is DERIVED from the current assignment, not read from the stored column:
+    // Active while Planned/Ongoing, Inactive with no assignment or once Completed.
     $frontendStatus = ($currentAct && $currentAct['activity_status'] !== 'Completed') ? 'Active' : 'Inactive';
 
     return [
@@ -797,13 +775,7 @@ function cdspBuildProfile($bid) {
     ];
 }
 
-// Required-field + enum validation, shared by the single-record create and
-// the bulk import. Returns an error string, or '' if valid.
-//
-// Birthdate, Civil Status, and Barangay are required by the underlying
-// beneficiaries table (NOT NULL columns) — validated here so a bad request
-// 422s cleanly instead of failing as a raw DB constraint violation
-// (birth_date/civil_status/barangay_id are all NOT NULL).
+// Validates CDSP profile input, returning an error string or ''.
 function cdspValidateProfile($d) {
     if (cdspNullStr($d['firstName'] ?? '') === null) return 'First name is required.';
     if (cdspNullStr($d['lastName'] ?? '')  === null) return 'Last name is required.';
@@ -823,8 +795,7 @@ function cdspValidateProfile($d) {
     return '';
 }
 
-// Insert one profile's full beneficiary spine. Shared by the single-record
-// create and the bulk import so the write logic only lives in one place.
+// Inserts one profile's full beneficiary spine.
 function cdspInsertProfileRow($pdo, $uid, $d) {
     $serviceId = cdspServiceIdByName($d['serviceAvailed']);
     $sex       = $d['sex'];
@@ -860,6 +831,7 @@ function cdspInsertProfileRow($pdo, $uid, $d) {
     return $bid;
 }
 
+// Creates a new CDSP profile.
 function cdspCreateProfile() {
     $uid = requireLogin();
     $d   = body();
@@ -879,11 +851,7 @@ function cdspCreateProfile() {
     json(['status'=>'ok','message'=>'Profile saved.','data'=>cdspBuildProfile($bid)]);
 }
 
-// POST /api/cdsp/importProfilesBulk   body = { rows: object[] }
-//
-// All-or-nothing bulk import: every row is validated up front, then the
-// whole batch is written inside ONE transaction. If any row fails validation
-// or the insert throws partway through, everything is rolled back.
+// Bulk-imports CDSP profiles.
 function cdspImportProfilesBulk() {
     $uid  = requireLogin();
     $body = body();
@@ -920,6 +888,7 @@ function cdspImportProfilesBulk() {
     json(['status' => 'ok', 'message' => 'Profiles saved.', 'data' => ['ids' => $ids, 'count' => count($ids)]]);
 }
 
+// Updates a CDSP profile.
 function cdspUpdateProfile($id) {
     if (!is_numeric($id)) error('Invalid id.', 422);
     $uid = requireLogin();
@@ -1024,6 +993,7 @@ function cdspUpdateProfile($id) {
     json(['status'=>'ok','message'=>'Profile updated.','data'=>cdspBuildProfile($bid)]);
 }
 
+// Soft-deletes a CDSP applicant.
 function cdspDeleteProfile($id) {
     if (!is_numeric($id)) error('Invalid id.', 422);
     $bid = (int) $id;
@@ -1053,12 +1023,10 @@ function cdspDeleteProfile($id) {
 }
 
 // ═══════════════════════════════════════════════════════════════════════════════
-// RECYCLE BIN  (soft-deleted CDSP applicants) — mirrors employment.php/gip.php's
-// pattern so these records surface in the same Security > Activity Logs >
-// Recycle Bin screen alongside EF's and GIP's records.
+// RECYCLE BIN  (soft-deleted CDSP applicants)
 // ═══════════════════════════════════════════════════════════════════════════════
 
-// recordType -> [table, primary-key column].
+// Maps each recycle-bin record type to its table and primary key.
 function cdspRecycleMap() {
     return [
         'cdspApplicant' => ['beneficiaries', 'beneficiary_id'],
@@ -1066,7 +1034,7 @@ function cdspRecycleMap() {
     ];
 }
 
-// Read + validate { recordType, id } from the request body. Returns [type, id].
+// Reads and validates {recordType, id} from the request body.
 function cdspRecycleTarget() {
     $d    = body();
     $type = $d['recordType'] ?? '';
@@ -1076,9 +1044,7 @@ function cdspRecycleTarget() {
     return [$type, $id];
 }
 
-// A human-readable name for an activity log line -- "#9" means nothing to
-// whoever reads it later; the applicant's actual name (or activity title)
-// does. Must be looked up BEFORE the record is hard-deleted.
+// Returns a recycle-bin record's display name.
 function cdspRecordName($type, $id) {
     if ($type === 'cdspApplicant') {
         $s = db()->prepare(
@@ -1094,7 +1060,7 @@ function cdspRecordName($type, $id) {
     return $name !== false ? $name : "#{$id}";
 }
 
-// GET /api/cdsp/listDeleted
+// Returns the recycle bin contents for applicants and activities.
 function cdspListDeleted() {
     cdspPurgeExpired();
     $pid = cdspParentServiceId();
@@ -1145,7 +1111,7 @@ function cdspListDeleted() {
     json(['status' => 'ok', 'data' => $items]);
 }
 
-// POST /api/cdsp/restoreRecord  { recordType, id }  — undo a soft delete.
+// Restores a record from the recycle bin.
 function cdspRestoreRecord() {
     [$type, $id] = cdspRecycleTarget();
     [$table, $pk] = cdspRecycleMap()[$type];
@@ -1159,10 +1125,7 @@ function cdspRestoreRecord() {
     json(['status' => 'ok', 'message' => 'Record restored.']);
 }
 
-// Single place that knows how to actually hard-delete each recordType --
-// shared by cdspPurgeRecord() (one record, explicit admin action) and
-// cdspPurgeExpired() (bulk, automatic 30-day retention purge) so there's
-// never a second, drifting copy of this dispatch.
+// Permanently deletes a recycle-bin record by type.
 function cdspHardDeleteByType($type, $id, $table, $pk) {
     if ($type === 'cdspApplicant') {
         cdspHardDeleteApplicant($id);
@@ -1174,8 +1137,7 @@ function cdspHardDeleteByType($type, $id, $table, $pk) {
     }
 }
 
-// POST /api/cdsp/purgeRecord  { recordType, id }  — permanent delete.
-// Only acts on records already in the recycle bin (deleted_at IS NOT NULL).
+// Permanently deletes a recycle-bin record.
 function cdspPurgeRecord() {
     [$type, $id] = cdspRecycleTarget();
     [$table, $pk] = cdspRecycleMap()[$type];
@@ -1190,11 +1152,7 @@ function cdspPurgeRecord() {
     json(['status' => 'ok', 'message' => 'Record permanently deleted.']);
 }
 
-// Auto-purges anything past the recycle bin's retention window (see
-// RECYCLE_BIN_RETENTION_DAYS in core/helpers.php). Called from
-// cdspListDeleted() so simply viewing the recycle bin enforces the "N days
-// left" countdown the UI already shows -- that display was cosmetic only
-// until this existed.
+// Purges CDSP recycle bin rows past RECYCLE_BIN_RETENTION_DAYS.
 function cdspPurgeExpired() {
     $uid = currentUserId();
 
@@ -1236,10 +1194,7 @@ function cdspPurgeExpired() {
     }
 }
 
-// Permanently remove a CDSP applicant and its CDSP-specific data (profile row,
-// activity participations, classifications, service enrollment). Used by the
-// recycle bin's permanent-delete action; not reachable except for an
-// already soft-deleted row. Mirrors employmentHardDeleteApplicant/gipHardDeleteApplicant.
+// Permanently deletes a CDSP applicant and all related data.
 function cdspHardDeleteApplicant($bid) {
     $pdo = db();
     try {

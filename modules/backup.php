@@ -14,6 +14,7 @@ include_once __DIR__ . '/../core/helpers.php';
 include_once __DIR__ . '/../core/guard.php';
 include_once __DIR__ . '/../core/activity_log.php';
 
+// Routes a backup action to its handler function.
 function handle($action, $id, $method)
 {
     switch ($action) {
@@ -28,32 +29,26 @@ function handle($action, $id, $method)
     }
 }
 
-// Never web-accessible directly (backups/.htaccess denies all) — unlike
-// uploads/, which is deliberately public for Documents Tab previews.
+// Returns the backups/ directory path.
 function backupDir()
 {
     return __DIR__ . '/../backups/';
 }
 
-// A restore runs as a single blocking request (it may take a while for a
-// large database), so there's no in-band way for that same response to also
-// stream out progress. Instead it writes its current step to this file as it
-// goes, and the frontend polls restoreProgress() (a separate, fast request)
-// on an interval while the restore request is in flight to show a real
-// progress bar rather than a fake time-based animation. Single-admin tool --
-// one fixed filename is fine, no need to key it per-restore.
+// Returns the path to the restore-progress tracking file.
 function backupProgressPath()
 {
     return backupDir() . '.restore_progress.json';
 }
 
+// Writes the current restore progress to disk.
 function backupWriteProgress($step, $total, $label, $done = false, $error = null)
 {
     $payload = ['step' => $step, 'total' => $total, 'label' => $label, 'done' => $done, 'error' => $error];
     @file_put_contents(backupProgressPath(), json_encode($payload));
 }
 
-// GET /api/backup/restoreProgress -- polled by the frontend during a restore.
+// Returns the current restore progress.
 function backupRestoreProgress()
 {
     $path = backupProgressPath();
@@ -69,33 +64,20 @@ function backupRestoreProgress()
     json(['status' => 'ok', 'data' => $data]);
 }
 
-// Not on PATH, so pg_dump must be invoked by full path — differs per
-// machine/PostgreSQL version, so it's a config.php setting rather than
-// hardcoded here (see config.php's pg_dump_path).
+// Returns the configured pg_dump executable path.
 function backupPgDumpPath()
 {
     $config = include __DIR__ . '/../config.php';
     return $config['pg_dump_path'] ?? '';
 }
 
-// psql.exe always ships next to pg_dump.exe in the same PostgreSQL bin/
-// folder, so it's derived from pg_dump_path rather than needing its own
-// config.php entry.
+// Returns the psql executable path.
 function backupPsqlPath()
 {
     return dirname(backupPgDumpPath()) . '/psql.exe';
 }
 
-// Runs a pg_dump/psql command with stdout+stderr redirected straight to
-// temp files instead of pipes. A DROP SCHEMA CASCADE over a non-trivial
-// schema makes Postgres emit a NOTICE per cascaded object on stderr while
-// stdout stays silent until the whole statement finishes -- reading one
-// pipe to completion before the other (or even draining both with
-// stream_select()) can deadlock: PHP's stream_select() does not reliably
-// work on proc_open pipes on Windows, so the child blocks writing to a full
-// pipe nobody is actually draining, and the parent blocks waiting on the
-// other one forever. Files have no such buffer limit, so this sidesteps
-// the whole class of bug rather than trying to read pipes correctly.
+// Runs a shell command and returns [exitCode, stderr].
 function backupRunCommand($cmd)
 {
     $outFile = tempnam(sys_get_temp_dir(), 'peso_out_');
@@ -114,6 +96,7 @@ function backupRunCommand($cmd)
     return [$exitCode, $stderr];
 }
 
+// Formats a byte count as a human-readable size.
 function backupFormatBytes($bytes)
 {
     $bytes = (int) $bytes;
@@ -123,29 +106,13 @@ function backupFormatBytes($bytes)
     return round($bytes / pow(1024, $i), 2) . ' ' . $units[$i];
 }
 
-// Only accepts names of the exact shape this module itself generates —
-// blocks path traversal (e.g. "../../config.php") on the download/delete
-// actions, which take a filename straight from the URL. .sql covers backups
-// created before uploads/ was bundled in; new backups are always .zip. The
-// optional _N suffix is for backupUniqueName()'s collision disambiguation
-// (see its comment for why that's needed at all). The second alternative,
-// PESO_DB_Backup_pre_<label>, covers hand-made safety snapshots taken before
-// a migration: backupList() shows them (same PESO_DB_Backup_* prefix), so
-// they must also be deletable/downloadable/restorable, or they'd sit in the
-// list rejecting every action. Its charset is letters/digits/underscore
-// only, so it can't carry a path separator or dots either.
+// Validates a backup filename against the expected naming pattern.
 function backupValidName($name)
 {
     return is_string($name) && preg_match('/^PESO_DB_Backup_(?:(?:before_restore_)?\d{4}-\d{2}-\d{2}_\d{6}(?:_\d+)?|pre_[A-Za-z0-9_]+)\.(sql|zip)$/', $name);
 }
 
-// The created-at shown here is parsed straight out of the filename (which
-// encodes it) rather than the file's filesystem mtime — mtime reflects
-// whatever timezone the PHP process's clock is in (this server's php.ini
-// has date.timezone misconfigured to Europe/Berlin, 6 hours off from the
-// app's actual local time), whereas the filename itself is built from
-// Postgres's now() at creation time, same source every other timestamp in
-// this app already uses.
+// Parses the created-at timestamp out of a backup filename.
 function backupCreatedAt($filename)
 {
     if (preg_match('/^PESO_DB_Backup_(?:before_restore_)?(\d{4}-\d{2}-\d{2})_(\d{2})(\d{2})(\d{2})(?:_\d+)?\.(?:sql|zip)$/', $filename, $m)) {
@@ -160,15 +127,7 @@ function backupCreatedAt($filename)
     return '';
 }
 
-// Two backups created within the same request (e.g. an uploaded file saved
-// under a fresh timestamp, immediately followed by that same restore's own
-// automatic safety snapshot) can land on the identical second-resolution
-// timestamp and therefore the identical filename. backupCreateSnapshot()
-// used ZipArchive::OVERWRITE, which silently clobbered a just-uploaded
-// backup before it was ever read from -- the "restore" ended up reloading
-// the safety snapshot (i.e. current data) instead of the intended backup,
-// with no error to show for it. This guarantees a name that doesn't already
-// exist on disk, appending _2, _3, ... only in that rare collision case.
+// Generates a unique backup filename for a given timestamp.
 function backupUniqueName($ts, $ext, $safety = false)
 {
     // $ts is 'YYYY-MM-DD_HHMMSS'. Automatic safety backups taken before a
@@ -186,6 +145,7 @@ function backupUniqueName($ts, $ext, $safety = false)
     return $name;
 }
 
+// Returns the list of available backup files.
 function backupList()
 {
     $files = array_merge(
@@ -204,8 +164,7 @@ function backupList()
     json(['status' => 'ok', 'data' => $items]);
 }
 
-// Recursively adds every file under $dir into $zip beneath $zipPrefix,
-// preserving the relative folder structure (documents/, gip photos, etc.).
+// Adds a directory's files into a zip archive.
 function backupAddDirToZip(ZipArchive $zip, $dir, $zipPrefix)
 {
     if (!is_dir($dir)) return;
@@ -223,10 +182,7 @@ function backupAddDirToZip(ZipArchive $zip, $dir, $zipPrefix)
     }
 }
 
-// Core snapshot logic shared by backupCreate() (the user-facing button) and
-// backupRestore() (which takes one of these automatically right before
-// overwriting live data, so a bad restore always has a way back). Returns
-// [filename, formattedSize] or throws via error() on failure.
+// Creates a full database + uploads backup and returns [filename, size].
 function backupCreateSnapshot($safety = false)
 {
     $config = include __DIR__ . '/../config.php';
@@ -290,6 +246,7 @@ function backupCreateSnapshot($safety = false)
     return [$zipName, backupFormatBytes(filesize($zipPath))];
 }
 
+// Creates a backup and logs the action.
 function backupCreate()
 {
     [$zipName, $size] = backupCreateSnapshot();
@@ -297,6 +254,7 @@ function backupCreate()
     json(['status' => 'ok', 'message' => 'Backup created.', 'data' => ['name' => $zipName, 'size' => $size]]);
 }
 
+// Streams a backup file to the browser for download.
 function backupDownload($name)
 {
     $name = basename((string) $name);
@@ -314,6 +272,7 @@ function backupDownload($name)
     exit;
 }
 
+// Deletes a backup file.
 function backupDelete($name)
 {
     $name = basename((string) $name);
@@ -326,13 +285,7 @@ function backupDelete($name)
     json(['status' => 'ok', 'message' => 'Backup deleted.']);
 }
 
-// Accepts a .zip uploaded from outside the system (e.g. the admin only
-// has a copy on a USB drive/cloud folder because the on-server copy was
-// deleted) and restores from it. The upload is restored straight from PHP's
-// temporary upload file (which PHP discards when the request ends) rather
-// than being copied into backups/, so it doesn't pile up in Backup History
-// -- the admin still has their own copy, and the automatic safety backup
-// taken first is what protects the current data.
+// Restores the database from an uploaded backup file.
 function backupRestoreUpload()
 {
     if (empty($_FILES['backupFile']) || $_FILES['backupFile']['error'] !== UPLOAD_ERR_OK) {
@@ -360,9 +313,7 @@ function backupRestoreUpload()
     return backupRunRestore($tmpPath, true, "uploaded backup file: \"{$label}\"");
 }
 
-// Deletes every file/folder inside $dir, keeping $dir itself. Used to wipe
-// uploads/ clean before restoring a backup's own uploads/ over it, so stray
-// files from after the backup don't linger mixed in with restored ones.
+// Deletes everything inside a directory, keeping the directory itself.
 function backupClearDirContents($dir)
 {
     if (!is_dir($dir)) return;
@@ -394,8 +345,7 @@ function backupCopyDirRecursive($src, $dst)
     }
 }
 
-// Runs a psql command (either a literal SQL string via -c, or a .sql file
-// via -f) against the live database. Returns [exitCode, stderr].
+// Runs a psql command against the live database and returns [exitCode, stderr].
 function backupRunPsql($args)
 {
     $config = include __DIR__ . '/../config.php';
@@ -416,11 +366,7 @@ function backupRunPsql($args)
     return $result;
 }
 
-// Overwrites the live database + uploads/ with the contents of one backup.
-// Always takes a fresh safety snapshot first (see backupCreateSnapshot())
-// so a bad restore still has a way back -- if the restore itself fails
-// partway, the DB may be left in a broken state; that snapshot is the
-// recovery path in that case, not this function retrying anything.
+// Restores the database and uploads from a backup file.
 function backupRestore($name)
 {
     $name = basename((string) $name);
@@ -431,8 +377,7 @@ function backupRestore($name)
     return backupRunRestore($path, str_ends_with(strtolower($name), '.zip'), "backup: {$name}");
 }
 
-// $sourceLabel is only for the activity log ("backup: <name>" for a file in
-// Backup History, "uploaded backup file: "<name>"" for Upload & Recover).
+// Restores the live database and uploads from a backup path.
 function backupRunRestore($path, $isZip, $sourceLabel)
 {
     $psql = backupPsqlPath();

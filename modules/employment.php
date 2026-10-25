@@ -157,9 +157,7 @@ function efDateOrNull($v)
     return preg_match('/^\d{4}-\d{2}-\d{2}$/', $s) ? $s : null;
 }
 
-// height_cm must be a positive number (check constraint) or null. The form's
-// height field is free text, so accept a plain number ("165") or pull the first
-// numeric value out of input like "165 cm". Capped at the numeric(5,2) range.
+// Parses a height value into a positive numeric(5,2), or null.
 function efHeightCm($v)
 {
     if (is_numeric($v)) {
@@ -198,8 +196,7 @@ function efDeriveEducation($d)
     return null;
 }
 
-// referred_program_enum value, or null if the form sent nothing valid.
-// Form values match the enum 1:1 (SPES, GIP, DILEEP, TESDA Training, TUPAD, JobStart, Others).
+// Returns the referred_program_enum value, or null if invalid.
 function efReferredProgram($d)
 {
     $valid = ['SPES', 'GIP', 'DILEEP', 'TESDA Training', 'TUPAD', 'JobStart', 'Others'];
@@ -263,13 +260,7 @@ function employmentCreateApplicant()
     json(['status' => 'ok', 'message' => 'Applicant saved.', 'data' => ['id' => $beneficiaryId]]);
 }
 
-// POST /api/employment/importApplicantsBulk   body = { rows: ApplicantFormData[] }
-//
-// All-or-nothing bulk import: every row is validated up front, then the whole
-// batch is written inside ONE transaction. If any row fails validation or the
-// insert throws partway through, everything is rolled back and nothing is
-// saved — the caller (the Excel import flow) relies on this so a bad row in a
-// large file can never leave a partial set of applicants behind.
+// Bulk-imports EF applicants.
 function employmentImportApplicantsBulk()
 {
     $uid  = requireLogin();
@@ -475,8 +466,7 @@ function efEmploymentFields($d)
 
 // ─── Disabilities + 2x2 photo (separate tables) ──────────────────────────────
 
-// Insert disability rows. Standard checkbox values (Visual/Speech/Hearing/Physical)
-// are stored verbatim; the "Other" checkbox stores the free-text description.
+// Inserts an applicant's disability rows.
 function employmentInsertDisabilities($pdo, $bid, $d)
 {
     $list = is_array($d['hasDisability'] ?? null) ? $d['hasDisability'] : [];
@@ -504,8 +494,7 @@ function efUploadBaseUrl()
     return 'http://' . $host . '/epeso_backend/';
 }
 
-// Save the 2x2 photo (a base64 data URL) as a real file + a documents row.
-// The documents table is the universal store; the 2x2 photo is a document too.
+// Saves the applicant's 2x2 photo as a file and a documents row.
 function employmentSavePhoto($pdo, $bid, $bsId, $uid, $d)
 {
     $img = $d['profileImage'] ?? '';
@@ -553,8 +542,7 @@ function employmentDeletePhotos($pdo, $bid)
         ->execute([':bid' => $bid]);
 }
 
-// On update: a new base64 photo replaces the old one; an empty value clears it;
-// an existing http URL (unchanged) is left as-is.
+// Replaces or clears an applicant's 2x2 photo on update.
 function employmentUpdatePhoto($pdo, $bid, $bsId, $uid, $d)
 {
     $img = $d['profileImage'] ?? '';
@@ -566,7 +554,7 @@ function employmentUpdatePhoto($pdo, $bid, $bsId, $uid, $d)
     }
 }
 
-// Human-readable file size from a byte count (mirrors the form's formatFileSize).
+// Human-readable file size from a byte count.
 function efFormatBytes($bytes)
 {
     $bytes = (int) $bytes;
@@ -576,11 +564,7 @@ function efFormatBytes($bytes)
     return round($bytes / pow(1024, $i), 2) . ' ' . $units[$i];
 }
 
-// Sync non-photo attachments to the documents table (the universal file store).
-//   - savedDocuments entries WITH a base64 dataUrl  → new uploads (saved to disk + inserted)
-//   - entries WITHOUT a dataUrl (existing files)     → kept by their document_id
-//   - existing non-photo docs no longer in the list  → deleted (file unlinked)
-// The 2x2 ID Picture is excluded here; it is managed via profileImage / employmentSavePhoto.
+// Saves non-photo attachment uploads for an EF applicant.
 function employmentSyncDocuments($pdo, $bid, $bsId, $uid, $d)
 {
     $docs = is_array($d['savedDocuments'] ?? null) ? $d['savedDocuments'] : [];
@@ -856,10 +840,7 @@ function employmentListApplicants()
     json(['status' => 'ok', 'data' => $out]);
 }
 
-// GET /api/employment/getApplicantPhoto/{id}
-// Returns the applicant's 2x2 photo as a base64 data URL so the front end can
-// embed it directly (e.g. in the Resume Builder PDF) without cross-origin
-// canvas-tainting issues. Returns null when no photo is attached.
+// Returns an applicant's 2x2 photo as a base64 data URL, or null.
 function employmentGetApplicantPhoto($id)
 {
     if (!is_numeric($id)) {
@@ -1025,7 +1006,7 @@ function employmentBuildApplicant($bid)
         else { $selfEmploymentType = 'Others'; $selfEmploymentOther = $selfTypeRaw; }
     }
 
-    // ── fullFormData (mirrors ApplicantFormData; unmapped fields default empty) ──
+    // ── fullFormData (ApplicantFormData shape; unmapped fields default empty) ──
     $full = [
         'surname' => $b['last_name'], 'firstName' => $b['first_name'], 'middleName' => $b['middle_name'] ?? '', 'suffix' => $b['suffix'] ?? '',
         'dateOfBirth' => $b['birth_date'], 'sex' => $b['sex'], 'religion' => $ef['religion'] ?? '', 'civilStatus' => $b['civil_status'],
@@ -1129,12 +1110,7 @@ function employmentBuildApplicant($bid)
     ];
 }
 
-// Refer-action lock state for an applicant, keyed on beneficiary_service_id:
-//   'Hired'    -> has an active placement (status Active); cannot be referred.
-//   'Referred' -> has a live referral (status Pending or Interviewed); cannot be referred.
-//   'Refer'    -> free to be referred (no active placement, no live referral).
-// Releases back to 'Refer' happen naturally: a referral set to 'Not Hired', or a
-// placement set to Resigned/Terminated/Completed, no longer match the conditions.
+// Returns an applicant's refer-action lock state: Hired, Referred, or Refer.
 function efApplicantReferralState($bsId)
 {
     $pl = db()->prepare(
@@ -1154,6 +1130,7 @@ function efApplicantReferralState($bsId)
     return 'Refer';
 }
 
+// Runs a prepared query by beneficiary id and returns all rows.
 function employmentFetchAll($sql, $bid)
 {
     $stmt = db()->prepare($sql);
@@ -1237,10 +1214,7 @@ function employmentUpdateApplicant($id)
 
 // ─── Delete ─────────────────────────────────────────────────────────────────
 
-// POST /api/employment/deleteApplicant/{id}
-// Soft delete: the applicant is flagged (deleted_at/deleted_by) and disappears
-// from every list, but the beneficiary spine stays intact so it can be restored
-// from the recycle bin. Permanent removal happens via purgeRecord.
+// Soft-deletes an EF applicant.
 function employmentDeleteApplicant($id)
 {
     $uid = requireLogin();
@@ -1284,10 +1258,7 @@ function employmentDeleteApplicant($id)
     json(['status' => 'ok', 'message' => 'Applicant moved to recycle bin.']);
 }
 
-// Counts of placement/referral history for an EF applicant. Both tables'
-// beneficiary_service_id FK has no ON DELETE action (defaults to RESTRICT in
-// Postgres), so a purge would otherwise fail with a raw FK-violation error —
-// used to warn the user before permanently deleting that history too.
+// Counts an applicant's placement/referral history (used before a purge).
 function efApplicantHistoryCounts($bid)
 {
     $pdo = db();
@@ -1305,11 +1276,7 @@ function efApplicantHistoryCounts($bid)
     return ['placements' => (int) $pl->fetchColumn(), 'referrals' => (int) $rf->fetchColumn()];
 }
 
-// Permanently remove an applicant and the entire beneficiary spine (uploaded
-// files, resume sub-tables, service enrollment). Used by the recycle bin's
-// permanent-delete action; not reachable except for an already soft-deleted row.
-// Callers should confirm history counts via efApplicantHistoryCounts() first
-// (see efPurgeRecord) — this always cascades once it's actually called.
+// Permanently deletes an EF applicant and all related data.
 function employmentHardDeleteApplicant($bid)
 {
     $pdo = db();
@@ -1348,11 +1315,7 @@ function employmentHardDeleteApplicant($bid)
 
 // ─── Industry helpers (employers.industry is a plain text column) ────────────────────────────────────────────────────────
 
-// Tidy an industry name before it is saved, so spelling variants don't pile up:
-//  - trim and collapse repeated spaces;
-//  - if it matches a standard name ignoring case ("retail"), save the standard spelling;
-//  - else if an employer already has the same name ignoring case ("mining" vs "Mining"),
-//    reuse that spelling; otherwise keep it as typed.
+// Normalizes an industry name's spelling and casing before it is saved.
 function efNormalizeIndustry($name)
 {
     $name = is_string($name) ? trim(preg_replace('/\s+/u', ' ', $name)) : '';
@@ -1375,9 +1338,7 @@ function efResolveIndustryName($d)
     return efNormalizeIndustry($ind);
 }
 
-// GET /api/employment/listIndustries -- the choices for every industry dropdown and filter:
-// the standard names (the single list; the app has no other copy) plus any custom names that
-// employers currently use, so a custom industry such as "Mining" can be filtered on too.
+// Returns the standard and custom industry names for dropdowns and filters.
 function efListIndustries()
 {
     $standard = efStandardIndustries();
@@ -1404,9 +1365,7 @@ function efStandardIndustries()
             'Education', 'Construction', 'Hospitality', 'Transportation', 'Financial Services'];
 }
 
-// The standard spelling of an industry name when it matches a standard one ignoring case
-// ("agriculture" -> "Agriculture"), else null. Used when reading, so lists agree even for
-// names saved before names were tidied on save.
+// Returns the standard spelling of an industry name, or null if it isn't one.
 function efStandardIndustryMatch($name)
 {
     foreach (efStandardIndustries() as $std) {
@@ -1474,6 +1433,7 @@ function efListEmployers()
     json(['status' => 'ok', 'data' => $out]);
 }
 
+// Validates employer input, returning an error string or ''.
 function efValidateEmployer($d)
 {
     if (efNull($d['companyName']      ?? '') === null) return 'Company name is required.';
@@ -1492,6 +1452,7 @@ function efValidateEmployer($d)
     return '';
 }
 
+// Binds employer form fields onto a prepared insert/update statement.
 function efBindEmployer($stmt, $d, $extra = [])
 {
     $industryName = efResolveIndustryName($d);
@@ -1549,12 +1510,7 @@ function efCreateEmployer()
     json(['status' => 'ok', 'message' => 'Employer saved.', 'data' => ['id' => $id]]);
 }
 
-// POST /api/employment/importEmployersBulk   body = { rows: EmployerFormData[] }
-//
-// All-or-nothing bulk import, same pattern as importApplicantsBulk: every row
-// is validated up front, then the whole batch is written inside ONE
-// transaction. If any row fails validation or the insert throws partway
-// through, everything is rolled back and nothing is saved.
+// Bulk-imports employers.
 function efImportEmployersBulk()
 {
     $body = body();
@@ -1682,8 +1638,7 @@ function efJobType($jobType)
     return in_array($jobType, $valid, true) ? $jobType : 'Contract';
 }
 
-// Format numeric salary bounds into a display string, e.g. "₱35,000 - ₱40,000".
-// Returns '' when both bounds are null (callers fall back to any legacy text).
+// Formats numeric salary bounds into a display string, or '' if both are null.
 function efFormatSalary($min, $max)
 {
     $peso = function ($n) {
@@ -1704,12 +1659,7 @@ function efSalaryNum($v)
     return $clean === '' ? null : $clean + 0;
 }
 
-// Build the frontend Vacancy object from a DB row (with joined employer/industry
-// and an active_placements count). Availability is DERIVED, not stored:
-//   remaining        = slots_total - active placements  (never drifts; reopens
-//                      automatically when a placement ends)
-//   effective status = Closed when manually closed OR full; else Open
-// `manualStatus` is the officer's open/close intent (what the toggle flips).
+// Builds the frontend Vacancy object from a DB row.
 function efBuildVacancy($row)
 {
     $min = $row['salary_min'] ?? null;
@@ -1762,12 +1712,11 @@ function efListVacancies()
     json(['status' => 'ok', 'data' => $out]);
 }
 
+// Validates vacancy input, returning an error string or ''.
 function efValidateVacancy($d)
 {
     if (efNull($d['jobTitle'] ?? '') === null) return 'Job title is required.';
     if (!isset($d['employerId']) || !is_numeric($d['employerId'])) return 'Please select an employer.';
-    // Description and requirements are optional (the form does not mark them
-    // required); the NOT NULL columns are satisfied by an empty-string default.
     return '';
 }
 
@@ -1920,11 +1869,7 @@ function efBuildReferral($row)
     ];
 }
 
-// GET /api/employment/getApplicantHistory/{beneficiaryId}
-// One applicant's full referral history (ALL statuses) as a referral -> placement
-// timeline. Each referral carries its linked placement (via placement.referral_id)
-// when one exists, so the UI can render Referred -> [referral status] -> [placement
-// status]. Ordered oldest-first so newer attempts appear below older ones.
+// Returns an applicant's full referral-to-placement history, oldest first.
 function efGetApplicantHistory($id)
 {
     if (!is_numeric($id)) error('Invalid applicant id.', 422);
@@ -1978,16 +1923,7 @@ function efGetApplicantHistory($id)
     ]]);
 }
 
-// GET /api/employment/listReferrals — a working list of unresolved referral
-// attempts only. Excludes Hired referrals (those become placements), and also
-// excludes any OTHER referral (Pending/Interviewed/Not Hired) belonging to an
-// applicant who currently has an ACTIVE placement — once someone's actively
-// hired (through whichever referral got them there), every earlier attempt for
-// them is resolved history, not something still needing action. A past
-// placement that has since ended (Resigned/Terminated/Completed) does NOT
-// suppress a new referral — matches efApplicantReferralState()'s definition
-// of "Hired". The full referral->placement timeline, including resolved
-// entries, remains visible via getApplicantHistory.
+// Returns the working list of unresolved referral attempts.
 function efListReferrals()
 {
     $stmt = db()->prepare(
@@ -2015,10 +1951,7 @@ function efListReferrals()
     json(['status' => 'ok', 'data' => $out]);
 }
 
-// GET /api/employment/checkDuplicateReferral?applicantId=X&vacancyId=Y
-// Warn-guard for the referral flow: has this applicant already been referred to OR
-// placed at the SAME employer for the SAME position (job title) before? Returns
-// the most recent match so the UI can confirm before creating a duplicate referral.
+// Returns the applicant's most recent matching referral/placement at the same employer and job title, if any.
 function efCheckDuplicateReferral()
 {
     $applicantId = isset($_GET['applicantId']) && is_numeric($_GET['applicantId']) ? (int) $_GET['applicantId'] : null;
@@ -2128,8 +2061,7 @@ function efCreateReferral()
     json(['status' => 'ok', 'message' => 'Referral created.', 'data' => ['id' => $id]]);
 }
 
-// POST /api/employment/updateReferralStatus/{id}  { status }
-// When status = 'Hired': atomically creates a placement and marks referral Hired.
+// Updates a referral's status, creating a placement when set to Hired.
 function efUpdateReferralStatus($id)
 {
     if (!is_numeric($id)) error('Invalid referral id.', 422);
@@ -2359,9 +2291,7 @@ function efUpdatePlacementStatus($id)
     json(['status' => 'ok', 'message' => "Placement status updated to {$status}."]);
 }
 
-// GET /api/employment/listPromotions/{placementId}
-// Promotion history for one placement, newest first. A placement can have many
-// promotions (Cook -> Head Cook -> Manager) within the same job.
+// Returns a placement's promotion history, newest first.
 function efListPromotions($id)
 {
     if (!is_numeric($id)) error('Invalid placement id.', 422);
@@ -2393,10 +2323,7 @@ function efListPromotions($id)
     json(['status' => 'ok', 'data' => $out]);
 }
 
-// POST /api/employment/createPromotion/{placementId}
-//   { promotionDate, newJobTitle, newSalaryMin?, newSalaryMax?, remarks? }
-// Records one promotion event against a placement. Does not alter the placement
-// row or its status -- promotions are append-only history.
+// Records a promotion event against a placement.
 function efCreatePromotion($id)
 {
     if (!is_numeric($id)) error('Invalid placement id.', 422);
@@ -2490,11 +2417,7 @@ function efReportCount($sql, $from, $to)
     return (int) $stmt->fetchColumn();
 }
 
-// GET /api/employment/monthlyReport?from=YYYY-MM-DD&to=YYYY-MM-DD
-//   (or ?year=YYYY&month=M for a single month — backward compatible)
-// PESO LMI/SPRS report data over a date range: registered / referred / placed
-// lists + summary counts (sex-disaggregated) and a prior-period comparison
-// (the same span shifted back one year). Supports Monthly / Annual / Custom.
+// Returns the PESO LMI/SPRS monthly report data for a date range.
 function efMonthlyReport()
 {
     // Resolve the reporting window (shared with reports.php's summary action).
@@ -2658,8 +2581,7 @@ function efMonthlyReport()
 // RECYCLE BIN  (soft-deleted EF records: applicants, employers, referrals)
 // ═══════════════════════════════════════════════════════════════════════════════
 
-// recordType -> [table, primary-key column]. The single source of truth for the
-// restore/purge actions so they cannot touch a table they shouldn't.
+// Maps each recycle-bin record type to its table and primary key.
 function efRecycleMap()
 {
     return [
@@ -2669,9 +2591,7 @@ function efRecycleMap()
     ];
 }
 
-// Read + validate { recordType, id } from the request body. Returns [type, id, body]
-// — the decoded body is returned too so callers needing extra fields (e.g.
-// purgeRecord's "force") don't have to re-read php://input a second time.
+// Reads and validates {recordType, id} from the request body.
 function efRecycleTarget()
 {
     $d    = body();
@@ -2682,10 +2602,7 @@ function efRecycleTarget()
     return [$type, $id, $d];
 }
 
-// A human-readable name for an activity log line -- "#9" means nothing to
-// whoever reads it later; the applicant's/employer's actual name (or, for a
-// referral, who it was for and where) does. Must be looked up BEFORE the
-// record is hard-deleted.
+// Returns a recycle-bin record's display name.
 function efRecordName($type, $id)
 {
     if ($type === 'applicant') {
@@ -2712,9 +2629,7 @@ function efRecordName($type, $id)
     return $name !== false ? $name : "#{$id}";
 }
 
-// GET /api/employment/listDeleted
-// Every soft-deleted EF record in the shape the recycle bin UI expects:
-//   { recordType, id, name, module, description, deletedBy, deletedAt }
+// Returns the recycle bin contents for applicants, employers, and referrals.
 function efListDeleted()
 {
     efPurgeExpired();
@@ -2811,16 +2726,7 @@ function efRestoreRecord()
     json(['status' => 'ok', 'message' => 'Record restored.']);
 }
 
-// POST /api/employment/purgeRecord  { recordType, id, force? }  — permanent delete.
-// Only acts on records already in the recycle bin (deleted_at IS NOT NULL).
-// For applicants with placement/referral history: blocked with a 409 (detail:
-// {code:'has_history', placements, referrals}) unless force=true is passed —
-// the frontend re-submits with force after the user confirms a specific
-// "this will also delete N placements / M referrals" warning.
-// Single place that knows how to actually hard-delete each recordType --
-// shared by efPurgeRecord() (one record, explicit admin action) and
-// efPurgeExpired() (bulk, automatic 30-day retention purge) so there's
-// never a second, drifting copy of this dispatch.
+// Permanently deletes a recycle-bin record by type.
 function efHardDeleteByType($type, $id)
 {
     if ($type === 'applicant')     employmentHardDeleteApplicant($id);
@@ -2828,6 +2734,7 @@ function efHardDeleteByType($type, $id)
     else                            employmentHardDeleteReferral($id);
 }
 
+// Permanently deletes a recycle-bin record, blocked for an applicant with unresolved history unless forced.
 function efPurgeRecord()
 {
     [$type, $id, $body] = efRecycleTarget();
@@ -2854,18 +2761,7 @@ function efPurgeRecord()
     json(['status' => 'ok', 'message' => 'Record permanently deleted.']);
 }
 
-// Auto-purges anything past the recycle bin's retention window (see
-// RECYCLE_BIN_RETENTION_DAYS in core/helpers.php). Called from
-// efListDeleted() so simply viewing the recycle bin enforces the "N days
-// left" countdown the UI already shows -- that display was cosmetic only
-// until this existed.
-//
-// An applicant with placement/referral history is deliberately SKIPPED here
-// rather than force-deleted through the same guard efPurgeRecord() enforces
-// for a manual purge -- destroying that history should stay a conscious
-// admin action (via the explicit "force" confirmation), never something
-// that happens silently in the background. It simply stays in the recycle
-// bin past its nominal 30 days until an admin reviews it.
+// Purges EF recycle bin rows past RECYCLE_BIN_RETENTION_DAYS, skipping applicants with unresolved history.
 function efPurgeExpired()
 {
     $uid = currentUserId();

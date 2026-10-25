@@ -1,23 +1,15 @@
 <?php
 // TUPAD: projects (tupad_projects) + profiles (beneficiary spine, no dedicated
-// profile table). No classification or 4Ps fields — the TUPAD applicant form
-// never collected them.
-//
-// Unlike DILP (one project at a time, enforced by a UNIQUE constraint on
-// beneficiary_service_id alone), tupad_project_beneficiaries is only unique on
-// (project_id, beneficiary_service_id) — a beneficiary can carry a running
-// history of TUPAD project assignments. "Current" is simply the most recently
-// assigned row; assigning never deletes older rows, so completed assignments
-// stay visible as history.
-//
-// Beneficiary status is derived at read time from the current assignment's
-// project status, same rule as DILP: Inactive (none), Active (Planned/Ongoing),
-// Completed (Completed).
+// profile table, no classification/4Ps fields). tupad_project_beneficiaries
+// keeps a running history of project assignments; "current" is the most
+// recent row. Status is derived at read time from that assignment's project
+// status: Inactive (none), Active (Planned/Ongoing), Completed (Completed).
 
 include_once __DIR__ . '/../core/helpers.php';
 include_once __DIR__ . '/../core/guard.php';
 include_once __DIR__ . '/../core/activity_log.php';
 
+// Routes a TUPAD action to its handler function.
 function handle($action, $id, $method)
 {
     switch ($action) {
@@ -44,22 +36,27 @@ function handle($action, $id, $method)
 
 // ─── Helpers ─────────────────────────────────────────────────────────────────
 
+// Trims a string, converting empty/blank to null.
 function tupadNullStr($v) {
     $s = is_string($v) ? trim($v) : $v;
     return ($s === '' || $s === null) ? null : $s;
 }
+// Validates and returns a YYYY-MM-DD date string, or null.
 function tupadDate($v) {
     $s = is_string($v) ? trim($v) : '';
     return preg_match('/^\d{4}-\d{2}-\d{2}$/', $s) ? $s : null;
 }
+// Converts a numeric value to int, or null.
 function tupadIntOrNull($v) { return is_numeric($v) ? (int)$v : null; }
 
+// Parses a currency-formatted string into a float, or null.
 function tupadMoneyOrNull($v) {
     if ($v === null) return null;
     $s = trim(str_replace([',', '₱', ' '], '', (string)$v));
     return ($s === '' || !is_numeric($s)) ? null : (float)$s;
 }
 
+// Returns the TUPAD service_id (cached).
 function tupadServiceId() {
     static $sid = null;
     if ($sid !== null) return $sid;
@@ -69,20 +66,20 @@ function tupadServiceId() {
     return (int) $sid;
 }
 
-// Same derivation rule as DILP: Active while Planned/Ongoing, Completed once
-// Completed, Inactive otherwise (no assignment — activity_status_enum has no
-// Cancelled state, so there's no extra case to fall back from here).
+// Derives a beneficiary's status from their project's status.
 function tupadDeriveStatus($projectStatus) {
     if ($projectStatus === 'Completed') return 'Completed';
     if ($projectStatus === 'Planned' || $projectStatus === 'Ongoing') return 'Active';
     return 'Inactive';
 }
 
+// Returns the base URL for serving uploaded files.
 function tupadUploadBaseUrl() {
     $host = $_SERVER['HTTP_HOST'] ?? 'localhost';
     return 'http://' . $host . '/epeso_backend/';
 }
 
+// Formats a byte count as a human-readable size.
 function tupadFormatBytes($bytes) {
     $bytes = (int) $bytes;
     if ($bytes <= 0) return '0 Bytes';
@@ -93,6 +90,7 @@ function tupadFormatBytes($bytes) {
 
 // ─── Projects ─────────────────────────────────────────────────────────────────
 
+// Returns the list of TUPAD projects.
 function tupadListProjects() {
     $s = db()->query(
         "SELECT p.*, (SELECT COUNT(*) FROM tupad_project_beneficiaries pb WHERE pb.project_id = p.project_id AND pb.exited_at IS NULL) AS assigned_count
@@ -103,6 +101,7 @@ function tupadListProjects() {
     json(['status' => 'ok', 'data' => array_map('tupadFormatProject', $s->fetchAll())]);
 }
 
+// Returns a single TUPAD project by id.
 function tupadGetProjectById($id) {
     $s = db()->prepare(
         "SELECT p.*, (SELECT COUNT(*) FROM tupad_project_beneficiaries pb WHERE pb.project_id = p.project_id AND pb.exited_at IS NULL) AS assigned_count
@@ -113,6 +112,7 @@ function tupadGetProjectById($id) {
     return $r ? tupadFormatProject($r) : null;
 }
 
+// Formats a TUPAD project row for the frontend.
 function tupadFormatProject($r) {
     return [
         'id'               => (int) $r['project_id'],
@@ -130,6 +130,7 @@ function tupadFormatProject($r) {
     ];
 }
 
+// Validates TUPAD project input.
 function tupadValidateProjectInput($d, $excludeId = null) {
     $title = trim($d['title'] ?? '');
     if ($title === '') error('Activity title is required.', 422);
@@ -161,6 +162,7 @@ function tupadValidateProjectInput($d, $excludeId = null) {
     return [$title, $date];
 }
 
+// Creates a new TUPAD project.
 function tupadCreateProject() {
     $uid = requireLogin();
     $d = body();
@@ -187,6 +189,7 @@ function tupadCreateProject() {
     json(['status' => 'ok', 'message' => 'Project created.', 'data' => tupadGetProjectById($id)]);
 }
 
+// Updates a TUPAD project.
 function tupadUpdateProject($id) {
     if (!is_numeric($id)) error('Invalid project id.', 422);
     $id  = (int) $id;
@@ -217,6 +220,7 @@ function tupadUpdateProject($id) {
     json(['status' => 'ok', 'message' => 'Project updated.', 'data' => tupadGetProjectById($id)]);
 }
 
+// Updates a TUPAD project's status.
 function tupadUpdateProjectStatus($id) {
     if (!is_numeric($id)) error('Invalid project id.', 422);
     $id = (int) $id;
@@ -237,6 +241,7 @@ function tupadUpdateProjectStatus($id) {
     json(['status' => 'ok', 'message' => 'Status updated.', 'data' => tupadGetProjectById($id)]);
 }
 
+// Deletes a TUPAD project.
 function tupadDeleteProject($id) {
     if (!is_numeric($id)) error('Invalid project id.', 422);
     $id = (int) $id;
@@ -262,6 +267,7 @@ function tupadDeleteProject($id) {
 
 // ─── Profiles ─────────────────────────────────────────────────────────────────
 
+// Returns the list of TUPAD profiles.
 function tupadListProfiles() {
     $s = db()->prepare(
         "SELECT DISTINCT b.beneficiary_id
@@ -280,6 +286,7 @@ function tupadListProfiles() {
     json(['status' => 'ok', 'data' => $out]);
 }
 
+// Returns a single TUPAD profile.
 function tupadGetProfile($id) {
     if (!is_numeric($id)) error('Invalid id.', 422);
     $p = tupadBuildProfile((int) $id);
@@ -287,6 +294,7 @@ function tupadGetProfile($id) {
     json(['status' => 'ok', 'data' => $p]);
 }
 
+// Builds the full TUPAD profile for display.
 function tupadBuildProfile($bid) {
     $s = db()->prepare(
         "SELECT b.*, bgy.barangay_name, c.city_id, c.city_name, p.province_id, p.province_name, r.region_name,
@@ -369,14 +377,7 @@ function tupadBuildProfile($bid) {
     ];
 }
 
-// Non-exiting sibling of tupadValidateProfileInput() below: returns an error
-// string (or '' if valid) instead of calling error()/exit, so the bulk
-// import can validate every row and collect all their problems instead of
-// aborting the whole request at the first bad row.
-//
-// Required fields mirror beneficiaries' real NOT NULL columns (sex, birth_date,
-// civil_status, barangay_id) so a bad request 422s cleanly instead of failing
-// as a raw DB constraint violation.
+// Validates TUPAD profile input, returning an error string or ''.
 function tupadProfileValidationError($d) {
     if (tupadNullStr($d['firstName'] ?? '') === null) return 'First name is required.';
     if (tupadNullStr($d['lastName'] ?? '') === null)  return 'Last name is required.';
@@ -392,6 +393,7 @@ function tupadProfileValidationError($d) {
     return '';
 }
 
+// Validates TUPAD profile input and returns [sex, birth, civil, bgyId].
 function tupadValidateProfileInput($d) {
     $err = tupadProfileValidationError($d);
     if ($err) error($err, 422);
@@ -404,8 +406,7 @@ function tupadValidateProfileInput($d) {
     return [$sex, $birth, $civil, $bgyId];
 }
 
-// Insert one profile's full beneficiary spine. Shared by the single-record
-// create and the bulk import.
+// Inserts one profile's full beneficiary spine.
 function tupadInsertProfileRow($pdo, $uid, $d) {
     $sex   = $d['sex'];
     $birth = tupadDate($d['birthdate'] ?? '');
@@ -438,6 +439,7 @@ function tupadInsertProfileRow($pdo, $uid, $d) {
     return $bid;
 }
 
+// Creates a new TUPAD profile.
 function tupadCreateProfile() {
     $uid = requireLogin();
     $d = body();
@@ -457,11 +459,7 @@ function tupadCreateProfile() {
     json(['status' => 'ok', 'message' => 'Profile saved.', 'data' => tupadBuildProfile($bid)]);
 }
 
-// POST /api/tupad/importProfilesBulk   body = { rows: object[] }
-//
-// All-or-nothing bulk import: every row is validated up front, then the
-// whole batch is written inside ONE transaction. If any row fails validation
-// or the insert throws partway through, everything is rolled back.
+// Bulk-imports TUPAD profiles.
 function tupadImportProfilesBulk() {
     $uid  = requireLogin();
     $body = body();
@@ -498,6 +496,7 @@ function tupadImportProfilesBulk() {
     json(['status' => 'ok', 'message' => 'Profiles saved.', 'data' => ['ids' => $ids, 'count' => count($ids)]]);
 }
 
+// Updates a TUPAD profile.
 function tupadUpdateProfile($id) {
     if (!is_numeric($id)) error('Invalid id.', 422);
     $bid = (int) $id;
@@ -541,6 +540,7 @@ function tupadUpdateProfile($id) {
     json(['status' => 'ok', 'message' => 'Profile updated.', 'data' => tupadBuildProfile($bid)]);
 }
 
+// Soft-deletes a TUPAD beneficiary.
 function tupadDeleteProfile($id) {
     if (!is_numeric($id)) error('Invalid id.', 422);
     $bid = (int) $id;
@@ -572,10 +572,8 @@ function tupadDeleteProfile($id) {
 }
 
 // ─── Assign / Unassign project ────────────────────────────────────────────────
-// tupad_project_beneficiaries is unique on (project_id, beneficiary_service_id)
-// only — assigning always inserts (or refreshes an existing identical link),
-// never deletes an older assignment, so completed projects remain in history.
 
+// Assigns a beneficiary to a TUPAD project.
 function tupadAssignProject() {
     requireLogin();
     $d = body();
@@ -620,6 +618,7 @@ function tupadAssignProject() {
     json(['status' => 'ok', 'message' => 'Beneficiary assigned to project.']);
 }
 
+// Unassigns a beneficiary from a TUPAD project.
 function tupadUnassignProject() {
     requireLogin();
     $d = body();
@@ -652,12 +651,7 @@ function tupadUnassignProject() {
     json(['status' => 'ok', 'message' => 'Beneficiary unassigned from project.']);
 }
 
-// Records that a beneficiary LEFT an already-started project early. Unlike
-// unassign (a correction, only while the project is still Planned, which
-// deletes the link), this KEEPS the assignment row and marks it with when/why/
-// who. TUPAD's status is derived, so the exit marker itself makes the status
-// read Withdrawn; the row also stops counting toward the project's headcount,
-// freeing the slot for a replacement. Only meaningful for an Ongoing project.
+// Marks a beneficiary as withdrawn from their TUPAD project.
 function tupadWithdrawFromProject() {
     $uid = requireLogin();
     $d = body();
@@ -708,6 +702,7 @@ function tupadWithdrawFromProject() {
 
 // ─── Documents (applicant) ────────────────────────────────────────────────────
 
+// Saves attachment uploads for a TUPAD applicant.
 function tupadSyncDocuments($pdo, $bid, $bsId, $uid, $d) {
     $docs = is_array($d['attachedDocuments'] ?? null) ? $d['attachedDocuments'] : [];
 
@@ -755,6 +750,7 @@ function tupadSyncDocuments($pdo, $bid, $bsId, $uid, $d) {
     }
 }
 
+// Returns an applicant's saved attachments.
 function tupadFetchSavedDocuments($bid) {
     $s = db()->prepare(
         "SELECT document_id, document_type, title, file_name, file_path, file_size
@@ -775,6 +771,7 @@ function tupadFetchSavedDocuments($bid) {
 
 // ─── Documents (project) ──────────────────────────────────────────────────────
 
+// Saves attachment uploads for a TUPAD project.
 function tupadSyncProjectDocuments($pdo, $projectId, $uid, $docsPayload) {
     $docs = is_array($docsPayload) ? $docsPayload : [];
 
@@ -819,6 +816,7 @@ function tupadSyncProjectDocuments($pdo, $projectId, $uid, $docsPayload) {
     }
 }
 
+// Returns a project's saved attachments.
 function tupadFetchProjectDocuments($projectId) {
     $s = db()->prepare(
         "SELECT document_id, file_name, file_path, file_size
@@ -836,9 +834,10 @@ function tupadFetchProjectDocuments($projectId) {
 }
 
 // ═══════════════════════════════════════════════════════════════════════════════
-// RECYCLE BIN  (soft-deleted TUPAD beneficiaries) — mirrors spes.php's pattern.
+// RECYCLE BIN  (soft-deleted TUPAD beneficiaries)
 // ═══════════════════════════════════════════════════════════════════════════════
 
+// Maps each recycle-bin record type to its table and primary key.
 function tupadRecycleMap() {
     return [
         'tupadApplicant' => ['beneficiaries', 'beneficiary_id'],
@@ -846,6 +845,7 @@ function tupadRecycleMap() {
     ];
 }
 
+// Reads and validates {recordType, id} from the request body.
 function tupadRecycleTarget() {
     $d    = body();
     $type = $d['recordType'] ?? '';
@@ -855,9 +855,7 @@ function tupadRecycleTarget() {
     return [$type, $id];
 }
 
-// A human-readable name for an activity log line -- "#9" means nothing to
-// whoever reads it later; the applicant's actual name (or project title)
-// does. Must be looked up BEFORE the record is hard-deleted.
+// Returns a recycle-bin record's display name.
 function tupadRecordName($type, $id) {
     if ($type === 'tupadApplicant') {
         $s = db()->prepare(
@@ -873,6 +871,7 @@ function tupadRecordName($type, $id) {
     return $name !== false ? $name : "#{$id}";
 }
 
+// Returns the recycle bin contents for beneficiaries and projects.
 function tupadListDeleted() {
     tupadPurgeExpired();
     $s = db()->prepare(
@@ -920,6 +919,7 @@ function tupadListDeleted() {
     json(['status' => 'ok', 'data' => $items]);
 }
 
+// Restores a record from the recycle bin.
 function tupadRestoreRecord() {
     [$type, $id] = tupadRecycleTarget();
     [$table, $pk] = tupadRecycleMap()[$type];
@@ -933,10 +933,7 @@ function tupadRestoreRecord() {
     json(['status' => 'ok', 'message' => 'Record restored.']);
 }
 
-// Single place that knows how to actually hard-delete each recordType --
-// shared by tupadPurgeRecord() (one record, explicit admin action) and
-// tupadPurgeExpired() (bulk, automatic 30-day retention purge) so there's
-// never a second, drifting copy of this dispatch.
+// Permanently deletes a recycle-bin record by type.
 function tupadHardDeleteByType($type, $id) {
     if ($type === 'tupadApplicant') {
         tupadHardDeleteApplicant($id);
@@ -945,6 +942,7 @@ function tupadHardDeleteByType($type, $id) {
     }
 }
 
+// Permanently deletes a recycle-bin record.
 function tupadPurgeRecord() {
     [$type, $id] = tupadRecycleTarget();
     [$table, $pk] = tupadRecycleMap()[$type];
@@ -959,11 +957,7 @@ function tupadPurgeRecord() {
     json(['status' => 'ok', 'message' => 'Record permanently deleted.']);
 }
 
-// Auto-purges anything past the recycle bin's retention window (see
-// RECYCLE_BIN_RETENTION_DAYS in core/helpers.php). Called from
-// tupadListDeleted() so simply viewing the recycle bin enforces the "N days
-// left" countdown the UI already shows -- that display was cosmetic only
-// until this existed.
+// Purges recycle bin rows past RECYCLE_BIN_RETENTION_DAYS, triggered from tupadListDeleted().
 function tupadPurgeExpired() {
     $uid = currentUserId();
 
@@ -1001,9 +995,7 @@ function tupadPurgeExpired() {
     }
 }
 
-// Permanently remove a TUPAD project and its uploaded files. Only reachable
-// for an already soft-deleted project, which tupadDeleteProject's in-use
-// guard already guaranteed has zero linked beneficiaries.
+// Permanently deletes a TUPAD project and its uploaded files.
 function tupadHardDeleteProject($id) {
     $docs = db()->prepare("SELECT file_path FROM attached_documents WHERE tupad_project_id=:id");
     $docs->execute([':id' => $id]);
@@ -1014,6 +1006,7 @@ function tupadHardDeleteProject($id) {
     db()->prepare("DELETE FROM tupad_projects WHERE project_id=:id")->execute([':id' => $id]);
 }
 
+// Permanently deletes a TUPAD applicant and all related data.
 function tupadHardDeleteApplicant($bid) {
     $pdo = db();
     try {

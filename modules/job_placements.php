@@ -1,20 +1,15 @@
 <?php
-// Job Placements: ONE shared table used by every program module (starting
-// with Skills Training) instead of each module having its own copy of the
-// same job_title/employer/date_hired columns. Mirrors the existing
-// attached_documents pattern -- keyed off beneficiary_service_id, the same
-// spine column every module's own profile table already uses, so any module
-// can plug into this without a schema change of its own.
-//
+// Job Placements: ONE shared table used by every program module, keyed off
+// beneficiary_service_id so any module can plug in without a schema change.
 // Permission is resolved dynamically from the applicant's own service_code
-// (see jpPermissionForBeneficiaryService) rather than a single static module
-// name, since this endpoint is shared across programs with different
-// permission keys (gip, cdsp, skills, ...).
+// (see jpPermissionForBeneficiaryService), since this endpoint is shared
+// across programs with different permission keys (gip, cdsp, skills, ...).
 
 include_once __DIR__ . '/../core/helpers.php';
 include_once __DIR__ . '/../core/guard.php';
 include_once __DIR__ . '/../core/activity_log.php';
 
+// Routes a job_placements action to its handler function.
 function handle($action, $id, $method)
 {
     switch ($action) {
@@ -28,26 +23,29 @@ function handle($action, $id, $method)
 
 // ─── Helpers ─────────────────────────────────────────────────────────────────
 
+// Trims a string, converting empty/blank to null.
 function jpNullStr($v) {
     $s = is_string($v) ? trim($v) : $v;
     return ($s === '' || $s === null) ? null : $s;
 }
+// Validates and returns a YYYY-MM-DD date string, or null.
 function jpDate($v) {
     $s = is_string($v) ? trim($v) : '';
     return preg_match('/^\d{4}-\d{2}-\d{2}$/', $s) ? $s : null;
 }
+// Converts a numeric value to int, or null.
 function jpIntOrNull($v) { return is_numeric($v) ? (int)$v : null; }
 
-// Mirrors job_placement_employment_type_enum (migration 057).
+// Valid values for job_placement_employment_type_enum.
 function jpEmploymentTypeValid() {
     return ['Full-time', 'Part-time', 'Contractual'];
 }
+// Returns the employment type if valid, else null.
 function jpEmploymentTypeOrNull($v) {
     return in_array($v, jpEmploymentTypeValid(), true) ? $v : null;
 }
 
-// service_code -> the permission key used by requirePermission()/canManage().
-// CDSP's three child services all share CDSP's own permission row.
+// Maps each program's service_code to its permission key.
 function jpPermissionMap() {
     return [
         'EF' => 'employment',
@@ -60,11 +58,7 @@ function jpPermissionMap() {
     ];
 }
 
-// Resolves which program a beneficiary_service_id belongs to and requires
-// the matching permission -- this endpoint has no single fixed module name
-// since it's shared across every program. Login is checked before the
-// applicant lookup so an unauthenticated caller can't probe which
-// beneficiary_service_id values exist by reading the 404 vs 403 response.
+// Checks the caller's permission for the program a beneficiary_service_id belongs to.
 function jpRequirePermission($bsId, $level) {
     requireLogin();
 
@@ -81,6 +75,7 @@ function jpRequirePermission($bsId, $level) {
     return requirePermission($perm, $level);
 }
 
+// Formats a job placement row for the frontend.
 function jpFormat($r) {
     return [
         'id'                   => (int) $r['placement_id'],
@@ -93,6 +88,7 @@ function jpFormat($r) {
     ];
 }
 
+// Validates job placement input and returns [title, employer, dateHired].
 function jpValidateInput($d) {
     $title = trim($d['jobTitle'] ?? '');
     if ($title === '') error('Job title is required.', 422);
@@ -106,7 +102,7 @@ function jpValidateInput($d) {
 
 // ─── Actions ──────────────────────────────────────────────────────────────────
 
-// GET /api/job_placements/listByApplicant?beneficiaryServiceId=123
+// Returns job placements for an applicant.
 function jpListByApplicant() {
     $bsId = jpIntOrNull($_GET['beneficiaryServiceId'] ?? '');
     if (!$bsId) error('beneficiaryServiceId is required.', 422);
@@ -121,6 +117,7 @@ function jpListByApplicant() {
     json(['status' => 'ok', 'data' => array_map('jpFormat', $s->fetchAll())]);
 }
 
+// Records a new job placement.
 function jpCreate() {
     $d = body();
     $bsId = jpIntOrNull($d['beneficiaryServiceId'] ?? '');
@@ -145,6 +142,7 @@ function jpCreate() {
     json(['status' => 'ok', 'message' => 'Job placement recorded.', 'data' => jpFormat($g->fetch())]);
 }
 
+// Updates a job placement.
 function jpUpdate($id) {
     if (!is_numeric($id)) error('Invalid placement id.', 422);
     $id = (int) $id;
@@ -172,6 +170,7 @@ function jpUpdate($id) {
     json(['status' => 'ok', 'message' => 'Job placement updated.', 'data' => jpFormat($g->fetch())]);
 }
 
+// Soft-deletes a job placement.
 function jpDelete($id) {
     if (!is_numeric($id)) error('Invalid placement id.', 422);
     $id = (int) $id;

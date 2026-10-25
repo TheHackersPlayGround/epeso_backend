@@ -11,6 +11,7 @@ include_once __DIR__ . '/../core/helpers.php';
 include_once __DIR__ . '/../core/guard.php';
 include_once __DIR__ . '/../core/activity_log.php';
 
+// Routes a DILP action to its handler function.
 function handle($action, $id, $method)
 {
     switch ($action) {
@@ -36,22 +37,27 @@ function handle($action, $id, $method)
 
 // ─── Helpers ─────────────────────────────────────────────────────────────────
 
+// Trims a string, converting empty/blank to null.
 function dilpNullStr($v) {
     $s = is_string($v) ? trim($v) : $v;
     return ($s === '' || $s === null) ? null : $s;
 }
+// Validates and returns a YYYY-MM-DD date string, or null.
 function dilpDate($v) {
     $s = is_string($v) ? trim($v) : '';
     return preg_match('/^\d{4}-\d{2}-\d{2}$/', $s) ? $s : null;
 }
+// Converts a numeric value to int, or null.
 function dilpIntOrNull($v) { return is_numeric($v) ? (int)$v : null; }
 
+// Parses a currency-formatted string into a float, or null.
 function dilpMoneyOrNull($v) {
     if ($v === null) return null;
     $s = trim(str_replace([',', '₱', ' '], '', (string)$v));
     return ($s === '' || !is_numeric($s)) ? null : (float)$s;
 }
 
+// Returns the DILP service_id (cached).
 function dilpServiceId() {
     static $sid = null;
     if ($sid !== null) return $sid;
@@ -61,19 +67,14 @@ function dilpServiceId() {
     return (int) $sid;
 }
 
-// The DILP applicant form's classification dropdown predates
-// beneficiary_classification_enum. Vendor/Fisherfolk/Farmer/Displaced Worker/
-// Transport Worker are real, distinct livelihood-beneficiary categories worth
-// reporting on individually, so they were added to the enum (migration 028)
-// rather than collapsed. OFW/PWD/Others map to their existing near-identical
-// values instead of duplicating them; anything unrecognized still falls back
-// to 'Other'.
+// Returns the valid classification values.
 function dilpValidClassifications() {
     return ['Student','Fresh Graduate','Employed','Underemployed','Unemployed',
             'Out of School Youth','Person with Disability','Solo Parent',
             'Women','Senior Citizen','Returning OFW','Other','Indigenous People',
             'Vendor','Fisherfolk','Farmer','Displaced Worker','Transport Worker'];
 }
+// Normalizes a classification value to its stored enum, defaulting to 'Other'.
 function dilpNormalizeClassification($v) {
     $v = is_string($v) ? trim($v) : '';
     if ($v === '') return null;
@@ -82,21 +83,20 @@ function dilpNormalizeClassification($v) {
     return in_array($v, dilpValidClassifications(), true) ? $v : 'Other';
 }
 
-// Beneficiary status is derived, never stored: Inactive with no assignment,
-// Active while the assigned project is Planned/Ongoing, Completed once it is.
-// A Cancelled project (project_status_enum only — TUPAD's activity_status_enum
-// has no such state) falls back to Inactive, same as no assignment at all.
+// Derives a beneficiary's status from their project's status.
 function dilpDeriveStatus($projectStatus) {
     if ($projectStatus === 'Completed') return 'Completed';
     if ($projectStatus === 'Planned' || $projectStatus === 'Ongoing') return 'Active';
     return 'Inactive';
 }
 
+// Returns the base URL for serving uploaded files.
 function dilpUploadBaseUrl() {
     $host = $_SERVER['HTTP_HOST'] ?? 'localhost';
     return 'http://' . $host . '/epeso_backend/';
 }
 
+// Formats a byte count as a human-readable size.
 function dilpFormatBytes($bytes) {
     $bytes = (int) $bytes;
     if ($bytes <= 0) return '0 Bytes';
@@ -107,6 +107,7 @@ function dilpFormatBytes($bytes) {
 
 // ─── Projects ─────────────────────────────────────────────────────────────────
 
+// Returns the list of DILP projects.
 function dilpListProjects() {
     $s = db()->query(
         "SELECT p.*, (SELECT COUNT(*) FROM dilp_project_beneficiaries pb WHERE pb.dilp_project_id = p.dilp_project_id) AS assigned_count
@@ -117,6 +118,7 @@ function dilpListProjects() {
     json(['status' => 'ok', 'data' => array_map('dilpFormatProject', $s->fetchAll())]);
 }
 
+// Returns a single DILP project by id.
 function dilpGetProjectById($id) {
     $s = db()->prepare(
         "SELECT p.*, (SELECT COUNT(*) FROM dilp_project_beneficiaries pb WHERE pb.dilp_project_id = p.dilp_project_id) AS assigned_count
@@ -127,6 +129,7 @@ function dilpGetProjectById($id) {
     return $r ? dilpFormatProject($r) : null;
 }
 
+// Formats a DILP project row for the frontend.
 function dilpFormatProject($r) {
     $bgyId = $r['barangay_id'] ?? null;
     $names = ['barangay' => '', 'cityMunicipality' => '', 'province' => '', 'region' => ''];
@@ -172,6 +175,7 @@ function dilpFormatProject($r) {
     ];
 }
 
+// Validates DILP project input.
 function dilpValidateProjectInput($d, $excludeId = null) {
     $idNum = trim($d['projectIdNumber'] ?? '');
     $name  = trim($d['projectName'] ?? '');
@@ -220,6 +224,7 @@ function dilpValidateProjectInput($d, $excludeId = null) {
     return [$idNum, $name, $type, $component, $impl, $bgyId];
 }
 
+// Creates a new DILP project.
 function dilpCreateProject() {
     $uid = requireLogin();
     $d = body();
@@ -248,6 +253,7 @@ function dilpCreateProject() {
     json(['status' => 'ok', 'message' => 'Project created.', 'data' => dilpGetProjectById($id)]);
 }
 
+// Updates a DILP project.
 function dilpUpdateProject($id) {
     if (!is_numeric($id)) error('Invalid project id.', 422);
     $id  = (int) $id;
@@ -277,6 +283,7 @@ function dilpUpdateProject($id) {
     json(['status' => 'ok', 'message' => 'Project updated.', 'data' => dilpGetProjectById($id)]);
 }
 
+// Updates a DILP project's status.
 function dilpUpdateProjectStatus($id) {
     if (!is_numeric($id)) error('Invalid project id.', 422);
     $id = (int) $id;
@@ -297,6 +304,7 @@ function dilpUpdateProjectStatus($id) {
     json(['status' => 'ok', 'message' => 'Status updated.', 'data' => dilpGetProjectById($id)]);
 }
 
+// Deletes a DILP project.
 function dilpDeleteProject($id) {
     if (!is_numeric($id)) error('Invalid project id.', 422);
     $id = (int) $id;
@@ -322,6 +330,7 @@ function dilpDeleteProject($id) {
 
 // ─── Profiles ─────────────────────────────────────────────────────────────────
 
+// Returns the list of DILP profiles.
 function dilpListProfiles() {
     $s = db()->prepare(
         "SELECT DISTINCT b.beneficiary_id
@@ -340,6 +349,7 @@ function dilpListProfiles() {
     json(['status' => 'ok', 'data' => $out]);
 }
 
+// Returns a single DILP profile.
 function dilpGetProfile($id) {
     if (!is_numeric($id)) error('Invalid id.', 422);
     $p = dilpBuildProfile((int) $id);
@@ -347,6 +357,7 @@ function dilpGetProfile($id) {
     json(['status' => 'ok', 'data' => $p]);
 }
 
+// Builds the full DILP profile for display.
 function dilpBuildProfile($bid) {
     $s = db()->prepare(
         "SELECT b.*, bgy.barangay_name, c.city_id, c.city_name, p.province_id, p.province_name, r.region_name,
@@ -417,14 +428,7 @@ function dilpBuildProfile($bid) {
     ];
 }
 
-// Non-exiting sibling of dilpValidateProfileInput() below: returns an error
-// string (or '' if valid) instead of calling error()/exit, so the bulk
-// import can validate every row and collect all their problems instead of
-// aborting the whole request at the first bad row.
-//
-// Required fields mirror beneficiaries' real NOT NULL columns (sex, birth_date,
-// civil_status, barangay_id) so a bad request 422s cleanly instead of failing
-// as a raw DB constraint violation.
+// Validates DILP profile input, returning an error string or ''.
 function dilpProfileValidationError($d) {
     if (dilpNullStr($d['firstName'] ?? '') === null) return 'First name is required.';
     if (dilpNullStr($d['lastName'] ?? '') === null)  return 'Last name is required.';
@@ -440,6 +444,7 @@ function dilpProfileValidationError($d) {
     return '';
 }
 
+// Validates DILP profile input and returns [sex, birth, civil, bgyId].
 function dilpValidateProfileInput($d) {
     $err = dilpProfileValidationError($d);
     if ($err) error($err, 422);
@@ -452,8 +457,7 @@ function dilpValidateProfileInput($d) {
     return [$sex, $birth, $civil, $bgyId];
 }
 
-// Insert one profile's full beneficiary spine. Shared by the single-record
-// create and the bulk import.
+// Inserts one profile's full beneficiary spine.
 function dilpInsertProfileRow($pdo, $uid, $d) {
     $sex   = $d['sex'];
     $birth = dilpDate($d['birthdate'] ?? '');
@@ -495,6 +499,7 @@ function dilpInsertProfileRow($pdo, $uid, $d) {
     return $bid;
 }
 
+// Creates a new DILP profile.
 function dilpCreateProfile() {
     $uid = requireLogin();
     $d = body();
@@ -514,11 +519,7 @@ function dilpCreateProfile() {
     json(['status' => 'ok', 'message' => 'Profile saved.', 'data' => dilpBuildProfile($bid)]);
 }
 
-// POST /api/dilp/importProfilesBulk   body = { rows: object[] }
-//
-// All-or-nothing bulk import: every row is validated up front, then the
-// whole batch is written inside ONE transaction. If any row fails validation
-// or the insert throws partway through, everything is rolled back.
+// Bulk-imports DILP profiles.
 function dilpImportProfilesBulk() {
     $uid  = requireLogin();
     $body = body();
@@ -555,6 +556,7 @@ function dilpImportProfilesBulk() {
     json(['status' => 'ok', 'message' => 'Profiles saved.', 'data' => ['ids' => $ids, 'count' => count($ids)]]);
 }
 
+// Updates a DILP profile.
 function dilpUpdateProfile($id) {
     if (!is_numeric($id)) error('Invalid id.', 422);
     $bid = (int) $id;
@@ -608,6 +610,7 @@ function dilpUpdateProfile($id) {
     json(['status' => 'ok', 'message' => 'Profile updated.', 'data' => dilpBuildProfile($bid)]);
 }
 
+// Soft-deletes a DILP beneficiary.
 function dilpDeleteProfile($id) {
     if (!is_numeric($id)) error('Invalid id.', 422);
     $bid = (int) $id;
@@ -638,10 +641,8 @@ function dilpDeleteProfile($id) {
 }
 
 // ─── Assign / Unassign project ────────────────────────────────────────────────
-// dilp_project_beneficiaries has a UNIQUE constraint on beneficiary_service_id
-// alone — a DILP beneficiary can only ever be linked to one project at a time
-// (unlike TUPAD, which allows a running history). Reassigning upserts the row.
 
+// Assigns a beneficiary to a DILP project.
 function dilpAssignProject() {
     requireLogin();
     $d = body();
@@ -688,6 +689,7 @@ function dilpAssignProject() {
     json(['status' => 'ok', 'message' => 'Beneficiary assigned to project.']);
 }
 
+// Unassigns a beneficiary from a DILP project.
 function dilpUnassignProject() {
     requireLogin();
     $d = body();
@@ -721,6 +723,7 @@ function dilpUnassignProject() {
 
 // ─── Documents (applicant) ────────────────────────────────────────────────────
 
+// Saves attachment uploads for a DILP applicant.
 function dilpSyncDocuments($pdo, $bid, $bsId, $uid, $d) {
     $docs = is_array($d['attachedDocuments'] ?? null) ? $d['attachedDocuments'] : [];
 
@@ -768,6 +771,7 @@ function dilpSyncDocuments($pdo, $bid, $bsId, $uid, $d) {
     }
 }
 
+// Returns an applicant's saved attachments.
 function dilpFetchSavedDocuments($bid) {
     $s = db()->prepare(
         "SELECT document_id, document_type, title, file_name, file_path, file_size
@@ -788,6 +792,7 @@ function dilpFetchSavedDocuments($bid) {
 
 // ─── Documents (project) ──────────────────────────────────────────────────────
 
+// Saves attachment uploads for a DILP project.
 function dilpSyncProjectDocuments($pdo, $projectId, $uid, $docsPayload) {
     $docs = is_array($docsPayload) ? $docsPayload : [];
 
@@ -832,6 +837,7 @@ function dilpSyncProjectDocuments($pdo, $projectId, $uid, $docsPayload) {
     }
 }
 
+// Returns a project's saved attachments.
 function dilpFetchProjectDocuments($projectId) {
     $s = db()->prepare(
         "SELECT document_id, file_name, file_path, file_size
@@ -849,9 +855,10 @@ function dilpFetchProjectDocuments($projectId) {
 }
 
 // ═══════════════════════════════════════════════════════════════════════════════
-// RECYCLE BIN  (soft-deleted DILP beneficiaries) — mirrors spes.php's pattern.
+// RECYCLE BIN  (soft-deleted DILP beneficiaries)
 // ═══════════════════════════════════════════════════════════════════════════════
 
+// Maps each recycle-bin record type to its table and primary key.
 function dilpRecycleMap() {
     return [
         'dilpApplicant' => ['beneficiaries', 'beneficiary_id'],
@@ -859,6 +866,7 @@ function dilpRecycleMap() {
     ];
 }
 
+// Reads and validates {recordType, id} from the request body.
 function dilpRecycleTarget() {
     $d    = body();
     $type = $d['recordType'] ?? '';
@@ -868,9 +876,7 @@ function dilpRecycleTarget() {
     return [$type, $id];
 }
 
-// A human-readable name for an activity log line -- "#9" means nothing to
-// whoever reads it later; the applicant's actual name (or project name)
-// does. Must be looked up BEFORE the record is hard-deleted.
+// Returns a recycle-bin record's display name.
 function dilpRecordName($type, $id) {
     if ($type === 'dilpApplicant') {
         $s = db()->prepare(
@@ -886,6 +892,7 @@ function dilpRecordName($type, $id) {
     return $name !== false ? $name : "#{$id}";
 }
 
+// Returns the recycle bin contents for beneficiaries and projects.
 function dilpListDeleted() {
     dilpPurgeExpired();
     $s = db()->prepare(
@@ -933,6 +940,7 @@ function dilpListDeleted() {
     json(['status' => 'ok', 'data' => $items]);
 }
 
+// Restores a record from the recycle bin.
 function dilpRestoreRecord() {
     [$type, $id] = dilpRecycleTarget();
     [$table, $pk] = dilpRecycleMap()[$type];
@@ -946,10 +954,7 @@ function dilpRestoreRecord() {
     json(['status' => 'ok', 'message' => 'Record restored.']);
 }
 
-// Single place that knows how to actually hard-delete each recordType --
-// shared by dilpPurgeRecord() (one record, explicit admin action) and
-// dilpPurgeExpired() (bulk, automatic 30-day retention purge) so there's
-// never a second, drifting copy of this dispatch.
+// Permanently deletes a recycle-bin record by type.
 function dilpHardDeleteByType($type, $id) {
     if ($type === 'dilpApplicant') {
         dilpHardDeleteApplicant($id);
@@ -958,6 +963,7 @@ function dilpHardDeleteByType($type, $id) {
     }
 }
 
+// Permanently deletes a recycle-bin record.
 function dilpPurgeRecord() {
     [$type, $id] = dilpRecycleTarget();
     [$table, $pk] = dilpRecycleMap()[$type];
@@ -972,11 +978,7 @@ function dilpPurgeRecord() {
     json(['status' => 'ok', 'message' => 'Record permanently deleted.']);
 }
 
-// Auto-purges anything past the recycle bin's retention window (see
-// RECYCLE_BIN_RETENTION_DAYS in core/helpers.php). Called from
-// dilpListDeleted() so simply viewing the recycle bin enforces the "N days
-// left" countdown the UI already shows -- that display was cosmetic only
-// until this existed.
+// Purges recycle bin rows older than RECYCLE_BIN_RETENTION_DAYS (triggered by dilpListDeleted()).
 function dilpPurgeExpired() {
     $uid = currentUserId();
 
@@ -1014,9 +1016,7 @@ function dilpPurgeExpired() {
     }
 }
 
-// Permanently remove a DILP project and its uploaded files. Only reachable
-// for an already soft-deleted project, which dilpDeleteProject's in-use guard
-// already guaranteed has zero linked beneficiaries.
+// Permanently deletes a DILP project and its uploaded files.
 function dilpHardDeleteProject($id) {
     $docs = db()->prepare("SELECT file_path FROM attached_documents WHERE dilp_project_id=:id");
     $docs->execute([':id' => $id]);
@@ -1027,6 +1027,7 @@ function dilpHardDeleteProject($id) {
     db()->prepare("DELETE FROM dilp_projects WHERE dilp_project_id=:id")->execute([':id' => $id]);
 }
 
+// Permanently deletes a DILP applicant and all related data.
 function dilpHardDeleteApplicant($bid) {
     $pdo = db();
     try {

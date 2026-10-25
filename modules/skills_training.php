@@ -2,34 +2,17 @@
 // Skills Training: trainings/activities (skills_training_activities, each
 // carrying its own free-typed batch_name) -> participants
 // (skills_training_activity_participants), plus profiles (beneficiary spine +
-// skills_training_profiles + classification and skills_training_profile_options -- the
-// qualification/purpose choices, which share skills_training_options told apart by option_type).
-// Mirrors cdsp.php's activity->participant shape (the closest existing
-// precedent) rather than GIP/SPES's flat single-batch model.
-//
-// A training's batch used to point at a separate skills_training_batches
-// table by batch_id; migration 071 merged that table into this one (batch_name
-// is now just a plain required text field on the training) and dropped the
-// now-dead skills_training_profiles.batch_id column. See that migration for
-// the full rationale.
-//
-// Design notes (confirmed against the live schema before writing this):
-//  - skills_training_profiles has no derived "status" column for batch/activity
-//    assignment (unlike CDSP/GIP/SPES) -- assignment state is read live from
-//    skills_training_activity_participants each time, same spirit as DILP/TUPAD's
-//    fully-computed model.
-//  - skills_training_profiles.application_status (Accepted/Waitlisted) is a
-//    real, manually-set stored column (migration 038), reusing the shared
-//    application_status_enum already used by spes_profiles -- not derived.
-//  - Attendance (skills_training_activity_participants.attended) is tracked via
-//    stUpdateAttendance() below -- rows are inserted with attended=NULL and stay
-//    that way until staff mark it, and a Completed training only counts as a
-//    genuine completion (for Aging/job-placement eligibility) when attended=true.
+// skills_training_profiles + classification and skills_training_profile_options
+// for qualification/purpose choices). Assignment status is read live from
+// skills_training_activity_participants, not stored. Attendance is tracked via
+// stUpdateAttendance() below; a Completed training only counts toward
+// Aging/job-placement eligibility when attended=true.
 
 include_once __DIR__ . '/../core/helpers.php';
 include_once __DIR__ . '/../core/guard.php';
 include_once __DIR__ . '/../core/activity_log.php';
 
+// Routes a Skills Training action to its handler function.
 function handle($action, $id, $method)
 {
     switch ($action) {
@@ -66,16 +49,20 @@ function handle($action, $id, $method)
 
 // ─── Helpers ─────────────────────────────────────────────────────────────────
 
+// Trims a string, converting empty/blank to null.
 function stNullStr($v) {
     $s = is_string($v) ? trim($v) : $v;
     return ($s === '' || $s === null) ? null : $s;
 }
+// Validates and returns a YYYY-MM-DD date string, or null.
 function stDate($v) {
     $s = is_string($v) ? trim($v) : '';
     return preg_match('/^\d{4}-\d{2}-\d{2}$/', $s) ? $s : null;
 }
+// Converts a numeric value to int, or null.
 function stIntOrNull($v) { return is_numeric($v) ? (int)$v : null; }
 
+// Returns the Skills Training service_id (cached).
 function stServiceId() {
     static $sid = null;
     if ($sid !== null) return $sid;
@@ -85,11 +72,13 @@ function stServiceId() {
     return (int)$sid;
 }
 
+// Returns the base URL for serving uploaded files.
 function stUploadBaseUrl() {
     $host = $_SERVER['HTTP_HOST'] ?? 'localhost';
     return 'http://' . $host . '/epeso_backend/';
 }
 
+// Formats a byte count as a human-readable size.
 function stFormatBytes($bytes) {
     $bytes = (int) $bytes;
     if ($bytes <= 0) return '0 Bytes';
@@ -98,21 +87,23 @@ function stFormatBytes($bytes) {
     return round($bytes / pow(1024, $i), 2) . ' ' . $units[$i];
 }
 
+// Returns the valid classification values.
 function stValidClassifications() {
     return ['Student','Out of School Youth','Person with Disability','Employed','Unemployed','Women'];
 }
 
-// Frontend shows "PWD" as the checkbox label; the shared enum's real value is
-// "Person with Disability" (same mapping DILP/CDSP already use).
+// Normalizes the PWD checkbox label to its stored enum value.
 function stNormalizeClassification($c) {
     return $c === 'PWD' ? 'Person with Disability' : $c;
 }
+// Converts the stored classification enum back to its display label.
 function stDenormalizeClassification($c) {
     return $c === 'Person with Disability' ? 'PWD' : $c;
 }
 
 // ─── Trainings / Activities ───────────────────────────────────────────────────
 
+// Formats a training activity row for the frontend.
 function stFormatActivity($r) {
     return [
         'id'            => (int)$r['activity_id'],
@@ -134,6 +125,7 @@ function stFormatActivity($r) {
     ];
 }
 
+// Returns the list of training activities.
 function stListActivities() {
     $s = db()->query(
         "SELECT a.activity_id, a.batch_name, a.activity_title, a.description,
@@ -148,6 +140,7 @@ function stListActivities() {
     json(['status' => 'ok', 'data' => array_map('stFormatActivity', $s->fetchAll())]);
 }
 
+// Returns a single training activity by id.
 function stGetActivityById($id) {
     $s = db()->prepare(
         "SELECT a.activity_id, a.batch_name, a.activity_title, a.description,
@@ -163,6 +156,7 @@ function stGetActivityById($id) {
     return $r ? stFormatActivity($r) : null;
 }
 
+// Creates a new training activity.
 function stCreateActivity() {
     $d = body();
     if (stNullStr($d['title'] ?? '') === null) error('Training title is required.', 422);
@@ -186,6 +180,7 @@ function stCreateActivity() {
     json(['status' => 'ok', 'message' => 'Training created.', 'data' => stGetActivityById((int)$s->fetchColumn())]);
 }
 
+// Updates a training activity.
 function stUpdateActivity($id) {
     if (!is_numeric($id)) error('Invalid training id.', 422);
     $id = (int)$id;
@@ -220,6 +215,7 @@ function stUpdateActivity($id) {
     json(['status' => 'ok', 'message' => 'Training updated.', 'data' => stGetActivityById($id)]);
 }
 
+// Updates a training activity's status.
 function stUpdateActivityStatus($id) {
     if (!is_numeric($id)) error('Invalid training id.', 422);
     $d = body();
@@ -241,6 +237,7 @@ function stUpdateActivityStatus($id) {
     json(['status' => 'ok', 'message' => 'Status updated.', 'data' => stGetActivityById((int)$id)]);
 }
 
+// Deletes a training activity.
 function stDeleteActivity($id) {
     if (!is_numeric($id)) error('Invalid training id.', 422);
     $id = (int)$id;
@@ -259,6 +256,7 @@ function stDeleteActivity($id) {
 
 // ─── Participants (assign / unassign) ────────────────────────────────────────
 
+// Returns the participants assigned to a training activity.
 function stListActivityParticipants($activityId) {
     if (!is_numeric($activityId)) error('Invalid training id.', 422);
     $s = db()->prepare(
@@ -283,6 +281,7 @@ function stListActivityParticipants($activityId) {
     json(['status' => 'ok', 'data' => $out]);
 }
 
+// Records a participant's attendance for a training.
 function stUpdateAttendance() {
     $d      = body();
     $actId  = stIntOrNull($d['activityId'] ?? '');
@@ -294,9 +293,7 @@ function stUpdateAttendance() {
     json(['status' => 'ok', 'message' => 'Attendance updated.']);
 }
 
-// Every training a beneficiary has ever been assigned to (PESO allows availing
-// more than one), newest first -- stAddParticipant no longer deletes prior rows,
-// so this is the full record, not just the current/active one.
+// Returns every training a beneficiary has been assigned to.
 function stListTrainingHistory($bsId) {
     if (!is_numeric($bsId)) error('Invalid beneficiary service id.', 422);
     $s = db()->prepare(
@@ -321,13 +318,7 @@ function stListTrainingHistory($bsId) {
     json(['status' => 'ok', 'data' => $out]);
 }
 
-// Aging: for every beneficiary who has genuinely finished at least one training
-// (status Completed AND attended -- same rule used everywhere else in this file),
-// how long since their most recent completion, and whether a job placement has
-// been recorded since. One row per beneficiary_service_id, using LATERAL joins
-// (not a plain JOIN+DISTINCT ON) so picking "their latest completed training"
-// and "their latest job placement" independently can't cross-multiply into
-// duplicate/mismatched rows when someone has more than one of either.
+// Returns the Aging Report: time since last completed training and placement status.
 function stAgingReport() {
     $s = db()->prepare(
         "SELECT bs.beneficiary_service_id, b.last_name, b.first_name, b.middle_name, b.sex,
@@ -376,6 +367,7 @@ function stAgingReport() {
     json(['status' => 'ok', 'data' => $out]);
 }
 
+// Assigns an applicant to a training activity.
 function stAddParticipant() {
     $d = body();
     $actId = stIntOrNull($d['activityId'] ?? '');
@@ -424,6 +416,7 @@ function stAddParticipant() {
     json(['status' => 'ok', 'message' => 'Training assigned.']);
 }
 
+// Unassigns an applicant from a training activity.
 function stRemoveParticipant() {
     $d = body();
     $actId = stIntOrNull($d['activityId'] ?? '');
@@ -451,6 +444,7 @@ function stRemoveParticipant() {
 
 // ─── Lookup lists (Qualifications / Purposes) ────────────────────────────────
 
+// Returns the list of qualification options.
 function stListQualifications() {
     $s = db()->query("SELECT option_id, option_name FROM skills_training_options WHERE option_type='Qualification' AND is_active=true ORDER BY option_id");
     json(['status' => 'ok', 'data' => array_map(function($r) {
@@ -458,6 +452,7 @@ function stListQualifications() {
     }, $s->fetchAll())]);
 }
 
+// Returns the list of purpose options.
 function stListPurposes() {
     $s = db()->query("SELECT option_id, option_name FROM skills_training_options WHERE option_type='Purpose' AND is_active=true ORDER BY option_id");
     json(['status' => 'ok', 'data' => array_map(function($r) {
@@ -467,6 +462,7 @@ function stListPurposes() {
 
 // ─── Documents (applicant) ────────────────────────────────────────────────────
 
+// Saves attachment uploads for a Skills Training applicant.
 function stSyncDocuments($pdo, $bid, $bsId, $uid, $d) {
     $docs = is_array($d['attachedDocuments'] ?? null) ? $d['attachedDocuments'] : [];
 
@@ -514,6 +510,7 @@ function stSyncDocuments($pdo, $bid, $bsId, $uid, $d) {
     }
 }
 
+// Returns an applicant's saved attachments.
 function stFetchSavedDocuments($bid) {
     $s = db()->prepare(
         "SELECT document_id, document_type, title, file_name, file_path, file_size
@@ -531,6 +528,7 @@ function stFetchSavedDocuments($bid) {
 
 // ─── Profiles ─────────────────────────────────────────────────────────────────
 
+// Builds the full Skills Training profile for display.
 function stBuildProfile($bid) {
     $s = db()->prepare(
         "SELECT b.*, bgy.barangay_name, c.city_name, p.province_name, r.region_name,
@@ -598,7 +596,6 @@ function stBuildProfile($bid) {
     // alone would pick whichever training happens to have been CREATED most
     // recently, which isn't necessarily the one they're actually in now (e.g.
     // reassigned into an older, still-Planned training after a newer one).
-    // Mirrors cdspBuildProfile()'s identical $currentAct logic.
     $assignS = db()->prepare(
         "SELECT a.activity_id, a.activity_title, a.status, p.attended
          FROM skills_training_activity_participants p
@@ -687,6 +684,7 @@ function stBuildProfile($bid) {
     ];
 }
 
+// Returns the list of Skills Training profiles.
 function stListProfiles() {
     $s = db()->prepare(
         "SELECT b.beneficiary_id
@@ -704,6 +702,7 @@ function stListProfiles() {
     json(['status' => 'ok', 'data' => $out]);
 }
 
+// Returns a single Skills Training profile.
 function stGetProfile($id) {
     if (!is_numeric($id)) error('Invalid id.', 422);
     $p = stBuildProfile((int)$id);
@@ -711,8 +710,7 @@ function stGetProfile($id) {
     json(['status' => 'ok', 'data' => $p]);
 }
 
-// Insert classification/qualification/purpose junction rows for a profile.
-// Shared by create + update (update calls this after clearing old rows).
+// Inserts classification/qualification/purpose rows for a profile.
 function stSyncSelections($pdo, $bid, $profileId, $d) {
     $validCls = stValidClassifications();
     $rawCls   = is_array($d['classification'] ?? null) ? $d['classification'] : [];
@@ -761,8 +759,7 @@ function stSyncSelections($pdo, $bid, $profileId, $d) {
     }
 }
 
-// Required-field + enum validation, shared by the single-record create and
-// the bulk import. Returns an error string, or '' if valid.
+// Validates Skills Training profile input, returning an error string or ''.
 function stValidateProfile($d) {
     if (stNullStr($d['firstName'] ?? '') === null) return 'First name is required.';
     if (stNullStr($d['lastName'] ?? '')  === null) return 'Last name is required.';
@@ -778,8 +775,7 @@ function stValidateProfile($d) {
     return '';
 }
 
-// Insert one profile's full beneficiary spine. Shared by the single-record
-// create and the bulk import.
+// Inserts one profile's full beneficiary spine.
 function stInsertProfileRow($pdo, $uid, $d) {
     $sex   = $d['sex'];
     $birth = stDate($d['birthdate'] ?? '');
@@ -814,6 +810,7 @@ function stInsertProfileRow($pdo, $uid, $d) {
     return $bid;
 }
 
+// Creates a new Skills Training profile.
 function stCreateProfile() {
     $uid = requireLogin();
     $d   = body();
@@ -833,11 +830,7 @@ function stCreateProfile() {
     json(['status' => 'ok', 'message' => 'Profile saved.', 'data' => stBuildProfile($bid)]);
 }
 
-// POST /api/skills_training/importProfilesBulk   body = { rows: object[] }
-//
-// All-or-nothing bulk import: every row is validated up front, then the
-// whole batch is written inside ONE transaction. If any row fails validation
-// or the insert throws partway through, everything is rolled back.
+// Bulk-imports Skills Training profiles.
 function stImportProfilesBulk() {
     $uid  = requireLogin();
     $body = body();
@@ -874,6 +867,7 @@ function stImportProfilesBulk() {
     json(['status' => 'ok', 'message' => 'Profiles saved.', 'data' => ['ids' => $ids, 'count' => count($ids)]]);
 }
 
+// Updates a Skills Training profile.
 function stUpdateProfile($id) {
     if (!is_numeric($id)) error('Invalid id.', 422);
     $uid = requireLogin();
@@ -969,6 +963,7 @@ function stUpdateProfile($id) {
     json(['status' => 'ok', 'message' => 'Profile updated.', 'data' => stBuildProfile($bid)]);
 }
 
+// Soft-deletes a Skills Training applicant.
 function stDeleteProfile($id) {
     if (!is_numeric($id)) error('Invalid id.', 422);
     $bid = (int)$id;
@@ -998,9 +993,10 @@ function stDeleteProfile($id) {
 }
 
 // ═══════════════════════════════════════════════════════════════════════════════
-// RECYCLE BIN (soft-deleted Skills Training applicants) — mirrors cdsp.php's pattern.
+// RECYCLE BIN (soft-deleted Skills Training applicants)
 // ═══════════════════════════════════════════════════════════════════════════════
 
+// Maps each recycle-bin record type to its table and primary key.
 function stRecycleMap() {
     return [
         'skillsTrainingApplicant' => ['beneficiaries', 'beneficiary_id'],
@@ -1008,6 +1004,7 @@ function stRecycleMap() {
     ];
 }
 
+// Reads and validates {recordType, id} from the request body.
 function stRecycleTarget() {
     $d    = body();
     $type = $d['recordType'] ?? '';
@@ -1017,9 +1014,7 @@ function stRecycleTarget() {
     return [$type, $id];
 }
 
-// A human-readable name for an activity log line -- "#9" means nothing to
-// whoever reads it later; the applicant's actual name (or batch/activity
-// name) does. Must be looked up BEFORE the record is hard-deleted.
+// Returns a recycle-bin record's display name.
 function stRecordName($type, $id) {
     if ($type === 'skillsTrainingApplicant') {
         $s = db()->prepare(
@@ -1035,6 +1030,7 @@ function stRecordName($type, $id) {
     return $name !== false ? $name : "#{$id}";
 }
 
+// Returns the recycle bin contents for applicants and activities.
 function stListDeleted() {
     stPurgeExpired();
     $s = db()->prepare(
@@ -1074,6 +1070,7 @@ function stListDeleted() {
     json(['status' => 'ok', 'data' => $items]);
 }
 
+// Restores a record from the recycle bin.
 function stRestoreRecord() {
     [$type, $id] = stRecycleTarget();
     [$table, $pk] = stRecycleMap()[$type];
@@ -1085,10 +1082,7 @@ function stRestoreRecord() {
     json(['status' => 'ok', 'message' => 'Record restored.']);
 }
 
-// Single place that knows how to actually hard-delete each recordType --
-// shared by stPurgeRecord() (one record, explicit admin action) and
-// stPurgeExpired() (bulk, automatic 30-day retention purge) so there's
-// never a second, drifting copy of this dispatch.
+// Permanently deletes a recycle-bin record by type.
 function stHardDeleteByType($type, $id) {
     if ($type === 'skillsTrainingApplicant') {
         stHardDeleteApplicant($id);
@@ -1097,6 +1091,7 @@ function stHardDeleteByType($type, $id) {
     }
 }
 
+// Permanently deletes a recycle-bin record.
 function stPurgeRecord() {
     [$type, $id] = stRecycleTarget();
     [$table, $pk] = stRecycleMap()[$type];
@@ -1109,11 +1104,7 @@ function stPurgeRecord() {
     json(['status' => 'ok', 'message' => 'Record permanently deleted.']);
 }
 
-// Auto-purges anything past the recycle bin's retention window (see
-// RECYCLE_BIN_RETENTION_DAYS in core/helpers.php). Called from
-// stListDeleted() so simply viewing the recycle bin enforces the "N days
-// left" countdown the UI already shows -- that display was cosmetic only
-// until this existed.
+// Retention sweep: hard-deletes recycle bin rows older than RECYCLE_BIN_RETENTION_DAYS. Run from stListDeleted().
 function stPurgeExpired() {
     $uid = currentUserId();
 
@@ -1153,6 +1144,7 @@ function stPurgeExpired() {
     }
 }
 
+// Permanently deletes a Skills Training applicant and all related data.
 function stHardDeleteApplicant($bid) {
     $pdo = db();
     try {

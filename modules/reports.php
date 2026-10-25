@@ -1,20 +1,14 @@
 <?php
-// Cross-program aggregates for the General PESO Report.
-//
-// Every program module (EF, CDSP, GIP, SPES, DILP/TUPAD/SLP/CLPEP, Skills
-// Training, OFW) threads its applicants through the shared beneficiaries /
-// beneficiary_services spine, disambiguated by beneficiary_services.service_id
-// -> services.service_code. That means a single grouped query gets every
-// program's participant headcount (and sex split) at once, and a genuine
-// unique-client count (a person counted once even if they used two programs)
-// is just COUNT(DISTINCT beneficiary_id) over the same rows.
-//
-// "Activities conducted" has no shared schema across modules though, so each
-// program's own batches/activities/projects table is counted separately.
+// Cross-program aggregates for the General PESO Report. Every program's
+// applicants share the beneficiaries/beneficiary_services spine, so headcounts
+// and unique-client counts come from one grouped query over that spine.
+// "Activities conducted" has no shared schema, so each program's own
+// batches/activities/projects table is counted separately.
 
 include_once __DIR__ . '/../core/helpers.php';
 include_once __DIR__ . '/../core/guard.php';
 
+// Routes a reports action to its handler function.
 function handle($action, $id, $method)
 {
     switch ($action) {
@@ -26,13 +20,7 @@ function handle($action, $id, $method)
     }
 }
 
-// Program key (matches the frontend's report category ids) -> display label,
-// the service_code(s) that roll up into it (Livelihood combines 4 programs),
-// and the table/date-column used to count "activities conducted" for it.
-// null activityTable means the concept doesn't apply (OFW: every row IS the
-// request, there's no separate "activity"). jobPlacements => true means the
-// program records placements in the shared job_placements table (EF has its
-// own employment_facilitation_placements table instead, handled separately).
+// Returns metadata (label, service codes, activity table) for each report program.
 function reportPrograms()
 {
     return [
@@ -56,13 +44,7 @@ function reportPrograms()
     ];
 }
 
-// Expands a top-level program service_code to include any CHILD service codes
-// recorded under it via parent_service_id — CDSP applicants are stored
-// against its child services (Career Coaching, Pre-Employment Coaching, Labor
-// Employment for Graduating Students), never against the CDSP row itself, and
-// those child services are admin-editable rows (not a fixed list), so this
-// resolves live rather than hardcoding the current child codes. Every other
-// program has no children, so this just returns [that program's own code].
+// Expands a top-level program service code to include its child service codes.
 function reportsExpandServiceCode($topCode)
 {
     $stmt = db()->prepare(
@@ -74,10 +56,7 @@ function reportsExpandServiceCode($topCode)
     return array_column($stmt->fetchAll(), 'service_code');
 }
 
-// COUNT(*) rows in a single-table "activity" (batch/session/project) whose
-// date column falls in [from, to]. Every one of these tables has a deleted_at
-// soft-delete column EXCEPT vacancies, which has none (matches
-// efReportVacancyCount()'s existing query in employment.php).
+// Counts rows in an activity table whose date column falls within a date range.
 function reportsCountActivities($table, $dateCol, $from, $to)
 {
     $deletedClause = $table === 'vacancies' ? '' : 'deleted_at IS NULL AND ';
@@ -88,13 +67,7 @@ function reportsCountActivities($table, $dateCol, $from, $to)
     return (int) $stmt->fetchColumn();
 }
 
-// GET /api/reports/summary?from=&to=&programs=cdsp,gip,...
-//   (or ?year=&month= — see resolveReportWindow())
-// programs is a comma-separated list of the keys from reportPrograms(); if
-// omitted, defaults to every program. Returns per-program participant counts
-// (sex-disaggregated), activities conducted, and a true unique-client count
-// across whichever programs were selected — all read live from the database,
-// nothing hardcoded or seeded.
+// Returns per-program participant, activity, and placement counts for a date range.
 function reportsSummary()
 {
     $window = resolveReportWindow();

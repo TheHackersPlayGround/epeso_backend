@@ -1,7 +1,7 @@
 <?php
 // Session check + role gate. Reused by protected modules.
 
-// Ensure the PHP session is started, then return the logged-in user id (or null).
+// Returns the logged-in user id, or null.
 function currentUserId()
 {
     if (session_status() !== PHP_SESSION_ACTIVE) {
@@ -10,9 +10,7 @@ function currentUserId()
     return isset($_SESSION['user_id']) ? (int) $_SESSION['user_id'] : null;
 }
 
-// Session-only check: is there a logged-in session? No database access, so it
-// is safe for the few read-only endpoints that must keep working while the
-// database is mid-restore (see requireAdminSessionOnly()).
+// Stops the request unless a session is logged in.
 function requireSession()
 {
     $id = currentUserId();
@@ -22,14 +20,7 @@ function requireSession()
     return $id;
 }
 
-// Stop the request unless someone is logged in AND their account is still
-// Active. An administrator setting a user to Inactive (or deleting them) must
-// take effect on the very next request, not only at their next login -- the
-// session they already hold would otherwise stay valid. Deleted and merely-
-// deactivated are reported with different detail codes so the app can tell
-// the signed-out user which one actually happened, rather than a generic
-// "deactivated" for both.
-// Returns the user id.
+// Stops the request unless the logged-in user's account is active.
 function requireLogin()
 {
     $id = requireSession();
@@ -54,7 +45,7 @@ function requireLogin()
     return $id;
 }
 
-// Stop the request unless the logged-in user is an Administrator. Returns the user id.
+// Stops the request unless the logged-in user is an Administrator.
 function requireAdmin()
 {
     $id = requireLogin();
@@ -67,16 +58,7 @@ function requireAdmin()
     return $id;
 }
 
-// Same admin gate, but reads the role cached in the session at login instead
-// of querying the users table. Use this ONLY for read-only polling endpoints
-// that must keep working while the database itself is mid-operation and
-// temporarily unqueryable -- e.g. backup restoreProgress, which is polled
-// throughout a restore that drops and reloads the very schema the users
-// table lives in. A normal requireAdmin() there would hang or error out for
-// the whole restore, since its DB query targets a table being torn down.
-// Trade-off: a demoted admin keeps this narrow, non-sensitive access (step
-// number + phase label, nothing else) until they next log in. Every other
-// admin-gated action still uses the live, DB-backed requireAdmin() above.
+// Stops the request unless the session's cached role is Administrator.
 function requireAdminSessionOnly()
 {
     $id = requireSession();
@@ -87,18 +69,7 @@ function requireAdminSessionOnly()
 }
 
 
-// Module-level permission gate. Mirrors the frontend canManage()/canView() rules.
-//
-//   $module  one of the 11 dashboard keys: 'employment','cdsp','gip','spes',
-//            'livelihood','skills','ofw','documents','maintenance','security','report'
-//   $level   'Viewer'  -> user may read the module (Viewer OR Editor row)
-//            'Editor'  -> user may add/edit/delete (Editor row required)
-//
-// Administrators always pass. Returns the user id so callers can use it.
-//
-// Usage inside a module:
-//   requirePermission('cdsp', 'Viewer');   // for GET/list/read endpoints
-//   requirePermission('cdsp', 'Editor');   // for create/update/delete endpoints
+// Stops the request unless the user has the required permission level for a module.
 function requirePermission($module, $level = 'Viewer')
 {
     $id = requireLogin();
