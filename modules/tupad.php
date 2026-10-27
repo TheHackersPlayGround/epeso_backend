@@ -184,6 +184,15 @@ function tupadCreateProject() {
     json(['status' => 'ok', 'message' => 'Project created.', 'data' => tupadGetProjectById($id)]);
 }
 
+// Stamps each assignment's own completion date, once, the first time its project is marked Completed.
+function tupadStampCompletion($pdo, $projectId, $newStatus) {
+    if ($newStatus !== 'Completed') return;
+    $pdo->prepare(
+        "UPDATE tupad_project_beneficiaries SET completed_at=now()
+         WHERE project_id=:id AND exited_at IS NULL AND completed_at IS NULL"
+    )->execute([':id' => $projectId]);
+}
+
 // Updates a TUPAD project.
 function tupadUpdateProject($id) {
     if (!is_numeric($id)) error('Invalid project id.', 422);
@@ -209,6 +218,7 @@ function tupadUpdateProject($id) {
         ':amt' => tupadMoneyOrNull($d['assistanceAmount'] ?? null), ':dtrel' => tupadDate($d['dateReleased'] ?? ''),
         ':id' => $id,
     ]);
+    tupadStampCompletion($pdo, $id, $status);
 
     tupadSyncProjectDocuments($pdo, $id, $uid, $d['documents'] ?? []);
     logActivity($uid, 'Update Project', 'livelihood-maintenance', "Updated project: {$title}");
@@ -229,9 +239,9 @@ function tupadUpdateProjectStatus($id) {
     $projTitle = $chk->fetchColumn();
     if ($projTitle === false) error('Project not found.', 404);
 
-    // No cascade write needed: beneficiary status is derived at read time from
-    // this same status column.
-    db()->prepare("UPDATE tupad_projects SET status=:s, updated_at=now() WHERE project_id=:id")->execute([':s' => $status, ':id' => $id]);
+    $pdo = db();
+    $pdo->prepare("UPDATE tupad_projects SET status=:s, updated_at=now() WHERE project_id=:id")->execute([':s' => $status, ':id' => $id]);
+    tupadStampCompletion($pdo, $id, $status);
     logActivity(currentUserId(), 'Update Project Status', 'livelihood-maintenance', "Set project '{$projTitle}' status to {$status}");
     json(['status' => 'ok', 'message' => 'Status updated.', 'data' => tupadGetProjectById($id)]);
 }
@@ -308,8 +318,8 @@ function tupadBuildProfile($bid) {
     if (!$b) return null;
     $bsId = (int) $b['beneficiary_service_id'];
 
-    // Current assignment = most recently assigned row; older rows (if any)
-    // survive as history rather than being deleted on reassignment.
+    // History stays in plain assignment order (newest first); older rows
+    // survive rather than being deleted on reassignment.
     $histS = db()->prepare(
         "SELECT tpb.*, tp.title, tp.status
          FROM tupad_project_beneficiaries tpb
@@ -319,14 +329,20 @@ function tupadBuildProfile($bid) {
     );
     $histS->execute([':bsid' => $bsId]);
     $history = $histS->fetchAll();
-    $current = $history[0] ?? null;
+
+    // The most recently-assigned row isn't always the active one -- an older
+    // project can be reopened after a newer one already finished.
+    $liveRows = array_values(array_filter($history, function ($h) {
+        return empty($h['exited_at']) && $h['status'] !== 'Completed';
+    }));
+    $current = $liveRows[0] ?? ($history[0] ?? null);
 
     $assignmentHistory = array_map(function ($h) {
         return [
             'projectId'     => (int) $h['project_id'],
             'projectName'   => $h['title'],
             'assignedDate'  => $h['assigned_at'],
-            'completedDate' => ($h['status'] === 'Completed' && empty($h['exited_at'])) ? $h['assigned_at'] : null,
+            'completedDate' => $h['completed_at'] ?? null,
             'exitedAt'      => $h['exited_at'] ?? null,
             'exitReason'    => $h['exit_reason'] ?? '',
         ];
@@ -549,7 +565,8 @@ function tupadDeleteProfile($id) {
          JOIN tupad_project_beneficiaries tpb ON tpb.beneficiary_service_id = bs.beneficiary_service_id
          JOIN tupad_projects tp ON tp.project_id = tpb.project_id
          WHERE bs.beneficiary_id = :bid AND bs.service_id = :sid
-         ORDER BY tpb.assigned_at DESC, tpb.project_beneficiary_id DESC LIMIT 1"
+         ORDER BY (CASE WHEN tpb.exited_at IS NULL AND tp.status != 'Completed' THEN 0 ELSE 1 END),
+                  tpb.assigned_at DESC, tpb.project_beneficiary_id DESC LIMIT 1"
     );
     $chk->execute([':bid' => $bid, ':sid' => tupadServiceId()]);
     $projStatus = $chk->fetchColumn();
@@ -626,7 +643,8 @@ function tupadUnassignProject() {
          JOIN tupad_project_beneficiaries tpb ON tpb.beneficiary_service_id = bs.beneficiary_service_id
          JOIN tupad_projects tp ON tp.project_id = tpb.project_id
          WHERE bs.beneficiary_id=:bid AND bs.service_id=:sid
-         ORDER BY tpb.assigned_at DESC, tpb.project_beneficiary_id DESC LIMIT 1"
+         ORDER BY (CASE WHEN tpb.exited_at IS NULL AND tp.status != 'Completed' THEN 0 ELSE 1 END),
+                  tpb.assigned_at DESC, tpb.project_beneficiary_id DESC LIMIT 1"
     );
     $row->execute([':bid' => $bid, ':sid' => tupadServiceId()]);
     $r = $row->fetch();
@@ -668,7 +686,8 @@ function tupadWithdrawFromProject() {
          JOIN tupad_project_beneficiaries tpb ON tpb.beneficiary_service_id = bs.beneficiary_service_id
          JOIN tupad_projects tp ON tp.project_id = tpb.project_id
          WHERE bs.beneficiary_id = :bid AND bs.service_id = :sid AND b.deleted_at IS NULL
-         ORDER BY tpb.assigned_at DESC, tpb.project_beneficiary_id DESC LIMIT 1"
+         ORDER BY (CASE WHEN tpb.exited_at IS NULL AND tp.status != 'Completed' THEN 0 ELSE 1 END),
+                  tpb.assigned_at DESC, tpb.project_beneficiary_id DESC LIMIT 1"
     );
     $q->execute([':bid' => $bid, ':sid' => tupadServiceId()]);
     $r = $q->fetch();
