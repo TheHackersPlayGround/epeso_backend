@@ -290,9 +290,7 @@ function spesDeleteBatch($id) {
     if (!is_numeric($id)) error('Invalid batch id.', 422);
     $id = (int) $id;
 
-    // spes_profiles.batch_id is the only record that a deployment happened
-    // (no participants junction table) — block deletion outright rather than
-    // nulling profiles out to allow it.
+    // batch_id is the only record a deployment happened; block deletion rather than nulling it out.
     $cntS = db()->prepare("SELECT COUNT(*) FROM spes_profiles WHERE batch_id=:id");
     $cntS->execute([':id' => $id]);
     $cnt = (int) $cntS->fetchColumn();
@@ -373,9 +371,7 @@ function spesBuildProfile($bid) {
         if ($row['classification'] === 'Other') { $classificationOther = $row['classification_other'] ?? ''; break; }
     }
 
-    // spes_profiles.batch_id is a single direct FK (no assignment-history
-    // table), so we can only ever surface a 0-or-1-entry "history" from the
-    // live link — same constraint as GIP.
+    // batch_id is a single direct FK (no history table), so history is only ever 0-or-1 entry.
     $assignmentHistory = [];
     $batchId = isset($sp['batch_id']) ? $sp['batch_id'] : null;
     if ($batchId) {
@@ -675,9 +671,8 @@ function spesAssignBatch() {
     if (!$spId) error('SPES profile not found.', 404);
     $spId = (int) $spId;
 
-    // Same rule as unassign: once the applicant's current batch has moved past
-    // Planned, there's no history table to fall back on — batch_id is the only
-    // record that assignment ever happened, so reassigning would erase it.
+    // Same rule as unassign: once the batch moves past Planned, batch_id is the only record
+    // of assignment, so reassigning would erase it.
     $curS = db()->prepare(
         "SELECT spb.status FROM spes_profiles sp
          LEFT JOIN spes_batches spb ON spb.batch_id = sp.batch_id
@@ -726,10 +721,8 @@ function spesUnassignBatch() {
     $r = $row->fetch();
     if (!$r || !$r['spes_profile_id']) error('SPES profile not found.', 404);
 
-    // spes_profiles.batch_id is the only place an assignment is recorded (no
-    // separate history table) — once the batch has moved past Planned
-    // (Ongoing or Completed), unassigning would silently erase the only
-    // record that this applicant was ever part of it.
+    // batch_id is the only place an assignment is recorded; past Planned, unassigning would
+    // silently erase the only record it happened.
     if ($r['batch_status'] !== 'Planned') {
         error('This batch is no longer Planned — unassigning would erase the only record of this assignment.', 409);
     }
@@ -923,9 +916,7 @@ function spesFetchBatchDocuments($batchId) {
     }, $s->fetchAll());
 }
 
-// ═══════════════════════════════════════════════════════════════════════════════
-// RECYCLE BIN  (soft-deleted SPES applicants)
-// ═══════════════════════════════════════════════════════════════════════════════
+// Recycle bin for soft-deleted SPES applicants.
 
 // Maps each recycle-bin record type to its table and primary key.
 function spesRecycleMap() {
@@ -1051,10 +1042,8 @@ function spesPurgeRecord() {
 function spesPurgeExpired() {
     $uid = currentUserId();
 
-    // Applicants: beneficiaries.deleted_at is a SHARED column (one row per
-    // person, not per-service) -- an unscoped query here would let SPES's
-    // sweep pick up and hard-delete someone who actually belongs to a
-    // different module. Scoped exactly like spesListDeleted().
+    // beneficiaries.deleted_at is shared across modules; scoped exactly like spesListDeleted()
+    // to avoid hard-deleting someone from a different module.
     $appS = db()->prepare(
         "SELECT b.beneficiary_id AS id
          FROM beneficiaries b

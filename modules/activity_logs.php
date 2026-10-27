@@ -1,12 +1,6 @@
 <?php
-// Activity Logs: read-only audit trail of meaningful actions app-wide.
-// Rows are written via core/activity_log.php's logActivity() helper from
-// every module's login/create/update/delete/status-change/user-management
-// call sites -- this module only lists them (matching every other list
-// endpoint in this app, search/filter/sort/pagination all happen
-// client-side against the full list, not as query-string params here).
-// Never editable or individually deletable -- an audit trail that could be
-// tampered with piecemeal wouldn't be trustworthy.
+// Read-only audit trail of app-wide actions, written via logActivity().
+// Never editable or deletable.
 
 include_once __DIR__ . '/../core/helpers.php';
 include_once __DIR__ . '/../core/guard.php';
@@ -32,9 +26,7 @@ function activityLogsList()
         return [
             'id'        => (int) $r['activity_log_id'],
             'timestamp' => $r['created_at'],
-            // activity_logs.user_id is ON DELETE SET NULL (not CASCADE)
-            // specifically so a purged account's history survives -- this
-            // is the one place that matters.
+            // user_id is ON DELETE SET NULL so a purged account's history survives.
             'user'      => $r['username'] ?? '(deleted user)',
             'role'      => $r['role'] ?? '',
             'action'    => $r['action'],

@@ -1,9 +1,6 @@
 <?php
-// TUPAD: projects (tupad_projects) + profiles (beneficiary spine, no dedicated
-// profile table, no classification/4Ps fields). tupad_project_beneficiaries
-// keeps a running history of project assignments; "current" is the most
-// recent row. Status is derived at read time from that assignment's project
-// status: Inactive (none), Active (Planned/Ongoing), Completed (Completed).
+// TUPAD: projects + beneficiary spine (no dedicated profile table). Status is
+// derived at read time from the current assignment's project status.
 
 include_once __DIR__ . '/../core/helpers.php';
 include_once __DIR__ . '/../core/guard.php';
@@ -142,10 +139,8 @@ function tupadValidateProjectInput($d, $excludeId = null) {
     $slots = wholeNumberOrNull($d['participants'] ?? null);
     if ($slots === null || $slots < 1) error('Number of Participants must be a whole number of at least 1.', 422);
 
-    // The same kind of work can run on the same day in different places, but not twice in
-    // the same place on the same day: block a project whose title (ignoring case and
-    // spacing), date and location all match an existing one. Deleted projects (Recycle Bin)
-    // don't count. A project with no location counts as one place too.
+    // Blocks a project whose title (ignoring case/spacing), date, and location all match an
+    // existing non-deleted one; no location still counts as one place.
     $location = tupadNullStr($d['location'] ?? '');
     $sameS = db()->prepare(
         "SELECT 1 FROM tupad_projects
@@ -638,9 +633,8 @@ function tupadUnassignProject() {
     if (!$r) error('This beneficiary is not currently assigned to a project.', 404);
     if (!empty($r['exited_at'])) error('This beneficiary was marked as withdrawn from this project — that record cannot be unassigned.', 409);
 
-    // Only the current (most recent) assignment can be undone, and only while
-    // its project is still Planned — once it has moved on, this row is the
-    // sole record that the assignment happened at all.
+    // Only the current assignment can be undone, and only while its project is still
+    // Planned; past that, this row is the sole record the assignment happened.
     if ($r['project_status'] !== 'Planned') {
         error('This project is no longer Planned — unassigning would erase the only record of this assignment.', 409);
     }
@@ -833,9 +827,7 @@ function tupadFetchProjectDocuments($projectId) {
     }, $s->fetchAll());
 }
 
-// ═══════════════════════════════════════════════════════════════════════════════
-// RECYCLE BIN  (soft-deleted TUPAD beneficiaries)
-// ═══════════════════════════════════════════════════════════════════════════════
+// Recycle bin for soft-deleted TUPAD beneficiaries.
 
 // Maps each recycle-bin record type to its table and primary key.
 function tupadRecycleMap() {
@@ -961,10 +953,8 @@ function tupadPurgeRecord() {
 function tupadPurgeExpired() {
     $uid = currentUserId();
 
-    // Applicants: beneficiaries.deleted_at is a SHARED column (one row per
-    // person, not per-service) -- an unscoped query here would let TUPAD's
-    // sweep pick up and hard-delete someone who actually belongs to a
-    // different module. Scoped exactly like tupadListDeleted().
+    // beneficiaries.deleted_at is shared across modules; scoped exactly like tupadListDeleted()
+    // to avoid hard-deleting someone from a different module.
     $appS = db()->prepare(
         "SELECT b.beneficiary_id AS id
          FROM beneficiaries b

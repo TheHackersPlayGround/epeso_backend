@@ -1,11 +1,6 @@
 <?php
-// DILP: projects (dilp_projects) + profiles (beneficiary spine, no dedicated
-// profile table — every remaining field lives on beneficiaries /
-// beneficiary_services / the shared classifications & documents tables).
-//
-// Beneficiary status is NOT stored: it's derived at read time from whether a
-// project is assigned and that project's own status (Planned/Ongoing -> Active,
-// Completed -> Completed, none or Cancelled -> Inactive). See dilpDeriveStatus().
+// DILP: projects + profiles (beneficiary spine, no dedicated profile table).
+// Beneficiary status is not stored: derived at read time from project status (see dilpDeriveStatus()).
 
 include_once __DIR__ . '/../core/helpers.php';
 include_once __DIR__ . '/../core/guard.php';
@@ -181,9 +176,7 @@ function dilpValidateProjectInput($d, $excludeId = null) {
     $name  = trim($d['projectName'] ?? '');
     if ($name === '')  error('Project Name is required.', 422);
 
-    // Project ID Number is optional: DOLE assigns it, so staff often don't have it yet.
-    // Blank is stored as NULL (not '') so many projects can leave it empty -- the UNIQUE
-    // constraint only compares real values.
+    // Project ID Number is optional; blank stored as NULL so the UNIQUE constraint only compares real values.
     if ($idNum === '') {
         $idNum = null;
     } else {
@@ -207,9 +200,7 @@ function dilpValidateProjectInput($d, $excludeId = null) {
     // Project location is required: the barangay is what tells same-named projects apart.
     if (!$bgyId) error('Barangay is required.', 422);
 
-    // The same project name can run in many barangays, but not twice in the same one
-    // (names compared ignoring case and spacing; a project with no barangay counts as
-    // one place too). Deleted projects (Recycle Bin) don't count.
+    // Same project name can run in many barangays, but not twice in the same one; deleted projects don't count.
     $sameS = db()->prepare(
         "SELECT 1 FROM dilp_projects
          WHERE deleted_at IS NULL AND lower(btrim(project_name)) = lower(:n)
@@ -659,10 +650,8 @@ function dilpAssignProject() {
     if (!$bsId) error('DILP profile not found.', 404);
     $bsId = (int) $bsId;
 
-    // Same rule as unassign: once the beneficiary's current project has moved
-    // past Planned, there's no history table to fall back on (unlike TUPAD) —
-    // this junction row is the only record that assignment ever happened, so
-    // reassigning would erase it.
+    // Same rule as unassign: once the current project moves past Planned, this junction row
+    // is the only record the assignment happened, so reassigning would erase it.
     $curS = db()->prepare(
         "SELECT dproj.status FROM dilp_project_beneficiaries dpb
          JOIN dilp_projects dproj ON dproj.dilp_project_id = dpb.dilp_project_id
@@ -707,9 +696,7 @@ function dilpUnassignProject() {
     $r = $row->fetch();
     if (!$r) error('This beneficiary is not currently assigned to a project.', 404);
 
-    // dilp_project_beneficiaries is the only place an assignment is recorded
-    // (no separate history table) — once the project has moved past Planned,
-    // unassigning would silently erase the only record it ever happened.
+    // No separate history table; once past Planned, unassigning would erase the only record.
     if ($r['project_status'] !== 'Planned') {
         error('This project is no longer Planned — unassigning would erase the only record of this assignment.', 409);
     }
@@ -854,9 +841,7 @@ function dilpFetchProjectDocuments($projectId) {
     }, $s->fetchAll());
 }
 
-// ═══════════════════════════════════════════════════════════════════════════════
-// RECYCLE BIN  (soft-deleted DILP beneficiaries)
-// ═══════════════════════════════════════════════════════════════════════════════
+// Recycle bin (soft-deleted DILP beneficiaries)
 
 // Maps each recycle-bin record type to its table and primary key.
 function dilpRecycleMap() {
@@ -982,10 +967,8 @@ function dilpPurgeRecord() {
 function dilpPurgeExpired() {
     $uid = currentUserId();
 
-    // Applicants: beneficiaries.deleted_at is a SHARED column (one row per
-    // person, not per-service) -- an unscoped query here would let DILP's
-    // sweep pick up and hard-delete someone who actually belongs to a
-    // different module. Scoped exactly like dilpListDeleted().
+    // beneficiaries.deleted_at is shared across modules, so scope by service_id
+    // to avoid purging someone belonging to a different module.
     $appS = db()->prepare(
         "SELECT b.beneficiary_id AS id
          FROM beneficiaries b

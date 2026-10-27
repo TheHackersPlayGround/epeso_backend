@@ -1,7 +1,5 @@
 <?php
-// Region -> province -> city -> barangay cascade (read-only)
-// Used by address fields across the app. The barangay search returns the full
-// region/province/city context so duplicate barangay names are distinguishable.
+// Region -> province -> city -> barangay cascade (read-only), used by address fields app-wide.
 
 include_once __DIR__ . '/../core/helpers.php';
 include_once __DIR__ . '/../core/guard.php';
@@ -84,9 +82,7 @@ function locationsBarangaysByCity()
     json(['status' => 'ok', 'data' => locationsIntIds($stmt->fetchAll())]);
 }
 
-// GET /api/locations/allCities?search=...
-// Cities across all provinces matching the term, each shown as "City, Province"
-// so duplicates are distinguishable. Used for the Work Experience address field.
+// GET /api/locations/allCities?search=... Cities shown as "City, Province" for the Work Experience field.
 function locationsSearchAllCities()
 {
     requireLogin();
@@ -116,10 +112,7 @@ function locationsIntIds($rows)
     return $rows;
 }
 
-// GET /api/locations/barangays?search=...
-// Returns up to 20 barangays whose name matches the search term, each carrying
-// its city/province/region so the frontend can tell duplicates apart and store
-// the resolved barangay_id.
+// GET /api/locations/barangays?search=... Returns up to 20 matches with city/province/region context.
 function locationsSearchBarangays()
 {
     // Any logged-in user may read location reference data (used by every module's

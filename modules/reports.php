@@ -1,9 +1,6 @@
 <?php
-// Cross-program aggregates for the General PESO Report. Every program's
-// applicants share the beneficiaries/beneficiary_services spine, so headcounts
-// and unique-client counts come from one grouped query over that spine.
-// "Activities conducted" has no shared schema, so each program's own
-// batches/activities/projects table is counted separately.
+// Cross-program aggregates for the General PESO Report. Headcounts come from the
+// shared beneficiaries spine; activity counts come from each program's own table.
 
 include_once __DIR__ . '/../core/helpers.php';
 include_once __DIR__ . '/../core/guard.php';
@@ -28,9 +25,7 @@ function reportPrograms()
             'activityTable' => 'vacancies', 'activityDateCol' => 'created_at'],
         'cdsp' => ['label' => 'CDSP', 'services' => ['CDSP'],
             'activityTable' => 'cdsp_activities', 'activityDateCol' => 'activity_date', 'jobPlacements' => true],
-        // gip_workplaces is now a reusable directory (no period of its own,
-        // like EF's employers/vacancies split) -- "activities conducted"
-        // counts new workplaces added in the period, via created_at.
+        // gip_workplaces is a reusable directory; activity count = new workplaces added in the period.
         'gip' => ['label' => 'GIP', 'services' => ['GIP'],
             'activityTable' => 'gip_workplaces', 'activityDateCol' => 'created_at', 'jobPlacements' => true],
         'spes' => ['label' => 'SPES', 'services' => ['SPES'],
@@ -84,11 +79,8 @@ function reportsSummary()
         error('Select at least one program.', 422);
     }
 
-    // Flatten to the service_codes actually needed (Livelihood alone expands to
-    // 4 top-level programs), then expand each to include any child service
-    // codes (CDSP's applicants are recorded against its children, not itself)
-    // — codeToTop remembers which top-level program code each expanded code
-    // rolls back up to, so results can be re-aggregated after grouping.
+    // Expand each top-level program to its service_codes (incl. children); codeToTop
+    // remembers which top-level code each expanded code rolls back up to for re-aggregation.
     $topCodes = [];
     foreach ($selected as $meta) {
         $topCodes = array_merge($topCodes, $meta['services']);
@@ -111,9 +103,8 @@ function reportsSummary()
         $codeBind[":c{$i}"] = $c;
     }
 
-    // Participants + sex split, scoped to the requested service_codes only —
-    // this matters for the unique-client count below, so an excluded program
-    // never silently contributes to the dedup total.
+    // Participants + sex split, scoped to requested service_codes only (excluded programs
+    // must not contribute to the dedup total below).
     $stmt = db()->prepare(
         "SELECT s.service_code,
                 COUNT(*) AS total,
@@ -127,9 +118,7 @@ function reportsSummary()
          GROUP BY s.service_code"
     );
     $stmt->execute(array_merge([':from' => $from, ':to' => $to], $codeBind));
-    // Roll each row's (possibly child) service_code back up to its top-level
-    // program code — e.g. CDSP-CC/CDSP-PEC/CDSP-LEGS rows all accumulate under
-    // 'CDSP', matching the keys reportPrograms() expects in $meta['services'].
+    // Roll each row's (possibly child) service_code back up to its top-level program code.
     $bySvc = [];
     foreach ($stmt->fetchAll() as $r) {
         $top = $codeToTop[$r['service_code']] ?? $r['service_code'];
@@ -141,15 +130,8 @@ function reportsSummary()
         $bySvc[$top]['female'] += (int) $r['female'];
     }
 
-    // Placements: EF has its own table (below); CDSP, GIP and Skills Training
-    // record theirs in the shared job_placements table. Same definition for
-    // both -- unique people whose date_hired falls in the report window -- so
-    // the column reads consistently. Every other program stays null rather
-    // than forcing a number onto a program that doesn't track placements.
-    // A person is counted once per top-level program (CDSP's three child
-    // services roll up together), but NOT deduplicated across programs: the
-    // same person registered separately under EF and CDSP has two unrelated
-    // beneficiary records, so they show up in both rows.
+    // Placements: EF uses its own table; CDSP/GIP/Skills Training share job_placements, both counting
+    // unique people hired within the window. Programs that don't track placements stay null.
     $jpTopCodes = [];
     foreach ($selected as $meta) {
         if (!empty($meta['jobPlacements'])) {

@@ -1,18 +1,6 @@
 <?php
-// Employers, vacancies, referrals, placements, EF profiles
-//
-// This sprint: the Applicants tab. An "applicant" is a beneficiary enrolled in
-// the Employment Facilitation service, so creating one writes across the
-// beneficiary spine in a single transaction:
-//   beneficiaries
-//   -> beneficiary_services (service = EF)
-//      -> employment_facilitation_profiles
-//   -> resume sub-tables (educations, trainings, applicant_credentials [eligibilities + licenses],
-//      work_experiences, job_preferences, languages, skills)
-//
-// Fields the EF schema has no column for are NOT persisted yet: referred
-// program / project info, gov IDs (Pag-IBIG/PhilHealth/SSS), disability detail,
-// uploaded documents, and the 2x2 photo.
+// Employers, vacancies, referrals, placements, EF profiles. Creating an applicant writes
+// across the beneficiary spine plus resume sub-tables in a single transaction.
 
 include_once __DIR__ . '/../core/helpers.php';
 include_once __DIR__ . '/../core/guard.php';
@@ -763,10 +751,7 @@ function employmentInsertResumeTables($pdo, $bid, $d)
         $occupation = efNull($row['occupation'] ?? '');
         $local      = efNull($row['localCity'] ?? '');
         $overseas   = efNull($row['overseasCountry'] ?? '');
-        // Keep the row if any of its three fields is filled in — the occupation
-        // input is disabled until an employment type is checked, so a row with
-        // only a city/country typed (and no employment type ticked yet) must
-        // still be persisted instead of being silently dropped.
+        // Keep the row if any of its three fields is filled in, even without an employment type ticked.
         if ($occupation === null && $local === null && $overseas === null) continue;
         // localCity takes priority when both are somehow present.
         $loc     = $local ?? $overseas;
@@ -799,9 +784,7 @@ function employmentInsertResumeTables($pdo, $bid, $d)
         ]);
     }
 
-    // Other skills: the predefined checkboxes (otherSkills, minus the 'OTHERS'
-    // marker) plus the free-text "OTHERS: specify" entries (otherSkillsSpecify).
-    // Both are stored as plain skill rows.
+    // Other skills: predefined checkboxes plus free-text "OTHERS: specify" entries, both stored as plain skill rows.
     $skillInsert = $pdo->prepare("INSERT INTO skills (beneficiary_id, skill_name) VALUES (:bid, :name)");
     $seenSkills = [];
     foreach (array_merge($d['otherSkills'] ?? [], $d['otherSkillsSpecify'] ?? []) as $name) {
@@ -942,9 +925,7 @@ function employmentBuildApplicant($bid)
     $photoPath = $photo->fetchColumn();
     $profileImage = $photoPath ? efUploadBaseUrl() . $photoPath : '';
 
-    // ── Attachments (documents table) → savedDocuments with download URLs ──
-    // Includes the 2x2 ID Picture so it is visible in the Documents/Attachments
-    // list where it was uploaded (it is also surfaced separately as profileImage).
+    // Attachments: includes the 2x2 ID Picture (also surfaced separately as profileImage).
     $docRows = db()->prepare(
         "SELECT document_id, document_type, title, file_name, file_path, file_size
          FROM attached_documents
@@ -1288,9 +1269,7 @@ function employmentHardDeleteApplicant($bid)
         $bsId = $bsStmt->fetchColumn();
         if ($bsId !== false) {
             $bsId = (int) $bsId;
-            // placement_promotions cascades automatically (ON DELETE CASCADE).
-            // Placements must go before referrals: placements.referral_id is
-            // ON DELETE RESTRICT against employment_facilitation_referrals.
+            // Placements must be deleted before referrals: placements.referral_id is ON DELETE RESTRICT.
             $pdo->prepare("DELETE FROM employment_facilitation_placements WHERE beneficiary_service_id = :id")->execute([':id' => $bsId]);
             $pdo->prepare("DELETE FROM employment_facilitation_referrals WHERE beneficiary_service_id = :id")->execute([':id' => $bsId]);
             $pdo->prepare("DELETE FROM employment_facilitation_profiles WHERE beneficiary_service_id = :id")->execute([':id' => $bsId]);
@@ -1309,11 +1288,9 @@ function employmentHardDeleteApplicant($bid)
     }
 }
 
-// ═══════════════════════════════════════════════════════════════════════════════
-// EMPLOYERS
-// ═══════════════════════════════════════════════════════════════════════════════
+// Employers
 
-// ─── Industry helpers (employers.industry is a plain text column) ────────────────────────────────────────────────────────
+// Industry helpers (employers.industry is a plain text column)
 
 // Normalizes an industry name's spelling and casing before it is saved.
 function efNormalizeIndustry($name)
@@ -1627,9 +1604,7 @@ function employmentHardDeleteEmployer($id)
     db()->prepare("DELETE FROM employers WHERE employer_id = :id")->execute([':id' => (int) $id]);
 }
 
-// ═══════════════════════════════════════════════════════════════════════════════
-// VACANCIES
-// ═══════════════════════════════════════════════════════════════════════════════
+// Vacancies
 
 // Map frontend job type to the vacancy_job_type_enum (Full-time/Part-time/Contract).
 function efJobType($jobType)
@@ -1835,9 +1810,7 @@ function efToggleVacancyStatus($id)
     json(['status' => 'ok', 'message' => "Vacancy {$next}.", 'data' => ['status' => $next]]);
 }
 
-// ═══════════════════════════════════════════════════════════════════════════════
-// REFERRALS
-// ═══════════════════════════════════════════════════════════════════════════════
+// Referrals
 
 // EF service_id = 1 (Employment Facilitation)
 define('EF_SERVICE_ID', 1);
@@ -2034,9 +2007,7 @@ function efCreateReferral()
     $vac->execute([':id' => $vacancyId]);
     if (!$vac->fetchColumn()) error('Vacancy is not available (closed or all slots filled).', 409);
 
-    // Global lock: an applicant who is already hired (active placement) or already
-    // has a live referral cannot be referred again — to any employer — until released
-    // (referral -> Not Hired, or placement -> Resigned/Terminated/Completed).
+    // Global lock: an applicant already hired or with a live referral can't be referred again until released.
     $state = efApplicantReferralState($bsId);
     if ($state === 'Hired')    error('This applicant is already hired and cannot be referred.', 409);
     if ($state === 'Referred') error('This applicant already has an active referral.', 409);
@@ -2119,9 +2090,7 @@ function efUpdateReferralStatus($id)
         ]);
         $placementId = (int) $ins->fetchColumn();
 
-        // No vacancy_count decrement: remaining openings are DERIVED from active
-        // placements (slots_total - active). A vacancy fills up and reopens (when
-        // a placement ends) automatically, with no stored counter to drift.
+        // No vacancy_count decrement: remaining openings are derived from active placements.
 
         $pdo->commit();
     } catch (Throwable $e) {
@@ -2144,17 +2113,12 @@ function efDeleteReferral($id)
     $status = $check->fetchColumn();
     if ($status === false) error('Referral not found.', 404);
 
-    // A courtesy guard, not a hard rule -- status can be freely changed back to
-    // Pending via updateReferralStatus, so this only stops accidental deletion
-    // of a referral someone's already acted on, not a determined override.
+    // Courtesy guard only, to stop accidental deletion of a referral already acted on.
     if ($status !== 'Pending') {
         error("Cannot delete: this referral is no longer pending (current status: {$status}). Only pending referrals can be deleted.", 409);
     }
 
-    // Placements carry a NOT NULL, ON DELETE RESTRICT referral_id, and there is
-    // no way to delete a placement anywhere in the app -- so once a referral
-    // has resulted in a hire, it must stay visible/restorable rather than
-    // disappearing into the recycle bin while its placement remains active.
+    // Placements have ON DELETE RESTRICT referral_id; a referral with a placement must stay restorable.
     $placementCheck = db()->prepare("SELECT COUNT(*) FROM employment_facilitation_placements WHERE referral_id = :id");
     $placementCheck->execute([':id' => (int) $id]);
     if ((int) $placementCheck->fetchColumn() > 0) {
@@ -2178,9 +2142,7 @@ function employmentHardDeleteReferral($id)
     db()->prepare("DELETE FROM employment_facilitation_referrals WHERE referral_id = :id")->execute([':id' => (int) $id]);
 }
 
-// ═══════════════════════════════════════════════════════════════════════════════
-// PLACEMENTS
-// ═══════════════════════════════════════════════════════════════════════════════
+// Placements
 
 // Build the frontend Placement object from a DB row.
 function efBuildPlacement($row)
@@ -2190,10 +2152,7 @@ function efBuildPlacement($row)
         'applicantId'     => (int) $row['beneficiary_id'],
         'applicantName'   => $row['applicant_name'],
         'jobTitle'        => $row['vacancy_job_title'] ?? '',
-        // Current title is derived from the latest promotion (if any), never
-        // stored on the placement itself — a second mutable copy of the same
-        // fact would drift the moment a promotion is recorded through any
-        // path that forgets to update it.
+        // Current title is derived from the latest promotion, never stored on the placement itself.
         'currentJobTitle' => $row['latest_promotion_title'] ?? $row['vacancy_job_title'] ?? '',
         'employer'        => $row['company_name'] ?? '',
         'dateHired'       => $row['date_hired'],
@@ -2367,9 +2326,7 @@ function efCreatePromotion($id)
     json(['status' => 'ok', 'message' => 'Promotion recorded.']);
 }
 
-// ═══════════════════════════════════════════════════════════════════════════════
-// PESO MONTHLY REPORT  (LMI / SPRS: registered, referred, placed + summary)
-// ═══════════════════════════════════════════════════════════════════════════════
+// PESO Monthly Report (LMI/SPRS: registered, referred, placed + summary)
 
 // "Employed (Wage Employed)" / "Unemployed (Resigned)" — matches the PESO forms.
 function efFormatEmploymentStatus($status, $type, $reason)
@@ -2460,9 +2417,7 @@ function efMonthlyReport()
         ];
     }, $regStmt->fetchAll(PDO::FETCH_ASSOC));
 
-    // ── Applicants Referred — DISTINCT persons in the period (one row per
-    //    applicant, even if referred to several vacancies), matching the "No. of
-    //    Applicants Referred" definition and keeping it consistent with Registered.
+    // Applicants Referred: distinct persons in the period, one row per applicant.
     $refStmt = db()->prepare(
         "SELECT {$name} AS name, b.sex, MAX(jp.occupation) AS occupation
          FROM employment_facilitation_referrals r
@@ -2577,9 +2532,7 @@ function efMonthlyReport()
     ]]);
 }
 
-// ═══════════════════════════════════════════════════════════════════════════════
-// RECYCLE BIN  (soft-deleted EF records: applicants, employers, referrals)
-// ═══════════════════════════════════════════════════════════════════════════════
+// Recycle bin (soft-deleted EF records: applicants, employers, referrals)
 
 // Maps each recycle-bin record type to its table and primary key.
 function efRecycleMap()
@@ -2766,10 +2719,8 @@ function efPurgeExpired()
 {
     $uid = currentUserId();
 
-    // Applicants: beneficiaries.deleted_at is a SHARED column (one row per
-    // person, not per-service) -- an unscoped query here would let EF's
-    // sweep pick up and hard-delete someone who actually belongs to a
-    // different module. Scoped exactly like efListDeleted().
+    // beneficiaries.deleted_at is shared across modules, so scope by service_id
+    // to avoid purging someone belonging to a different module.
     $appS = db()->prepare(
         "SELECT b.beneficiary_id AS id
          FROM beneficiaries b

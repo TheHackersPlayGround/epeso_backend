@@ -1,11 +1,6 @@
 <?php
-// CLPEP: interventions (clpep_interventions) + profiles (clpep_profiles,
-// 1:1 with beneficiary_services via UNIQUE beneficiary_service_id).
-// clpep_intervention_beneficiaries keeps a running history of assignments;
-// "current" is the most recently assigned row. clpep_profiles.status is
-// stored but always server-derived from the current assignment, never
-// client-set. Minors-only program: civil_status is hardcoded to 'Single'
-// since the applicant form collects no Civil Status.
+// CLPEP: interventions + profiles (1:1 with beneficiary_services). Status is server-derived.
+// Minors-only program: civil_status is hardcoded to 'Single'.
 
 include_once __DIR__ . '/../core/helpers.php';
 include_once __DIR__ . '/../core/guard.php';
@@ -232,9 +227,7 @@ function clpepUpdateInterventionStatus($id) {
 
     db()->prepare("UPDATE clpep_interventions SET status=:s, updated_at=now() WHERE intervention_id=:id")->execute([':s' => $status, ':id' => $id]);
 
-    // Cascade: refresh derived status for every beneficiary currently linked
-    // to this intervention (clpep_profiles.status is stored, unlike DILP/TUPAD
-    // which compute it purely at read time).
+    // Cascade: refresh derived status for every beneficiary linked to this intervention.
     clpepRefreshDerivedStatusForIntervention($id, $status);
 
     logActivity(currentUserId(), 'Update Intervention Status', 'livelihood-maintenance', "Set intervention '{$ivName}' status to {$status}");
@@ -693,9 +686,7 @@ function clpepUnassignIntervention() {
     $r = $row->fetch();
     if (!$r) error('This beneficiary is not currently assigned to an intervention.', 404);
 
-    // Only the current (most recent) assignment can be undone, and only while
-    // its intervention is still Planned -- once it has moved on, this row is
-    // the sole record that the assignment happened at all.
+    // Only the current assignment can be undone, and only while still Planned.
     if ($r['intervention_status'] !== 'Planned') {
         error('This intervention is no longer Planned -- unassigning would erase the only record of this assignment.', 409);
     }
@@ -847,9 +838,7 @@ function clpepFetchInterventionDocuments($interventionId) {
     }, $s->fetchAll());
 }
 
-// ═══════════════════════════════════════════════════════════════════════════════
-// RECYCLE BIN  (soft-deleted CLPEP beneficiaries)
-// ═══════════════════════════════════════════════════════════════════════════════
+// Recycle bin (soft-deleted CLPEP beneficiaries)
 
 // Maps each recycle-bin record type to its table and primary key.
 function clpepRecycleMap() {
@@ -975,10 +964,8 @@ function clpepPurgeRecord() {
 function clpepPurgeExpired() {
     $uid = currentUserId();
 
-    // Applicants: beneficiaries.deleted_at is a SHARED column (one row per
-    // person, not per-service) -- an unscoped query here would let CLPEP's
-    // sweep pick up and hard-delete someone who actually belongs to a
-    // different module. Scoped exactly like clpepListDeleted().
+    // beneficiaries.deleted_at is shared across modules, so scope by service_id
+    // to avoid purging someone belonging to a different module.
     $appS = db()->prepare(
         "SELECT b.beneficiary_id AS id
          FROM beneficiaries b

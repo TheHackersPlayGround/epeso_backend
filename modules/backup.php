@@ -1,14 +1,6 @@
 <?php
-// Backups: a full pg_dump snapshot of the live database PLUS every file in
-// uploads/, bundled into one .zip. A bare SQL dump only carries
-// attached_documents' metadata rows (filename, folder, uploader) -- the
-// actual uploaded files live on disk under uploads/ and were never part of
-// the dump, so a restore-only-from-SQL would leave every "View/Download"
-// 404ing. Older backups created before this change are plain .sql files;
-// both extensions stay supported below so existing history keeps working.
-// Administrator-only (requireAdmin(), not requirePermission()) — a full
-// dump contains every applicant's PII and every user's password hash, so
-// this isn't gated by the regular per-module permission system at all.
+// Full pg_dump snapshot plus uploads/ files, bundled as .zip (older backups are plain .sql, both supported).
+// Administrator-only since a dump contains all applicant PII and password hashes.
 
 include_once __DIR__ . '/../core/helpers.php';
 include_once __DIR__ . '/../core/guard.php';
@@ -118,9 +110,7 @@ function backupCreatedAt($filename)
     if (preg_match('/^PESO_DB_Backup_(?:before_restore_)?(\d{4}-\d{2}-\d{2})_(\d{2})(\d{2})(\d{2})(?:_\d+)?\.(?:sql|zip)$/', $filename, $m)) {
         return "{$m[1]} {$m[2]}:{$m[3]}:{$m[4]}";
     }
-    // Earlier automatic safety backups used a compact, dash-less date
-    // (pre_restore_YYYYMMDD_HHMMSS) to fit the pre_<label> shape; still
-    // listed, so they keep a proper created-at.
+    // Older safety backups used a compact dash-less date format; still parsed here.
     if (preg_match('/^PESO_DB_Backup_pre_restore_(\d{4})(\d{2})(\d{2})_(\d{2})(\d{2})(\d{2})(?:_\d+)?\.(?:sql|zip)$/', $filename, $m)) {
         return "{$m[1]}-{$m[2]}-{$m[3]} {$m[4]}:{$m[5]}:{$m[6]}";
     }
@@ -130,9 +120,7 @@ function backupCreatedAt($filename)
 // Generates a unique backup filename for a given timestamp.
 function backupUniqueName($ts, $ext, $safety = false)
 {
-    // $ts is 'YYYY-MM-DD_HHMMSS'. Automatic safety backups taken before a
-    // restore get a "before_restore" marker so they're recognisable even
-    // once downloaded, where the UI badge isn't shown.
+    // $ts is 'YYYY-MM-DD_HHMMSS'. Safety backups get a "before_restore" marker.
     $base = $safety
         ? "PESO_DB_Backup_before_restore_{$ts}"
         : "PESO_DB_Backup_{$ts}";
@@ -196,13 +184,8 @@ function backupCreateSnapshot($safety = false)
         error('The PHP zip extension is not enabled on this server. Contact your system administrator.', 500);
     }
 
-    // Sourced from Postgres's own clock, not PHP's date() — see
-    // backupCreatedAt()'s comment for why they can disagree on this server.
-    // Names are reserved via backupUniqueName() (against the .zip, the one
-    // that actually persists) so this can never collide with -- and
-    // overwrite -- another backup created moments earlier in the same
-    // request (see backupUniqueName()'s comment for the incident that
-    // caused this).
+    // Timestamp sourced from Postgres's clock, not PHP's date().
+    // Name reserved via backupUniqueName() to avoid collisions with a backup created moments earlier.
     $ts = db()->query("SELECT to_char(now(), 'YYYY-MM-DD_HH24MISS')")->fetchColumn();
     $zipName = backupUniqueName($ts, 'zip', $safety);
     $sqlName = substr($zipName, 0, -4) . '.sql';
@@ -294,10 +277,7 @@ function backupRestoreUpload()
 
     $origName = $_FILES['backupFile']['name'];
     $ext = strtolower(pathinfo($origName, PATHINFO_EXTENSION));
-    // New backups are always .zip (database + uploaded documents). Old .sql
-    // backups already in backups/ can still be restored from Backup History,
-    // but are no longer accepted as an upload, since they'd restore the
-    // database without the documents it refers to.
+    // New backups are always .zip; old .sql backups can only be restored from Backup History.
     if ($ext !== 'zip') {
         error('Only .zip backup files are accepted.', 422);
     }
@@ -389,12 +369,7 @@ function backupRunRestore($path, $isZip, $sourceLabel)
     $step = 0;
 
     $uid = currentUserId();
-    // Release the session lock now that we have the user id. PHP's default
-    // session handler holds an exclusive file lock for the whole request --
-    // without closing it here, the frontend's restoreProgress polls (which
-    // also start a session) would queue behind this multi-step restore and
-    // only resolve once it's already finished, making the progress bar look
-    // stuck at 0% and then jump straight to done.
+    // Release the session lock so progress-poll requests aren't blocked behind this long request.
     session_write_close();
     backupWriteProgress(++$step, $totalSteps, 'Creating safety backup of current data...');
     [$safetyName, $safetySize] = backupCreateSnapshot(true);
@@ -429,9 +404,7 @@ function backupRunRestore($path, $isZip, $sourceLabel)
         }
     }
 
-    // Drop and recreate the schema so the dump restores to exactly the
-    // backup's state -- anything created/changed since (tables, columns,
-    // enum values) is wiped, matching "use that backup file instead".
+    // Drop and recreate the schema so the dump restores to exactly the backup's state.
     backupWriteProgress(++$step, $totalSteps, 'Resetting database schema...');
     [$dropCode, $dropErr] = backupRunPsql('-c ' . escapeshellarg('DROP SCHEMA public CASCADE; CREATE SCHEMA public; GRANT ALL ON SCHEMA public TO public;'));
     if ($dropCode !== 0) {

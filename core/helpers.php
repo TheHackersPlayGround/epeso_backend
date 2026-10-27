@@ -1,32 +1,21 @@
 <?php
 // Input validation, enum-cast, pagination
 
-// Recycle bin retention: a soft-deleted record older than this is
-// auto-purged the next time anyone loads the recycle bin (each module's
-// {prefix}PurgeExpired(), called from {prefix}ListDeleted() -- see e.g.
-// gip.php). Mirrors the "N days left" countdown already shown in
-// src/pages/security/ActivityLogsTab.tsx's getDaysRemaining() -- that
-// display was previously cosmetic only; this is what makes it real. Keep
-// both numbers in sync if this ever changes.
+// Recycle bin retention: soft-deleted records older than this are auto-purged on next
+// load. Keep in sync with ActivityLogsTab.tsx's getDaysRemaining() countdown.
 if (!defined('RECYCLE_BIN_RETENTION_DAYS')) {
     define('RECYCLE_BIN_RETENTION_DAYS', 30);
 }
 
-// Strict whole-number parse for slot counts: only plain digits ("5" or 5) are
-// accepted. "1.5", "1e3", "-2", " " and "" all return null, so a slot field can
-// never be quietly truncated (1.5 -> 1) the way a plain (int) cast would.
+// Strict whole-number parse: only plain digits accepted; "1.5"/"1e3"/"-2"/"" return null.
 function wholeNumberOrNull($v)
 {
     $s = trim((string) $v);
     return ctype_digit($s) ? (int) $s : null;
 }
 
-// Resolve a report's reporting window from the query string. Explicit
-// ?from=&to= wins; otherwise falls back to ?year=&month= (a single calendar
-// month), defaulting to the current month. Also returns the prior-period
-// window (same span shifted back one year) for year-over-year comparisons.
-// Shared by employment.php's monthlyReport and reports.php's summary so both
-// support the same Monthly / Annual / Custom Range modes the frontend offers.
+// Resolves a report window from the query string (?from=&to= or ?year=&month=, default
+// current month); also returns the prior-year window for year-over-year comparisons.
 function resolveReportWindow()
 {
     $from = isset($_GET['from']) ? trim($_GET['from']) : '';

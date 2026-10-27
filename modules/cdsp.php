@@ -396,9 +396,7 @@ function cdspUpdateActivityStatus($id) {
     $prevS = db()->prepare("SELECT status FROM cdsp_activities WHERE activity_id=:id");
     $prevS->execute([':id' => (int)$id]);
     $prevStatus = $prevS->fetchColumn();
-    // Only stamp completed_at on the actual Planned/Ongoing -> Completed transition
-    // (matches cdspUpdateActivity's guard) -- otherwise reopening an activity and
-    // marking it Completed again resets everyone's aging clock to "just now".
+    // Only stamp completed_at on the actual transition to Completed, not on re-marking.
     $completedAt = ($status === 'Completed' && $prevStatus !== 'Completed') ? ',completed_at=now()' : '';
     db()->prepare("UPDATE cdsp_activities SET status=:s,updated_at=now(){$completedAt} WHERE activity_id=:id")->execute([':s'=>$status,':id'=>(int)$id]);
     cdspSyncActivityParticipantsStatus((int)$id);
@@ -479,14 +477,8 @@ function cdspAddParticipant() {
     $capRow = $capS->fetch();
     if ($capRow === false) error('Activity not found.', 404);
 
-    // The activity picker UI only ever shows activities matching the
-    // beneficiary's own sub-service (Career Coaching / Pre-Employment
-    // Coaching / Labor Employment for Graduating Students), but that's a
-    // frontend filter only -- re-check here so a mismatched assignment
-    // can't slip in through any other caller. Without this, a beneficiary
-    // could end up with a completed activity under a different sub-service
-    // than they're enrolled in, which the Aging Report's sub-service
-    // breakdown assumes can't happen.
+    // Frontend only shows activities matching the beneficiary's sub-service; re-check here
+    // so a mismatched assignment can't slip in through another caller.
     $bsvcS = db()->prepare("SELECT service_id FROM beneficiary_services WHERE beneficiary_service_id=:b");
     $bsvcS->execute([':b'=>$bsId]);
     $bsServiceId = $bsvcS->fetchColumn();
@@ -520,9 +512,7 @@ function cdspRemoveParticipant() {
     $bsId  = cdspIntOrNull($d['beneficiaryServiceId'] ?? '');
     if (!$actId || !$bsId) error('activityId and beneficiaryServiceId required.', 422);
 
-    // Removing a participant hard-deletes this row, which is the only place
-    // date_assigned/completed_at for that history entry live. Once the activity
-    // is Completed, that would silently erase the completion record, so block it.
+    // Hard-delete would erase the only completion record once the activity is Completed, so block it.
     $statS = db()->prepare("SELECT status FROM cdsp_activities WHERE activity_id=:a");
     $statS->execute([':a' => $actId]);
     $status = $statS->fetchColumn();
@@ -701,10 +691,7 @@ function cdspBuildProfile($bid) {
             : $currentAct['activity_status'];
     }
 
-    // PESO wants staff warned (not blocked) when re-assigning someone within 6
-    // months of an activity they actually finished -- only a genuine completion
-    // (status Completed AND attended) starts this clock, same rule as above, so
-    // an activity they skipped never counts against them.
+    // Warns (doesn't block) on re-assignment within 6 months of a genuinely completed activity.
     $lastCompS = db()->prepare(
         "SELECT ca.activity_title, ca.completed_at, ca.activity_date
          FROM cdsp_activity_participants cap
@@ -908,14 +895,8 @@ function cdspUpdateProfile($id) {
     if (!$bsRow) error('CDSP profile not found.', 404);
     $bsId = (int)$bsRow['beneficiary_service_id'];
 
-    // Block a service change once the beneficiary has ANY activity
-    // participation history under their CURRENT service - Planned, Ongoing,
-    // or Completed. beneficiary_service_id is a shared anchor referenced by
-    // cdsp_profiles, attached_documents, and every other module's profile table, so
-    // it represents a specific enrollment event, not a casually-editable
-    // field - swapping the service out from under it would retroactively
-    // rewrite what all of that linked history appears to belong to. Same
-    // lock spirit as cdspDeleteActivity's participant-history check.
+    // Block a service change once the beneficiary has any activity participation history
+    // under their current service, since that history is tied to the enrollment.
     if ((int)$bsRow['service_id'] !== $newServiceId) {
         $hasHistory = db()->prepare(
             "SELECT 1 FROM cdsp_activity_participants WHERE beneficiary_service_id = :bsid LIMIT 1"
@@ -929,9 +910,7 @@ function cdspUpdateProfile($id) {
     $sex = in_array($d['sex'] ?? '', ['Male','Female'], true) ? $d['sex'] : null;
     if (!$sex) error('Sex is required.', 422);
 
-    // Birthdate, Civil Status, and Barangay are required by the underlying
-    // beneficiaries table (NOT NULL columns) — validated here so a bad
-    // request 422s cleanly instead of failing as a raw DB constraint violation.
+    // Birthdate, Civil Status, and Barangay are NOT NULL in the DB; validated here for a clean 422.
     $birth = cdspDate($d['birthdate'] ?? '');
     if (!$birth) error('Birthdate is required.', 422);
     if ($birth > date('Y-m-d')) error('Birthdate cannot be in the future.', 422);
@@ -1022,9 +1001,7 @@ function cdspDeleteProfile($id) {
     json(['status'=>'ok','message'=>'Applicant moved to recycle bin.']);
 }
 
-// ═══════════════════════════════════════════════════════════════════════════════
-// RECYCLE BIN  (soft-deleted CDSP applicants)
-// ═══════════════════════════════════════════════════════════════════════════════
+// Recycle bin (soft-deleted CDSP applicants)
 
 // Maps each recycle-bin record type to its table and primary key.
 function cdspRecycleMap() {
@@ -1130,9 +1107,7 @@ function cdspHardDeleteByType($type, $id, $table, $pk) {
     if ($type === 'cdspApplicant') {
         cdspHardDeleteApplicant($id);
     } else {
-        // Activities were already blocked from being soft-deleted while still
-        // referenced (see cdspDeleteActivity's in-use guard), so a plain row
-        // delete here is safe — no cascade needed.
+        // Activities are already blocked from soft-delete while referenced, so a plain delete is safe.
         db()->prepare("DELETE FROM {$table} WHERE {$pk} = :id")->execute([':id' => $id]);
     }
 }
@@ -1156,12 +1131,8 @@ function cdspPurgeRecord() {
 function cdspPurgeExpired() {
     $uid = currentUserId();
 
-    // Applicants: beneficiaries.deleted_at is a SHARED column (one row per
-    // person, not per-service) -- an unscoped query here would let CDSP's
-    // sweep pick up and hard-delete someone who actually belongs to a
-    // different module. Scoped exactly like cdspListDeleted() (via
-    // services.parent_service_id, since CDSP has sub-services like
-    // CDSP-CC/CDSP-PEC/CDSP-LEGS rather than one flat service_id).
+    // beneficiaries.deleted_at is shared across modules, so scope by parent_service_id
+    // to avoid purging someone belonging to a different module.
     $pid = cdspParentServiceId();
     $appS = db()->prepare(
         "SELECT b.beneficiary_id AS id

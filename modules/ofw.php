@@ -1,8 +1,6 @@
 <?php
-// OFW: profiles (beneficiary spine + ofw_profiles) + request types + agencies +
-// attachments (ELPOR forms / OWWA Welfare Case form / generic documents, all
-// via the universal `documents` table). Flat case-record list, no batch/project
-// concept. Agencies and Type of Request are stored as repeatable child rows.
+// OFW profiles, request types, agencies, and attachments via the documents table.
+// Flat case-record list; agencies and request types are repeatable child rows.
 
 include_once __DIR__ . '/../core/helpers.php';
 include_once __DIR__ . '/../core/guard.php';
@@ -521,9 +519,7 @@ function ofwDeleteProfile($id) {
     json(['status' => 'ok', 'message' => 'Profile moved to recycle bin.']);
 }
 
-// ═══════════════════════════════════════════════════════════════════════════════
-// RECYCLE BIN (soft-deleted OFW profiles)
-// ═══════════════════════════════════════════════════════════════════════════════
+// Recycle bin for soft-deleted OFW profiles.
 
 // Maps the OFW recycle-bin record type to its table and primary key.
 function ofwRecycleMap() {

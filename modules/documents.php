@@ -1,7 +1,5 @@
 <?php
-// Documents Tab: folder-organized, PESO-staff document library. Unrelated to
-// any specific applicant/batch/project — that's attached_documents' job
-// (see migration 044's split). folders/document_library back this module.
+// Documents Tab: folder-organized PESO-staff document library, unrelated to any applicant/project.
 
 include_once __DIR__ . '/../core/helpers.php';
 include_once __DIR__ . '/../core/guard.php';
@@ -290,10 +288,8 @@ function docsRenameDocument($id)
     $oldName = $row['file_name'];
     $folderId = $row['folder_id'] !== null ? (int) $row['folder_id'] : null;
 
-    // The extension is not user-editable: whatever the client submits is treated as the
-    // base name only, and the original file's extension is always reappended. This stops
-    // a client-side caret-position quirk (backspacing into the extension) from silently
-    // corrupting the stored file extension.
+    // Extension is not user-editable; client input is treated as base name only and the
+    // original extension is always reappended.
     $oldExt = pathinfo($oldName, PATHINFO_EXTENSION);
     $newBase = pathinfo($name, PATHINFO_FILENAME);
     if ($newBase === '') error('File name is required.', 422);
@@ -395,9 +391,7 @@ function docsListDeleted()
     docsPurgeExpired();
     $items = [];
 
-    // Origin context (which folder it'll reappear in on restore) is more
-    // useful here than restating the module badge — pf is the folder's own
-    // parent, so a nested folder shows "Subfolder of <parent>".
+    // Shows origin context (parent folder it'll restore into) rather than the module badge.
     $fS = db()->query(
         "SELECT f.folder_id AS id, f.folder_name AS name, f.deleted_at, u.username AS deleted_by,
                 pf.folder_name AS parent_name
@@ -503,11 +497,7 @@ function docsRestoreRecord()
     $stmt->execute([':id' => $id]);
     if ($stmt->rowCount() === 0) error('Record not found in recycle bin.', 404);
 
-    // If this record's parent folder is itself still in the bin (e.g. the
-    // last file in a folder was deleted, then the now-empty folder was
-    // deleted too), restoring here would leave it orphaned — visible in
-    // listDocuments/listFolders but unreachable in the tree. Fall back to
-    // root instead of leaving it invisibly stranded.
+    // If the parent folder is still in the bin, restoring here would orphan this record; fall back to root.
     if ($type === 'documentsDocument') {
         db()->prepare(
             "UPDATE document_library SET folder_id = NULL

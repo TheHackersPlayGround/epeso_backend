@@ -1,9 +1,6 @@
 <?php
-// Job Placements: ONE shared table used by every program module, keyed off
-// beneficiary_service_id so any module can plug in without a schema change.
-// Permission is resolved dynamically from the applicant's own service_code
-// (see jpPermissionForBeneficiaryService), since this endpoint is shared
-// across programs with different permission keys (gip, cdsp, skills, ...).
+// Job Placements: one shared table used by every program module, keyed off beneficiary_service_id.
+// Permission is resolved dynamically from the applicant's own service_code.
 
 include_once __DIR__ . '/../core/helpers.php';
 include_once __DIR__ . '/../core/guard.php';

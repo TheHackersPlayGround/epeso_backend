@@ -8,10 +8,7 @@ include_once __DIR__ . '/../core/activity_log.php';
 // Router entry point. index.php calls this with the parsed action/id/method.
 function handle($action, $id, $method)
 {
-    // User management lives under the "security" module:
-    //   viewing the list needs Security = Viewer,
-    //   creating/updating/deleting needs Security = Editor.
-    // Administrators always pass (handled inside requirePermission).
+    // Gated by the "security" module permission (list=Viewer, create/update/delete=Editor).
     switch ($action) {
         case 'list':
             requirePermission('security', 'Viewer');

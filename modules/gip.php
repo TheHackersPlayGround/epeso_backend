@@ -247,9 +247,7 @@ function gipDeleteWorkplace($id) {
     if (!is_numeric($id)) error('Invalid workplace id.', 422);
     $id = (int) $id;
 
-    // gip_profiles.workplace_id is the only record that an internship happened
-    // (no participants junction table like CDSP) — block deletion outright
-    // rather than nulling profiles out to allow it.
+    // workplace_id is the only record an internship happened; block deletion rather than nulling it out.
     $cntS = db()->prepare("SELECT COUNT(*) FROM gip_profiles WHERE workplace_id=:id");
     $cntS->execute([':id' => $id]);
     $cnt = (int) $cntS->fetchColumn();
@@ -262,10 +260,8 @@ function gipDeleteWorkplace($id) {
     $name = $nameS->fetchColumn();
     if ($name === false) error('Workplace not found.', 404);
 
-    // Soft delete only -- files/document rows stay intact so a restored
-    // workplace still has its attachments. They're only actually removed at
-    // purge time (gipHardDeleteWorkplace), which is when
-    // attached_documents.gip_workplace_id's ON DELETE CASCADE actually fires.
+    // Soft delete only; attachments stay intact until purge time (gipHardDeleteWorkplace)
+    // triggers the ON DELETE CASCADE.
     db()->prepare("UPDATE gip_workplaces SET deleted_at=now(), deleted_by=:uid WHERE workplace_id=:id")->execute([':uid' => currentUserId(), ':id' => $id]);
     logActivity(currentUserId(), 'Delete Workplace', 'gip-maintenance', "Deleted workplace: {$name}");
     json(['status' => 'ok', 'message' => 'Workplace deleted.']);
@@ -332,10 +328,7 @@ function gipBuildProfile($bid) {
         if ($row['classification'] === 'Other') { $classificationOther = $row['classification_other'] ?? ''; break; }
     }
 
-    // gip_profiles.workplace_id is a single direct FK (no assignment-history
-    // table), so we can only ever surface a 0-or-1-entry "history" from the
-    // live link. Dates are the applicant's own (workplace_assigned_at /
-    // workplace_completed_at) -- the workplace itself no longer has a period.
+    // workplace_id is a single direct FK (no history table), so history is only ever 0-or-1 entry.
     $assignmentHistory = [];
     $workplaceId = isset($gp['workplace_id']) ? $gp['workplace_id'] : null;
     if ($workplaceId) {
@@ -359,10 +352,8 @@ function gipBuildProfile($bid) {
         $age = (new DateTime($b['birth_date']))->diff(new DateTime('today'))->y;
     }
 
-    // Aging fields -- only meaningful once this one-shot internship is
-    // Completed. Unlike Skills Training/CDSP there's no LATERAL "pick the
-    // latest of several" needed: gip_profiles holds at most one completed
-    // engagement ever, so it's read straight off this same row.
+    // Aging fields only meaningful once Completed; gip_profiles holds at most one
+    // engagement, so it's read straight off this row.
     $lastCompletedDate = ($gp['status'] ?? null) === 'Completed' ? ($gp['workplace_completed_at'] ?? null) : null;
     $placed = false;
     if ($lastCompletedDate) {
@@ -434,9 +425,7 @@ function gipValidateProfileInput($d) {
 
     $sex   = $d['sex'];
     $birth = gipDate($d['birthdate'] ?? '');
-    // civil_status_enum has no "Annulled" value (the frontend offers it as an
-    // option) — anything outside the DB's real enum falls back to null rather
-    // than failing the whole save.
+    // civil_status_enum has no "Annulled" value; anything outside the real enum falls back to null.
     $validCivil = ['Single', 'Married', 'Widowed', 'Separated', 'Divorced'];
     $civil = in_array($d['civilStatus'] ?? '', $validCivil, true) ? $d['civilStatus'] : null;
     $bgyId = (int) $d['barangayId'];
@@ -659,10 +648,8 @@ function gipAgingReport() {
     json(['status' => 'ok', 'data' => $out]);
 }
 
-// ─── Assign / Unassign / Complete workplace ────────────────────────────────────
-// A workplace is a reusable directory entry (like EF's Employer) — capacity
-// is the only gate on assignment, not a workplace-level status. Each
-// applicant's own status/dates track their individual engagement there.
+// Assign / Unassign / Complete workplace. Capacity is the only assignment gate (not a
+// workplace-level status); each applicant's own status/dates track their engagement.
 
 // Returns an applicant's GIP profile row, or 404s.
 function gipProfileIdFor($bid) {
@@ -692,14 +679,8 @@ function gipAssignWorkplace() {
     $gp = gipProfileIdFor($bid);
     $gpId = (int) $gp['gip_profile_id'];
 
-    // Can't assign someone who's already actively interning somewhere —
-    // unassign that engagement first. And, since gipCompleteAssignment()
-    // is deliberately final ("a GIP applicant only ever goes through the
-    // program once"), a Completed applicant can't be reassigned either —
-    // gip_profiles has no participant-history table like Skills Training/
-    // CDSP, only a single workplace_id + one pair of assignment/completion
-    // dates, so reassigning after Completed would silently overwrite (and
-    // lose) the record of their finished internship.
+    // Can't assign someone already Ongoing (unassign first). Completed is also final --
+    // gip_profiles has no history table, so reassigning would overwrite the finished record.
     if ($gp['status'] === 'Ongoing') {
         error('This applicant is already assigned to a workplace/office. Unassign them or mark their current internship completed first.', 409);
     }
@@ -939,9 +920,7 @@ function gipFetchWorkplaceDocuments($workplaceId) {
     }, $s->fetchAll());
 }
 
-// ═══════════════════════════════════════════════════════════════════════════════
-// RECYCLE BIN  (soft-deleted GIP applicants)
-// ═══════════════════════════════════════════════════════════════════════════════
+// Recycle bin for soft-deleted GIP applicants.
 
 // Maps each recycle-bin record type to its table and primary key.
 function gipRecycleMap() {
@@ -1068,12 +1047,8 @@ function gipPurgeRecord() {
 function gipPurgeExpired() {
     $uid = currentUserId();
 
-    // Applicants: beneficiaries.deleted_at is a SHARED column (one row per
-    // person, not per-service) -- an unscoped query here would let GIP's
-    // sweep pick up and hard-delete someone who actually belongs to a
-    // different module (wrong cleanup function, wrong log attribution, and
-    // a real risk of FK/orphan issues since gipHardDeleteApplicant()
-    // assumes GIP-specific rows exist). Scoped exactly like gipListDeleted().
+    // beneficiaries.deleted_at is shared across modules; scoped exactly like gipListDeleted()
+    // to avoid hard-deleting someone from a different module.
     $appS = db()->prepare(
         "SELECT b.beneficiary_id AS id
          FROM beneficiaries b

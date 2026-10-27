@@ -1,11 +1,6 @@
 <?php
-// SLP: projects (slp_projects) + profiles (slp_profiles, 1:1 with
-// beneficiary_services via UNIQUE beneficiary_service_id). slp_project_beneficiaries
-// keeps a running history of assignments; "current" is the most recent row.
-// slp_profiles.status is stored but always server-derived, never client-set.
-// Sector Classification and PWD disability detail reuse the shared
-// beneficiary_classifications/disabilities tables; Educational Attainment
-// reuses beneficiaries.educational_attainment.
+// SLP: projects + profiles (1:1 with beneficiary_services). slp_project_beneficiaries
+// keeps assignment history; slp_profiles.status is stored but always server-derived.
 
 include_once __DIR__ . '/../core/helpers.php';
 include_once __DIR__ . '/../core/guard.php';
@@ -186,9 +181,7 @@ function slpCreateProject() {
     $valid  = ['Planned', 'Ongoing', 'Completed', 'Cancelled'];
     $status = in_array($d['status'] ?? '', $valid, true) ? $d['status'] : 'Planned';
 
-    // project_category is NOT NULL but SLPForm.tsx doesn't collect it (the
-    // maintenance form never surfaced this field) -- default to 'Others'
-    // rather than reintroducing a UI field nobody asked for.
+    // project_category is NOT NULL but the form doesn't collect it; defaults to 'Others'.
     $pdo = db();
     $s = $pdo->prepare(
         "INSERT INTO slp_projects(project_name,description,slp_track,project_category,date_started,location,facilitator,assistance_amount,date_released,status,created_at,updated_at)
@@ -253,9 +246,8 @@ function slpUpdateProjectStatus($id) {
 
     db()->prepare("UPDATE slp_projects SET status=:s, updated_at=now() WHERE project_id=:id")->execute([':s' => $status, ':id' => $id]);
 
-    // Cascade: refresh derived status for every beneficiary currently linked
-    // to this project (slp_profiles.status is stored, unlike DILP/TUPAD which
-    // compute it purely at read time).
+    // Cascade: refresh derived status for every beneficiary linked to this project
+    // (slp_profiles.status is stored, unlike DILP/TUPAD's read-time computation).
     slpRefreshDerivedStatusForProject($id, $status);
 
     logActivity(currentUserId(), 'Update Project Status', 'livelihood-maintenance', "Set project '{$projName}' status to {$status}");
@@ -455,10 +447,7 @@ function slpProfileValidationError($d) {
     if (!slpDate($d['birthdate'] ?? '')) return 'Birthdate is required.';
     if (slpDate($d['birthdate'] ?? '') > date('Y-m-d')) return 'Birthdate cannot be in the future.';
     if (slpDate($d['dateApplied'] ?? '') > date('Y-m-d')) return 'Date Applied cannot be in the future.';
-    // Civil status enum is Single/Married/Widowed/Separated/Divorced -- the
-    // form's dropdown currently shows "Annulled" instead of "Divorced",
-    // which does not exist as a value; treated as invalid/blank here so it
-    // 422s cleanly rather than failing as a raw DB constraint violation.
+    // Form dropdown shows "Annulled" which isn't a valid enum value; treated as invalid so it 422s cleanly.
     $validCivil = ['Single', 'Married', 'Widowed', 'Separated', 'Divorced'];
     if (!in_array($d['civilStatus'] ?? '', $validCivil, true)) return 'Civil status is required.';
     $bgyId = (!empty($d['barangayId']) && is_numeric($d['barangayId']) && (int) $d['barangayId'] > 0)
@@ -817,10 +806,8 @@ function slpAssignProject() {
     if (!$proj) error('Project not found.', 404);
     $status = $proj['status'];
     if ($status !== 'Planned') error('Only Planned projects can be assigned.', 409);
-    // A project's SLP Track (Individual/Association/Employment) represents a
-    // distinct assistance mechanism from the applicant's own track -- an
-    // Association-track project can't be assigned to an Individual-track
-    // applicant and vice versa.
+    // A project's SLP Track must match the applicant's own track (e.g. Association
+    // project can't be assigned to an Individual-track applicant).
     if ($proj['slp_track'] !== $bsRow['slp_track']) {
         error("This applicant's SLP Track ({$bsRow['slp_track']}) does not match this project's SLP Track ({$proj['slp_track']}).", 409);
     }
@@ -1080,9 +1067,7 @@ function slpFetchProjectDocuments($projectId) {
     }, $s->fetchAll());
 }
 
-// ═══════════════════════════════════════════════════════════════════════════════
-// RECYCLE BIN  (soft-deleted SLP beneficiaries)
-// ═══════════════════════════════════════════════════════════════════════════════
+// Recycle bin for soft-deleted SLP beneficiaries.
 
 // Maps each recycle-bin record type to its table and primary key.
 function slpRecycleMap() {
@@ -1208,10 +1193,8 @@ function slpPurgeRecord() {
 function slpPurgeExpired() {
     $uid = currentUserId();
 
-    // Applicants: beneficiaries.deleted_at is a SHARED column (one row per
-    // person, not per-service) -- an unscoped query here would let SLP's
-    // sweep pick up and hard-delete someone who actually belongs to a
-    // different module. Scoped exactly like slpListDeleted().
+    // beneficiaries.deleted_at is shared across modules; scoped exactly like slpListDeleted()
+    // to avoid hard-deleting someone from a different module.
     $appS = db()->prepare(
         "SELECT b.beneficiary_id AS id
          FROM beneficiaries b

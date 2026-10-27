@@ -1,12 +1,6 @@
 <?php
-// Skills Training: trainings/activities (skills_training_activities, each
-// carrying its own free-typed batch_name) -> participants
-// (skills_training_activity_participants), plus profiles (beneficiary spine +
-// skills_training_profiles + classification and skills_training_profile_options
-// for qualification/purpose choices). Assignment status is read live from
-// skills_training_activity_participants, not stored. Attendance is tracked via
-// stUpdateAttendance() below; a Completed training only counts toward
-// Aging/job-placement eligibility when attended=true.
+// Skills Training: activities -> participants, plus profiles. Assignment status is read
+// live, not stored; Completed only counts toward Aging/job-placement when attended=true.
 
 include_once __DIR__ . '/../core/helpers.php';
 include_once __DIR__ . '/../core/guard.php';
@@ -116,9 +110,7 @@ function stFormatActivity($r) {
         'facilitator'   => $r['facilitator'] ?? '',
         'participants'  => isset($r['participant_count']) ? (int)$r['participant_count'] : null,
         'assignedCount' => isset($r['assigned_count']) ? (int)$r['assigned_count'] : 0,
-        // Only meaningful once a training is actually Completed -- attended is
-        // still mostly NULL for a Planned/Ongoing training, so these come back
-        // as 0/0 until then rather than a real present/absent split.
+        // Only meaningful once Completed; otherwise attended is NULL so this stays 0/0.
         'presentCount'  => isset($r['present_count']) ? (int)$r['present_count'] : 0,
         'absentCount'   => isset($r['absent_count']) ? (int)$r['absent_count'] : 0,
         'status'        => $r['status'],
@@ -225,9 +217,8 @@ function stUpdateActivityStatus($id) {
     $prevS = db()->prepare("SELECT status FROM skills_training_activities WHERE activity_id=:id");
     $prevS->execute([':id' => (int)$id]);
     $prevStatus = $prevS->fetchColumn();
-    // Only stamp completed_at on the actual Planned/Ongoing -> Completed transition
-    // (matches stUpdateActivity's guard) -- otherwise reopening a training and
-    // marking it Completed again resets everyone's aging clock to "just now".
+    // Only stamp completed_at on the actual transition to Completed, so reopening and
+    // re-completing a training doesn't reset everyone's aging clock.
     $completedAt = ($status === 'Completed' && $prevStatus !== 'Completed') ? ',completed_at=now()' : '';
     db()->prepare("UPDATE skills_training_activities SET status=:s,updated_at=now(){$completedAt} WHERE activity_id=:id")
         ->execute([':s' => $status, ':id' => (int)$id]);
@@ -403,10 +394,7 @@ function stAddParticipant() {
     $pdo = db();
     $pdo->beginTransaction();
     try {
-        // A profile keeps every past assignment as history (PESO allows availing
-        // more than one training) -- only the current/active one is ever removed
-        // (see stRemoveParticipant), so re-assigning just adds a new row rather
-        // than deleting the old one.
+        // Past assignments are kept as history; re-assigning adds a new row instead of deleting the old one.
         $pdo->prepare("INSERT INTO skills_training_activity_participants(activity_id,beneficiary_service_id,attended) VALUES(:a,:b,NULL)")->execute([':a' => $actId, ':b' => $bsId]);
         $pdo->commit();
     } catch (Throwable $e) {
@@ -590,12 +578,8 @@ function stBuildProfile($bid) {
         else { $purposeOfTraining[] = $row['purpose_name']; }
     }
 
-    // Pulls every training this person has ever been part of, oldest to newest
-    // by SCHEDULED date, then walks backwards to find their real current one
-    // (the most recent that isn't Completed yet) -- sorting by activity_id
-    // alone would pick whichever training happens to have been CREATED most
-    // recently, which isn't necessarily the one they're actually in now (e.g.
-    // reassigned into an older, still-Planned training after a newer one).
+    // Walks trainings oldest-to-newest by scheduled date, then backwards to find the real
+    // current one (most recent not-yet-Completed) -- sort by activity_id alone is unreliable.
     $assignS = db()->prepare(
         "SELECT a.activity_id, a.activity_title, a.status, p.attended
          FROM skills_training_activity_participants p
@@ -611,9 +595,7 @@ function stBuildProfile($bid) {
         if ($row['status'] !== 'Completed') { $assigned = $row; break; }
     }
     if (!$assigned && !empty($allAssignments)) $assigned = end($allAssignments);
-    // A training marked Completed only counts as completed for beneficiaries who
-    // actually attended -- someone marked absent (or never marked) should not be
-    // eligible for Record Job Placement or completion-based reporting.
+    // Completed only counts for beneficiaries who actually attended; absent/unmarked is not eligible.
     $assignedStatus = null;
     if ($assigned) {
         $assignedStatus = ($assigned['status'] === 'Completed' && !(bool)$assigned['attended'])
@@ -621,10 +603,8 @@ function stBuildProfile($bid) {
             : $assigned['status'];
     }
 
-    // PESO wants staff warned (not blocked) when re-assigning someone within 6
-    // months of a training they actually finished -- only a genuine completion
-    // (status Completed AND attended) starts this clock, same rule as Absent
-    // above, so a training they skipped never counts against them.
+    // Staff get a warning (not a block) re-assigning within 6 months of a genuine completion
+    // (Completed AND attended); a skipped training never starts this clock.
     $lastCompS = db()->prepare(
         "SELECT a.activity_title, a.completed_at, a.activity_date
          FROM skills_training_activity_participants p
@@ -636,9 +616,7 @@ function stBuildProfile($bid) {
     $lastCompS->execute([':bsid' => $bsId]);
     $lastCompleted = $lastCompS->fetch();
 
-    // Same "has a job placement been recorded" check the Aging Report uses --
-    // powers the Skills Training list's own Aging filter (0-1/1-3/3-6/6+ months),
-    // so a placed beneficiary is correctly excluded from every bucket there too.
+    // Same placement check the Aging Report uses, so placed beneficiaries are excluded from every aging bucket.
     $placedS = db()->prepare("SELECT EXISTS(SELECT 1 FROM job_placements WHERE beneficiary_service_id = :bsid AND deleted_at IS NULL) AS placed");
     $placedS->execute([':bsid' => $bsId]);
     $placed = (bool)$placedS->fetchColumn();
@@ -901,11 +879,8 @@ function stUpdateProfile($id) {
     $validStatus = ['Pending','Accepted','Waitlisted','Rejected'];
     $appStatus = in_array($d['status'] ?? '', $validStatus, true) ? $d['status'] : 'Waitlisted';
 
-    // Accepted is required to be assigned a training, so an Accepted applicant
-    // can't be moved to another status while they are in a Planned or Ongoing
-    // training. Planned can be unassigned first (see stRemoveParticipant); Ongoing
-    // can't, and they should simply stay Accepted while it runs. A Completed
-    // training stays on record and does not block a later status change.
+    // An Accepted applicant can't change status while in a Planned/Ongoing training
+    // (Planned can be unassigned first); Completed trainings don't block status changes.
     if ($appStatus !== 'Accepted') {
         $curS = db()->prepare("SELECT application_status FROM skills_training_profiles WHERE skills_training_profile_id=:pid");
         $curS->execute([':pid' => $profileId]);
@@ -992,9 +967,7 @@ function stDeleteProfile($id) {
     json(['status' => 'ok', 'message' => 'Applicant moved to recycle bin.']);
 }
 
-// ═══════════════════════════════════════════════════════════════════════════════
-// RECYCLE BIN (soft-deleted Skills Training applicants)
-// ═══════════════════════════════════════════════════════════════════════════════
+// Recycle bin for soft-deleted Skills Training applicants.
 
 // Maps each recycle-bin record type to its table and primary key.
 function stRecycleMap() {
@@ -1108,10 +1081,8 @@ function stPurgeRecord() {
 function stPurgeExpired() {
     $uid = currentUserId();
 
-    // Applicants: beneficiaries.deleted_at is a SHARED column (one row per
-    // person, not per-service) -- an unscoped query here would let Skills
-    // Training's sweep pick up and hard-delete someone who actually belongs
-    // to a different module. Scoped exactly like stListDeleted().
+    // beneficiaries.deleted_at is shared across modules; scoped exactly like stListDeleted()
+    // to avoid hard-deleting someone from a different module.
     $appS = db()->prepare(
         "SELECT b.beneficiary_id AS id
          FROM beneficiaries b
@@ -1172,10 +1143,8 @@ function stHardDeleteApplicant($bid) {
         }
         $pdo->prepare("DELETE FROM attached_documents WHERE beneficiary_id = :id AND document_source = 'Skills Training'")->execute([':id' => $bid]);
         $pdo->prepare("DELETE FROM beneficiary_classifications WHERE beneficiary_id = :id")->execute([':id' => $bid]);
-        // Matches cdsp.php/gip.php/employment.php's hard-delete exactly: unscoped
-        // deletes of beneficiary_services/beneficiaries, not just this module's rows.
-        // Pre-existing, deliberately-kept-consistent cross-module behavior (see
-        // cdspHardDeleteApplicant's comment) -- not something to "fix" per-module.
+        // Matches cdsp.php/gip.php/employment.php's hard-delete: unscoped deletes, kept
+        // consistent across modules deliberately -- not a per-module bug to fix.
         $pdo->prepare("DELETE FROM beneficiary_services WHERE beneficiary_id = :id")->execute([':id' => $bid]);
         $pdo->prepare("DELETE FROM beneficiaries WHERE beneficiary_id = :id")->execute([':id' => $bid]);
 
