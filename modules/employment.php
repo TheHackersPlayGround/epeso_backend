@@ -226,10 +226,11 @@ function employmentCreateApplicant()
         // Enroll in the Employment Facilitation service.
         $stmt = $pdo->prepare(
             "INSERT INTO beneficiary_services (beneficiary_id, service_id, date_applied, received_by)
-             VALUES (:bid, :sid, CURRENT_DATE, :uid)
+             VALUES (:bid, :sid, :applied, :rby)
              RETURNING beneficiary_service_id"
         );
-        $stmt->execute([':bid' => $beneficiaryId, ':sid' => efServiceId(), ':uid' => $uid]);
+        [$applied, $receivedBy] = employmentOfficeFields($d, $uid);
+        $stmt->execute([':bid' => $beneficiaryId, ':sid' => efServiceId(), ':applied' => $applied, ':rby' => $receivedBy]);
         $bsId = (int) $stmt->fetchColumn();
 
         employmentInsertEfProfile($pdo, $bsId, $d);
@@ -277,10 +278,11 @@ function employmentImportApplicantsBulk()
 
             $stmt = $pdo->prepare(
                 "INSERT INTO beneficiary_services (beneficiary_id, service_id, date_applied, received_by)
-                 VALUES (:bid, :sid, CURRENT_DATE, :uid)
+                 VALUES (:bid, :sid, :applied, :rby)
                  RETURNING beneficiary_service_id"
             );
-            $stmt->execute([':bid' => $beneficiaryId, ':sid' => efServiceId(), ':uid' => $uid]);
+            [$applied, $receivedBy] = employmentOfficeFields($d, $uid);
+            $stmt->execute([':bid' => $beneficiaryId, ':sid' => efServiceId(), ':applied' => $applied, ':rby' => $receivedBy]);
             $bsId = (int) $stmt->fetchColumn();
 
             employmentInsertEfProfile($pdo, $bsId, $d);
@@ -305,6 +307,26 @@ function employmentImportApplicantsBulk()
     }
 
     json(['status' => 'ok', 'message' => 'Applicants saved.', 'data' => ['ids' => $ids, 'count' => count($ids)]]);
+}
+
+// "For PESO Office Only" section: Date Applied and Received By. A blank Date Applied means
+// today and a blank Received By means the logged-in staff member's name. When updating,
+// $keepIfBlank leaves the saved value untouched instead (a blank must not overwrite it).
+function employmentOfficeFields($d, $uid, $keepIfBlank = false)
+{
+    $date = efDateOrNull($d['dateApplicationReceived'] ?? '');
+    $by   = efNull($d['receivedBy'] ?? '');
+    if ($by !== null) $by = mb_substr(trim(preg_replace('/\s+/u', ' ', $by)), 0, 150);
+    if (!$keepIfBlank) {
+        if ($date === null) $date = date('Y-m-d');
+        if ($by === null) {
+            $s = db()->prepare("SELECT trim(first_name || ' ' || last_name) FROM users WHERE user_id = :id");
+            $s->execute([':id' => $uid]);
+            $name = $s->fetchColumn();
+            $by = ($name !== false && $name !== '') ? $name : null;
+        }
+    }
+    return [$date, $by];
 }
 
 // Required-field + enum validation. Returns an error string, or '' if valid.
@@ -333,6 +355,15 @@ function employmentValidateApplicant($d)
     }
     if (efDateOrNull($d['dateOfBirth'] ?? '') > date('Y-m-d')) {
         return 'Date of Birth cannot be in the future.';
+    }
+    // Date Applied (optional): a real date, and not in the future.
+    $applied = efNull($d['dateApplicationReceived'] ?? '');
+    if ($applied !== null) {
+        $appliedDate = efDateOrNull($applied);
+        if ($appliedDate === null || !checkdate((int) substr($appliedDate, 5, 2), (int) substr($appliedDate, 8, 2), (int) substr($appliedDate, 0, 4))) {
+            return 'Date Applied is not a valid date.';
+        }
+        if ($appliedDate > date('Y-m-d')) return 'Date Applied cannot be in the future.';
     }
     // barangay_id is required by the DB and comes from the address combobox.
     if (!isset($d['barangayId']) || !is_numeric($d['barangayId'])) {
@@ -866,7 +897,7 @@ function employmentBuildApplicant($bid)
 {
     $stmt = db()->prepare(
         "SELECT b.*, bgy.barangay_name, c.city_name, c.city_id, p.province_name, p.province_id, r.region_name,
-                bs.beneficiary_service_id, bs.date_applied
+                bs.beneficiary_service_id, bs.date_applied, bs.received_by
          FROM beneficiaries b
          JOIN beneficiary_services bs ON bs.beneficiary_id = b.beneficiary_id AND bs.service_id = :sid
          LEFT JOIN barangays bgy ON bgy.barangay_id = b.barangay_id
@@ -1002,6 +1033,8 @@ function employmentBuildApplicant($bid)
         'isFormerOFW' => !empty($ef['is_former_ofw']) ? 'Yes' : 'No', 'formerOFWCountry' => $ef['former_ofw_country'] ?? '',
         'formerOFWReturnDate' => $ef['former_ofw_return_date'] ?? '',
         'is4PsBeneficiary' => !empty($b['is_4ps_beneficiary']) ? 'Yes' : 'No', 'householdIdNo' => $ef['household_id_no'] ?? '',
+        // For PESO Office Only
+        'dateApplicationReceived' => $b['date_applied'] ?? '', 'receivedBy' => $b['received_by'] ?? '',
         'employmentStatus' => $ef['employment_status'] ?? '', 'employmentType' => $ef['employment_type'] ?? '',
         'selfEmploymentType' => $selfEmploymentType, 'selfEmploymentOther' => $selfEmploymentOther,
         'unemploymentReason' => $ef['unemployment_reason'] ?? '', 'unemploymentReasonOther' => $ef['other_reason'] ?? '',
@@ -1167,6 +1200,14 @@ function employmentUpdateApplicant($id)
             ':contact' => efNull($d['contactNumber'] ?? ''), ':email' => efNull($d['email'] ?? ''),
             ':is4ps' => efYes($d['is4PsBeneficiary'] ?? '') ? 'true' : 'false', ':educ' => efDeriveEducation($d), ':bid' => $bid,
         ]);
+
+        // For PESO Office Only: change Date Applied / Received By only when they were filled in.
+        [$applied, $receivedBy] = employmentOfficeFields($d, null, true);
+        $pdo->prepare(
+            "UPDATE beneficiary_services
+             SET date_applied = COALESCE(:applied, date_applied), received_by = COALESCE(:rby, received_by), updated_at = now()
+             WHERE beneficiary_service_id = :bsid"
+        )->execute([':applied' => $applied, ':rby' => $receivedBy, ':bsid' => $bsId]);
 
         // Replace the EF profile + all resume rows (simplest correct update).
         $pdo->prepare("DELETE FROM employment_facilitation_profiles WHERE beneficiary_service_id = :id")->execute([':id' => $bsId]);
