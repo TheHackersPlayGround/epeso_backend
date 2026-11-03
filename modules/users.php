@@ -118,6 +118,14 @@ function usersList()
     json(['status' => 'ok', 'users' => $out]);
 }
 
+// 3-30 characters: letters, numbers, dots, underscores and dashes; must start with a letter or number.
+function checkUsernameFormat($username)
+{
+    if (!preg_match('/^[A-Za-z0-9][A-Za-z0-9._-]{2,29}$/', $username)) {
+        error('Username must be 3 to 30 characters and can only contain letters, numbers, dots, underscores and dashes (no spaces).', 422);
+    }
+}
+
 // Creates a new user account.
 function usersCreate()
 {
@@ -147,8 +155,10 @@ function usersCreate()
         error('Only an Administrator can create an Administrator account.', 403);
     }
 
-    // Username must be unique.
-    $check = db()->prepare("SELECT 1 FROM users WHERE username = :u AND deleted_at IS NULL");
+    checkUsernameFormat($username);
+
+    // Username must be unique (ignoring upper/lower case).
+    $check = db()->prepare("SELECT 1 FROM users WHERE lower(username) = lower(:u) AND deleted_at IS NULL");
     $check->execute([':u' => $username]);
     if ($check->fetch()) {
         error('That username is already taken.', 409);
@@ -211,7 +221,7 @@ function usersUpdate($id)
         error('A valid user id is required.', 422);
     }
 
-    $existing = db()->prepare("SELECT role FROM users WHERE user_id = :id");
+    $existing = db()->prepare("SELECT role, username FROM users WHERE user_id = :id");
     $existing->execute([':id' => $id]);
     $target = $existing->fetch();
     if (!$target) {
@@ -242,8 +252,14 @@ function usersUpdate($id)
         error('Only an Administrator can modify Administrator accounts.', 403);
     }
 
-    // Username must be unique among OTHER users.
-    $check = db()->prepare("SELECT 1 FROM users WHERE username = :u AND user_id <> :id AND deleted_at IS NULL");
+    // Only enforce the format when the username is being changed, so an older
+    // account with a non-conforming name can still have its role/status edited.
+    if ($username !== $target['username']) {
+        checkUsernameFormat($username);
+    }
+
+    // Username must be unique among OTHER users (ignoring upper/lower case).
+    $check = db()->prepare("SELECT 1 FROM users WHERE lower(username) = lower(:u) AND user_id <> :id AND deleted_at IS NULL");
     $check->execute([':u' => $username, ':id' => $id]);
     if ($check->fetch()) {
         error('That username is already taken.', 409);
