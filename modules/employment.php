@@ -1704,6 +1704,8 @@ function efBuildVacancy($row)
         'requirements'   => $row['requirements'] ?? '',
         'status'         => $effective,   // effective (display/filter/referral)
         'manualStatus'   => $manual,      // officer intent (drives the toggle)
+        // The day the vacancy was entered; the LMI report counts vacancies by this date.
+        'createdDate'    => isset($row['created_at']) ? substr($row['created_at'], 0, 10) : '',
     ];
 }
 
