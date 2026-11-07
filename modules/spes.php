@@ -3,6 +3,7 @@
 
 include_once __DIR__ . '/../core/helpers.php';
 include_once __DIR__ . '/../core/guard.php';
+include_once __DIR__ . '/../core/duplicates.php';
 include_once __DIR__ . '/../core/activity_log.php';
 
 // Routes a SPES action to its handler function.
@@ -533,6 +534,12 @@ function spesImportProfilesBulk() {
     }
     if ($errors) error('Validation failed. No records were imported.', 422, ['errors' => $errors]);
 
+    // Possible duplicates (same name and birthdate): ask the user first; rows repeated in the file are dropped.
+    [$rows, $skipped] = dupGateImport('spes', $rows, 'firstName', 'lastName', 'birthdate', $body);
+    if (!$rows) {
+        json(['status' => 'ok', 'message' => 'Every row was a duplicate, so nothing was imported.', 'data' => ['ids' => [], 'count' => 0, 'skipped' => $skipped]]);
+    }
+
     $pdo = db();
     $ids = [];
     try {
@@ -549,11 +556,10 @@ function spesImportProfilesBulk() {
         ]);
     }
 
-    foreach ($rows as $d) {
-        logActivity($uid, 'Create Profile', 'spes', "Created applicant: " . trim($d['lastName']) . ", " . trim($d['firstName']));
-    }
+    // One log line for the whole import, not one per person.
+    logActivity($uid, 'Import Records', 'spes', "Imported " . count($ids) . " SPES applicants" . ($skipped > 0 ? " ({$skipped} duplicate row" . ($skipped === 1 ? '' : 's') . " skipped)" : ''));
 
-    json(['status' => 'ok', 'message' => 'Profiles saved.', 'data' => ['ids' => $ids, 'count' => count($ids)]]);
+    json(['status' => 'ok', 'message' => 'Profiles saved.', 'data' => ['ids' => $ids, 'count' => count($ids), 'skipped' => $skipped]]);
 }
 
 // Updates a SPES profile.

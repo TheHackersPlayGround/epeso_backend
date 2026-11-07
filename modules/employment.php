@@ -4,6 +4,7 @@
 
 include_once __DIR__ . '/../core/helpers.php';
 include_once __DIR__ . '/../core/guard.php';
+include_once __DIR__ . '/../core/duplicates.php';
 include_once __DIR__ . '/../core/activity_log.php';
 
 // Router entry point. index.php calls this with the parsed action/id/method.
@@ -269,6 +270,12 @@ function employmentImportApplicantsBulk()
         error('Validation failed. No records were imported.', 422, ['errors' => $errors]);
     }
 
+    // Possible duplicates (same name and birthdate): ask the user first; rows repeated in the file are dropped.
+    [$rows, $skipped] = dupGateImport('ef', $rows, 'firstName', 'surname', 'dateOfBirth', $body);
+    if (!$rows) {
+        json(['status' => 'ok', 'message' => 'Every row was a duplicate, so nothing was imported.', 'data' => ['ids' => [], 'count' => 0, 'skipped' => $skipped]]);
+    }
+
     $pdo = db();
     $ids = [];
     try {
@@ -302,11 +309,10 @@ function employmentImportApplicantsBulk()
         ]);
     }
 
-    foreach ($rows as $d) {
-        logActivity($uid, 'Create Applicant', 'employment', "Created applicant: " . trim($d['surname']) . ", " . trim($d['firstName']));
-    }
+    // One log line for the whole import, not one per person.
+    logActivity($uid, 'Import Records', 'employment', "Imported " . count($ids) . " Employment Facilitation applicants" . ($skipped > 0 ? " ({$skipped} duplicate row" . ($skipped === 1 ? '' : 's') . " skipped)" : ''));
 
-    json(['status' => 'ok', 'message' => 'Applicants saved.', 'data' => ['ids' => $ids, 'count' => count($ids)]]);
+    json(['status' => 'ok', 'message' => 'Applicants saved.', 'data' => ['ids' => $ids, 'count' => count($ids), 'skipped' => $skipped]]);
 }
 
 // "For PESO Office Only" section: Date Applied and Received By. A blank Date Applied means
@@ -1575,10 +1581,8 @@ function efImportEmployersBulk()
         ]);
     }
 
-    $uid = currentUserId();
-    foreach ($rows as $d) {
-        logActivity($uid, 'Create Employer', 'employment', "Created employer: " . trim($d['companyName']));
-    }
+    // One log line for the whole import, not one per employer.
+    logActivity(currentUserId(), 'Import Records', 'employment', "Imported " . count($ids) . " employers");
 
     json(['status' => 'ok', 'message' => 'Employers saved.', 'data' => ['ids' => $ids, 'count' => count($ids)]]);
 }

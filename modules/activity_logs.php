@@ -4,11 +4,13 @@
 
 include_once __DIR__ . '/../core/helpers.php';
 include_once __DIR__ . '/../core/guard.php';
+include_once __DIR__ . '/../core/activity_log.php';
 
 function handle($action, $id, $method)
 {
     switch ($action) {
         case 'list': requirePermission('security', 'Viewer'); return activityLogsList();
+        case 'logExport': requireLogin(); return activityLogsLogExport();
         default: error("Unknown Activity Logs action: {$action}", 404);
     }
 }
@@ -37,4 +39,23 @@ function activityLogsList()
     }, $s->fetchAll());
 
     json(['status' => 'ok', 'data' => $out]);
+}
+
+// Records one line for a data export (Excel/PDF/Word) that the browser just produced.
+// Exports are built client-side, so the browser tells us after the file is made.
+function activityLogsLogExport()
+{
+    $d = body();
+    $allowed = ['employment', 'ofw', 'cdsp', 'gip', 'spes', 'livelihood', 'skills', 'documents', 'security', 'report'];
+    $module = in_array($d['module'] ?? '', $allowed, true) ? $d['module'] : 'report';
+    $name = mb_substr(trim((string) ($d['name'] ?? '')), 0, 200);
+    if ($name === '') error('Export name is required.', 422);
+    $format = in_array($d['format'] ?? '', ['Excel', 'PDF', 'Word'], true) ? $d['format'] : null;
+    $rows = isset($d['rows']) && is_numeric($d['rows']) && (int) $d['rows'] >= 0 ? (int) $d['rows'] : null;
+
+    $details = "Exported {$name}" . ($format || $rows !== null
+        ? ' (' . implode(', ', array_filter([$format, $rows !== null ? $rows . ' row' . ($rows === 1 ? '' : 's') : null])) . ')'
+        : '');
+    logActivity(currentUserId(), 'Export Records', $module, $details);
+    json(['status' => 'ok']);
 }
