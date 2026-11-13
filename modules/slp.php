@@ -6,6 +6,7 @@ include_once __DIR__ . '/../core/helpers.php';
 include_once __DIR__ . '/../core/guard.php';
 include_once __DIR__ . '/../core/duplicates.php';
 include_once __DIR__ . '/../core/activity_log.php';
+include_once __DIR__ . '/../core/submission_approval.php';
 
 // Routes an SLP action to its handler function.
 function handle($action, $id, $method)
@@ -584,17 +585,20 @@ function slpCreateProfile() {
     $d = body();
     $err = slpProfileValidationError($d);
     if ($err) error($err, 422);
+    $submissionId = submissionIdFromBody($d);
+    if ($submissionId !== null) submissionApprovalPrecheck('slp', $submissionId);
 
     $pdo = db();
     try {
         $pdo->beginTransaction();
         $bid = slpInsertProfileRow($pdo, $uid, $d);
+        if ($submissionId !== null) submissionApprovalMark($pdo, 'slp', $submissionId, $uid, $bid);
         $pdo->commit();
     } catch (Throwable $e) {
         if ($pdo->inTransaction()) $pdo->rollBack();
         error('Failed to save profile: ' . $e->getMessage(), 500);
     }
-    logActivity($uid, 'Create Profile', 'livelihood', "Created beneficiary: " . trim($d['lastName']) . ", " . trim($d['firstName']));
+    logActivity($uid, 'Create Profile', 'livelihood', "Created beneficiary: " . trim($d['lastName']) . ", " . trim($d['firstName']) . submissionApprovalLogNote($submissionId));
     json(['status' => 'ok', 'message' => 'Profile saved.', 'data' => slpBuildProfile($bid)]);
 }
 
@@ -980,7 +984,7 @@ function slpSyncDocuments($pdo, $bid, $bsId, $uid, $d) {
         if ($binary === false) continue;
 
         $origName = (string) ($doc['fileName'] ?? 'file');
-        $ext      = pathinfo($origName, PATHINFO_EXTENSION) ?: 'bin';
+        $ext = uploadExtOrFail($origName, $binary);
         $stored   = 'slp_' . $bid . '_doc_' . time() . '_' . mt_rand(1000, 9999) . '.' . $ext;
         if (file_put_contents(__DIR__ . '/../uploads/' . $stored, $binary) === false) continue;
 
@@ -1044,7 +1048,7 @@ function slpSyncProjectDocuments($pdo, $projectId, $uid, $docsPayload) {
         if ($binary === false) continue;
 
         $origName = (string) ($doc['name'] ?? $doc['fileName'] ?? 'file');
-        $ext      = pathinfo($origName, PATHINFO_EXTENSION) ?: 'bin';
+        $ext = uploadExtOrFail($origName, $binary);
         $stored   = 'slp_project_' . $projectId . '_' . time() . '_' . mt_rand(1000, 9999) . '.' . $ext;
         if (file_put_contents(__DIR__ . '/../uploads/' . $stored, $binary) === false) continue;
 

@@ -3,6 +3,7 @@
 
 include_once __DIR__ . '/../core/helpers.php';
 include_once __DIR__ . '/../core/guard.php';
+include_once __DIR__ . '/../core/location_queries.php';
 
 // Router entry point. index.php calls this with the parsed action/id/method.
 function handle($action, $id, $method)
@@ -29,15 +30,7 @@ function locationsSearchProvinces()
 {
     requireLogin();
     $search = isset($_GET['search']) ? trim($_GET['search']) : '';
-    $stmt = db()->prepare(
-        "SELECT province_id AS id, province_name AS name
-         FROM provinces
-         WHERE province_name ILIKE :q
-         ORDER BY province_name
-         LIMIT 100"
-    );
-    $stmt->execute([':q' => '%' . $search . '%']);
-    json(['status' => 'ok', 'data' => locationsIntIds($stmt->fetchAll())]);
+    json(['status' => 'ok', 'data' => locQueryProvinces($search)]);
 }
 
 // GET /api/locations/cities?provinceId=..&search=...
@@ -46,19 +39,8 @@ function locationsSearchCities()
 {
     requireLogin();
     $provinceId = isset($_GET['provinceId']) && is_numeric($_GET['provinceId']) ? (int) $_GET['provinceId'] : 0;
-    if (!$provinceId) {
-        json(['status' => 'ok', 'data' => []]);
-    }
     $search = isset($_GET['search']) ? trim($_GET['search']) : '';
-    $stmt = db()->prepare(
-        "SELECT city_id AS id, city_name AS name
-         FROM cities
-         WHERE province_id = :pid AND city_name ILIKE :q
-         ORDER BY city_name
-         LIMIT 200"
-    );
-    $stmt->execute([':pid' => $provinceId, ':q' => '%' . $search . '%']);
-    json(['status' => 'ok', 'data' => locationsIntIds($stmt->fetchAll())]);
+    json(['status' => 'ok', 'data' => locQueryCities($provinceId, $search)]);
 }
 
 // GET /api/locations/barangaysByCity?cityId=..&search=...
@@ -67,19 +49,8 @@ function locationsBarangaysByCity()
 {
     requireLogin();
     $cityId = isset($_GET['cityId']) && is_numeric($_GET['cityId']) ? (int) $_GET['cityId'] : 0;
-    if (!$cityId) {
-        json(['status' => 'ok', 'data' => []]);
-    }
     $search = isset($_GET['search']) ? trim($_GET['search']) : '';
-    $stmt = db()->prepare(
-        "SELECT barangay_id AS id, barangay_name AS name
-         FROM barangays
-         WHERE city_id = :cid AND barangay_name ILIKE :q
-         ORDER BY barangay_name
-         LIMIT 300"
-    );
-    $stmt->execute([':cid' => $cityId, ':q' => '%' . $search . '%']);
-    json(['status' => 'ok', 'data' => locationsIntIds($stmt->fetchAll())]);
+    json(['status' => 'ok', 'data' => locQueryBarangaysByCity($cityId, $search)]);
 }
 
 // GET /api/locations/allCities?search=... Cities shown as "City, Province" for the Work Experience field.
@@ -87,29 +58,7 @@ function locationsSearchAllCities()
 {
     requireLogin();
     $search = isset($_GET['search']) ? trim($_GET['search']) : '';
-    if ($search === '') {
-        json(['status' => 'ok', 'data' => []]);
-    }
-    $stmt = db()->prepare(
-        "SELECT c.city_id AS id, (c.city_name || ', ' || p.province_name) AS name
-         FROM cities c
-         JOIN provinces p ON p.province_id = c.province_id
-         WHERE c.city_name ILIKE :q
-         ORDER BY c.city_name, p.province_name
-         LIMIT 50"
-    );
-    $stmt->execute([':q' => '%' . $search . '%']);
-    json(['status' => 'ok', 'data' => locationsIntIds($stmt->fetchAll())]);
-}
-
-// Cast the `id` column of each row to int.
-function locationsIntIds($rows)
-{
-    foreach ($rows as &$r) {
-        $r['id'] = (int) $r['id'];
-    }
-    unset($r);
-    return $rows;
+    json(['status' => 'ok', 'data' => locQueryAllCities($search)]);
 }
 
 // GET /api/locations/barangays?search=... Returns up to 20 matches with city/province/region context.

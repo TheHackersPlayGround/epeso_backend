@@ -5,6 +5,7 @@
 include_once __DIR__ . '/../core/helpers.php';
 include_once __DIR__ . '/../core/guard.php';
 include_once __DIR__ . '/../core/activity_log.php';
+include_once __DIR__ . '/../core/submission_approval.php';
 
 // Routes an OFW action to its handler function.
 function handle($action, $id, $method)
@@ -127,7 +128,7 @@ function ofwSyncDocuments($pdo, $bid, $bsId, $uid, $d) {
         $binary = base64_decode($m[2], true);
         if ($binary === false) continue;
         $origName = (string) ($named[$type]['fileName'] ?? 'file');
-        $ext = pathinfo($origName, PATHINFO_EXTENSION) ?: 'bin';
+        $ext = uploadExtOrFail($origName, $binary);
         $stored = 'ofw_' . $bid . '_' . preg_replace('/[^a-zA-Z0-9]+/', '_', $type) . '_' . time() . '_' . mt_rand(1000, 9999) . '.' . $ext;
         if (file_put_contents(__DIR__ . '/../uploads/' . $stored, $binary) === false) continue;
         $ins->execute([
@@ -144,7 +145,7 @@ function ofwSyncDocuments($pdo, $bid, $bsId, $uid, $d) {
         $binary = base64_decode($m[2], true);
         if ($binary === false) continue;
         $origName = (string) ($doc['fileName'] ?? $doc['name'] ?? 'file');
-        $ext = pathinfo($origName, PATHINFO_EXTENSION) ?: 'bin';
+        $ext = uploadExtOrFail($origName, $binary);
         $stored = 'ofw_' . $bid . '_doc_' . time() . '_' . mt_rand(1000, 9999) . '.' . $ext;
         if (file_put_contents(__DIR__ . '/../uploads/' . $stored, $binary) === false) continue;
         $custom = ofwNullStr($doc['name'] ?? '');
@@ -362,6 +363,8 @@ function ofwCreateProfile() {
     $uid = requireLogin();
     $d = body();
     [$sex, $birth, $civil, $bgyId, $emp, $refNo, $filed] = ofwValidateProfileInput($d);
+    $submissionId = submissionIdFromBody($d);
+    if ($submissionId !== null) submissionApprovalPrecheck('ofw', $submissionId);
 
     $validStatus = ['Pending', 'Approved', 'Ongoing', 'Completed', 'Rejected'];
     $status = in_array($d['status'] ?? '', $validStatus, true) ? $d['status'] : 'Pending';
@@ -407,13 +410,14 @@ function ofwCreateProfile() {
 
         ofwSyncSelections($pdo, $profileId, $d);
         ofwSyncDocuments($pdo, $bid, $bsId, $uid, $d);
+        if ($submissionId !== null) submissionApprovalMark($pdo, 'ofw', $submissionId, $uid, $bid);
 
         $pdo->commit();
     } catch (Throwable $e) {
         if ($pdo->inTransaction()) $pdo->rollBack();
         error('Failed to save profile: ' . $e->getMessage(), 500);
     }
-    logActivity($uid, 'Create Profile', 'ofw', "Created applicant: " . trim($d['lastName']) . ", " . trim($d['firstName']));
+    logActivity($uid, 'Create Profile', 'ofw', "Created applicant: " . trim($d['lastName']) . ", " . trim($d['firstName']) . submissionApprovalLogNote($submissionId));
     json(['status' => 'ok', 'message' => 'Profile saved.', 'data' => ofwBuildProfile($bid)]);
 }
 

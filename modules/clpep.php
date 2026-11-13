@@ -6,6 +6,7 @@ include_once __DIR__ . '/../core/helpers.php';
 include_once __DIR__ . '/../core/guard.php';
 include_once __DIR__ . '/../core/duplicates.php';
 include_once __DIR__ . '/../core/activity_log.php';
+include_once __DIR__ . '/../core/submission_approval.php';
 
 // Routes a CLPEP action to its handler function.
 function handle($action, $id, $method)
@@ -473,17 +474,20 @@ function clpepCreateProfile() {
     $d = body();
     $err = clpepProfileValidationError($d);
     if ($err) error($err, 422);
+    $submissionId = submissionIdFromBody($d);
+    if ($submissionId !== null) submissionApprovalPrecheck('clpep', $submissionId);
 
     $pdo = db();
     try {
         $pdo->beginTransaction();
         $bid = clpepInsertProfileRow($pdo, $uid, $d);
+        if ($submissionId !== null) submissionApprovalMark($pdo, 'clpep', $submissionId, $uid, $bid);
         $pdo->commit();
     } catch (Throwable $e) {
         if ($pdo->inTransaction()) $pdo->rollBack();
         error('Failed to save profile: ' . $e->getMessage(), 500);
     }
-    logActivity($uid, 'Create Profile', 'livelihood', "Created beneficiary: " . trim($d['lastName']) . ", " . trim($d['firstName']));
+    logActivity($uid, 'Create Profile', 'livelihood', "Created beneficiary: " . trim($d['lastName']) . ", " . trim($d['firstName']) . submissionApprovalLogNote($submissionId));
     json(['status' => 'ok', 'message' => 'Profile saved.', 'data' => clpepBuildProfile($bid)]);
 }
 
@@ -751,7 +755,7 @@ function clpepSyncDocuments($pdo, $bid, $bsId, $uid, $d) {
         if ($binary === false) continue;
 
         $origName = (string) ($doc['fileName'] ?? 'file');
-        $ext      = pathinfo($origName, PATHINFO_EXTENSION) ?: 'bin';
+        $ext = uploadExtOrFail($origName, $binary);
         $stored   = 'clpep_' . $bid . '_doc_' . time() . '_' . mt_rand(1000, 9999) . '.' . $ext;
         if (file_put_contents(__DIR__ . '/../uploads/' . $stored, $binary) === false) continue;
 
@@ -815,7 +819,7 @@ function clpepSyncInterventionDocuments($pdo, $interventionId, $uid, $docsPayloa
         if ($binary === false) continue;
 
         $origName = (string) ($doc['name'] ?? $doc['fileName'] ?? 'file');
-        $ext      = pathinfo($origName, PATHINFO_EXTENSION) ?: 'bin';
+        $ext = uploadExtOrFail($origName, $binary);
         $stored   = 'clpep_intervention_' . $interventionId . '_' . time() . '_' . mt_rand(1000, 9999) . '.' . $ext;
         if (file_put_contents(__DIR__ . '/../uploads/' . $stored, $binary) === false) continue;
 

@@ -10,6 +10,7 @@ date_default_timezone_set('Asia/Manila');
 include_once __DIR__ . '/core/cors.php';
 include_once __DIR__ . '/core/db.php';
 include_once __DIR__ . '/core/response.php';
+include_once __DIR__ . '/core/uploads.php';
 
 // --- Parse the path into segments after "/api/" ---
 $uri = parse_url($_SERVER['REQUEST_URI'], PHP_URL_PATH);

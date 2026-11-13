@@ -219,6 +219,17 @@ function employmentCreateApplicant()
         error($errors, 422);
     }
 
+    // Approving a kiosk submission (Pending inbox): the form is saved exactly like a normal Add,
+    // and the submission is marked Approved in the same transaction below.
+    $submissionId = isset($d['submissionId']) && is_numeric($d['submissionId']) ? (int) $d['submissionId'] : null;
+    if ($submissionId !== null) {
+        $chk = db()->prepare("SELECT status::text FROM applicant_submissions WHERE submission_id = :id AND program = 'ef'");
+        $chk->execute([':id' => $submissionId]);
+        $st = $chk->fetchColumn();
+        if ($st === false) error('Submission not found.', 404);
+        if ($st !== 'Pending') error('This submission was already approved or rejected.', 409);
+    }
+
     $pdo = db();
     try {
         $pdo->beginTransaction();
@@ -240,13 +251,24 @@ function employmentCreateApplicant()
         employmentSavePhoto($pdo, $beneficiaryId, $bsId, $uid, $d);
         employmentSyncDocuments($pdo, $beneficiaryId, $bsId, $uid, $d);
 
+        if ($submissionId !== null) {
+            $mark = $pdo->prepare(
+                "UPDATE applicant_submissions
+                 SET status = 'Approved', reviewed_by = :uid, reviewed_at = now(), beneficiary_id = :bid
+                 WHERE submission_id = :id AND program = 'ef' AND status = 'Pending'"
+            );
+            $mark->execute([':uid' => $uid, ':bid' => $beneficiaryId, ':id' => $submissionId]);
+            // Someone else handled it between the check above and now: undo this save.
+            if ($mark->rowCount() !== 1) throw new RuntimeException('This submission was already approved or rejected.');
+        }
+
         $pdo->commit();
     } catch (Throwable $e) {
         if ($pdo->inTransaction()) $pdo->rollBack();
         error('Failed to save applicant: ' . $e->getMessage(), 500);
     }
 
-    logActivity($uid, 'Create Applicant', 'employment', "Created applicant: " . trim($d['surname']) . ", " . trim($d['firstName']));
+    logActivity($uid, 'Create Applicant', 'employment', "Created applicant: " . trim($d['surname']) . ", " . trim($d['firstName']) . ($submissionId !== null ? " (approved from kiosk submission #{$submissionId})" : ''));
     json(['status' => 'ok', 'message' => 'Applicant saved.', 'data' => ['id' => $beneficiaryId]]);
 }
 
@@ -632,7 +654,7 @@ function employmentSyncDocuments($pdo, $bid, $bsId, $uid, $d)
         if ($binary === false) continue;
 
         $origName = (string) ($doc['fileName'] ?? 'file');
-        $ext      = pathinfo($origName, PATHINFO_EXTENSION) ?: 'bin';
+        $ext = uploadExtOrFail($origName, $binary);
         $stored   = 'ef_' . $bid . '_doc_' . time() . '_' . mt_rand(1000, 9999) . '.' . $ext;
         if (file_put_contents(__DIR__ . '/../uploads/' . $stored, $binary) === false) continue;
 

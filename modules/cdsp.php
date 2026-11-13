@@ -5,6 +5,7 @@ include_once __DIR__ . '/../core/helpers.php';
 include_once __DIR__ . '/../core/guard.php';
 include_once __DIR__ . '/../core/duplicates.php';
 include_once __DIR__ . '/../core/activity_log.php';
+include_once __DIR__ . '/../core/submission_approval.php';
 
 // Routes a CDSP action to its handler function.
 function handle($action, $id, $method)
@@ -178,7 +179,7 @@ function cdspSyncDocuments($pdo, $bid, $bsId, $uid, $d) {
         if ($binary === false) continue;
 
         $origName = (string) ($doc['fileName'] ?? $doc['name'] ?? 'file');
-        $ext      = pathinfo($origName, PATHINFO_EXTENSION) ?: 'bin';
+        $ext = uploadExtOrFail($origName, $binary);
         $stored   = 'cdsp_' . $bid . '_doc_' . time() . '_' . mt_rand(1000, 9999) . '.' . $ext;
         if (file_put_contents(__DIR__ . '/../uploads/' . $stored, $binary) === false) continue;
 
@@ -825,17 +826,20 @@ function cdspCreateProfile() {
     $d   = body();
     $err = cdspValidateProfile($d);
     if ($err) error($err, 422);
+    $submissionId = submissionIdFromBody($d);
+    if ($submissionId !== null) submissionApprovalPrecheck('cdsp', $submissionId);
 
     $pdo = db();
     try {
         $pdo->beginTransaction();
         $bid = cdspInsertProfileRow($pdo, $uid, $d);
+        if ($submissionId !== null) submissionApprovalMark($pdo, 'cdsp', $submissionId, $uid, $bid);
         $pdo->commit();
     } catch (Throwable $e) {
         if ($pdo->inTransaction()) $pdo->rollBack();
         error('Failed to save profile: ' . $e->getMessage(), 500);
     }
-    logActivity($uid, 'Create Profile', 'cdsp', "Created applicant: " . trim($d['lastName']) . ", " . trim($d['firstName']));
+    logActivity($uid, 'Create Profile', 'cdsp', "Created applicant: " . trim($d['lastName']) . ", " . trim($d['firstName']) . submissionApprovalLogNote($submissionId));
     json(['status'=>'ok','message'=>'Profile saved.','data'=>cdspBuildProfile($bid)]);
 }
 

@@ -6,3 +6,22 @@
 <IfModule mod_headers.c>
     Header set Access-Control-Allow-Origin "http://localhost:5173"
 </IfModule>
+
+# SECURITY: nothing in this folder may ever run as a script. Uploaded files are only ever documents and images,
+# so scripts and pages that could execute in the browser are refused outright, and PHP is switched off here
+# as a second lock in case a bad file ever got in.
+<FilesMatch "(?i)\.(php[0-9]?|phtml|phar|pht|phps|cgi|pl|py|sh|bat|cmd|exe|jsp|asp|aspx|html?|svg|js)$">
+    Require all denied
+</FilesMatch>
+<IfModule mod_php.c>
+    php_flag engine off
+</IfModule>
+<IfModule mod_php7.c>
+    php_flag engine off
+</IfModule>
+<IfModule mod_php8.c>
+    php_flag engine off
+</IfModule>
+Options -ExecCGI -Indexes
+RemoveHandler .php .phtml .php3 .php4 .php5 .php7 .phar
+RemoveType .php .phtml .php3 .php4 .php5 .php7 .phar

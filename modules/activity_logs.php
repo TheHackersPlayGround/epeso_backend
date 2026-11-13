@@ -29,7 +29,9 @@ function activityLogsList()
             'id'        => (int) $r['activity_log_id'],
             'timestamp' => $r['created_at'],
             // user_id is ON DELETE SET NULL so a purged account's history survives.
-            'user'      => $r['username'] ?? '(deleted user)',
+            // Kiosk submissions and the automatic clean-up have no user (not staff actions).
+            'user'      => $r['username'] ?? ($r['action'] === 'Kiosk Submission' ? 'Kiosk (applicant)'
+                          : ($r['action'] === 'Auto-Purge Submissions' ? 'System' : '(deleted user)')),
             'role'      => $r['role'] ?? '',
             'action'    => $r['action'],
             'module'    => $r['module_name'],

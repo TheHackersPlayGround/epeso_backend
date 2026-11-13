@@ -246,7 +246,7 @@ function docsUploadDocument()
     if (docsDocumentNameTaken($origName, $folderId)) {
         error("A file named \"{$origName}\" already exists here.", 409);
     }
-    $ext    = pathinfo($origName, PATHINFO_EXTENSION) ?: 'bin';
+    $ext = uploadExtOrFail($origName, $binary, true);
     $stored = 'doc_' . time() . '_' . mt_rand(1000, 9999) . '.' . $ext;
     if (file_put_contents(__DIR__ . '/../uploads/' . $stored, $binary) === false) {
         error('Failed to save the uploaded file.', 500);

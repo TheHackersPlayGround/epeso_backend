@@ -6,6 +6,7 @@ include_once __DIR__ . '/../core/helpers.php';
 include_once __DIR__ . '/../core/guard.php';
 include_once __DIR__ . '/../core/duplicates.php';
 include_once __DIR__ . '/../core/activity_log.php';
+include_once __DIR__ . '/../core/submission_approval.php';
 
 // Routes a Skills Training action to its handler function.
 function handle($action, $id, $method)
@@ -484,7 +485,7 @@ function stSyncDocuments($pdo, $bid, $bsId, $uid, $d) {
         if ($binary === false) continue;
 
         $origName = (string) ($doc['fileName'] ?? $doc['name'] ?? 'file');
-        $ext      = pathinfo($origName, PATHINFO_EXTENSION) ?: 'bin';
+        $ext = uploadExtOrFail($origName, $binary);
         $stored   = 'skills_' . $bid . '_doc_' . time() . '_' . mt_rand(1000, 9999) . '.' . $ext;
         if (file_put_contents(__DIR__ . '/../uploads/' . $stored, $binary) === false) continue;
 
@@ -795,17 +796,20 @@ function stCreateProfile() {
     $d   = body();
     $err = stValidateProfile($d);
     if ($err) error($err, 422);
+    $submissionId = submissionIdFromBody($d);
+    if ($submissionId !== null) submissionApprovalPrecheck('skills', $submissionId);
 
     $pdo = db();
     try {
         $pdo->beginTransaction();
         $bid = stInsertProfileRow($pdo, $uid, $d);
+        if ($submissionId !== null) submissionApprovalMark($pdo, 'skills', $submissionId, $uid, $bid);
         $pdo->commit();
     } catch (Throwable $e) {
         if ($pdo->inTransaction()) $pdo->rollBack();
         error('Failed to save profile: ' . $e->getMessage(), 500);
     }
-    logActivity($uid, 'Create Profile', 'skills', "Created applicant: " . trim($d['lastName']) . ", " . trim($d['firstName']));
+    logActivity($uid, 'Create Profile', 'skills', "Created applicant: " . trim($d['lastName']) . ", " . trim($d['firstName']) . submissionApprovalLogNote($submissionId));
     json(['status' => 'ok', 'message' => 'Profile saved.', 'data' => stBuildProfile($bid)]);
 }
 
