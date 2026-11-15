@@ -33,6 +33,11 @@ $action = isset($segments[1]) ? $segments[1] : 'index';
 $id     = isset($segments[2]) ? $segments[2] : null;
 $method = $_SERVER['REQUEST_METHOD'];
 
+// --- Public gate: requests that arrive through the public employer address (Cloudflare) may only reach the employer
+// modules; the employer modules use the limited database account when one is configured. See core/public_gate.php.
+include_once __DIR__ . '/core/public_gate.php';
+applyPublicGate($module);
+
 // --- Health check (Sprint 0 test) ---
 if ($module === null || $module === 'ping') {
     $dbStatus = 'unknown';

@@ -76,7 +76,7 @@ function kioskProgramRegistry()
         ],
         // ── Livelihood programs (staff permission "livelihood") and OFW ──
         // Not on the kiosk: assignments to a project/intervention, status, dates, received-by, remarks,
-        // documents, and (SLP) the assessment results + eligibility type + participant ID: staff set those.
+        // documents, and (SLP) the assessment results + participant ID: staff set those.
         'dilp' => [
             'label' => 'DOLE Integrated Livelihood Program', 'short' => 'DILP', 'prefix' => 'DL',
             'permission' => 'livelihood', 'module' => 'livelihood', 'dup' => 'dilp',
@@ -97,7 +97,7 @@ function kioskProgramRegistry()
             'first' => 'firstName', 'last' => 'lastName', 'birth' => 'birthdate',
             'contactRequired' => false,
             'allowed' => array_merge($core, [
-                'nameExtension', 'is4PsBeneficiary', 'sector', 'sectorOthersSpecify', 'sectorIpGroupSpecify',
+                'nameExtension', 'is4PsBeneficiary', 'eligibilityType', 'referringParty', 'sector', 'sectorOthersSpecify', 'sectorIpGroupSpecify',
                 'sectorDisabilitySpecify', 'educationalAttainment', 'sourceOfIncome', 'totalHouseholdMonthlyIncome',
             ]),
         ],

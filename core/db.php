@@ -11,6 +11,11 @@ function db()
 
     $config = include __DIR__ . '/../config.php';
     $c = $config['db'];
+    // Employer portal requests (see index.php) use their own, limited database account when config.php defines
+    // 'employer_db': it can read what employers may see and write only the employer tables, nothing else.
+    if (defined('EMPLOYER_REQUEST') && !empty($config['employer_db'])) {
+        $c = $config['employer_db'];
+    }
 
     // The hyphen in "e-peso_db" is fine inside the DSN string.
     $dsn = "pgsql:host={$c['host']};port={$c['port']};dbname={$c['name']}";

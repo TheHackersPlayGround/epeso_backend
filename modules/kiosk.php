@@ -214,6 +214,12 @@ function kioskProgramValidate($program, $d)
         if (!in_array($d['serviceAvailed'] ?? '', kioskCdspServiceNames(), true)) return 'Please choose a CDSP service.';
     }
     if ($program === 'slp' && !isset($d['is4PsBeneficiary'])) return 'Please choose your participant type (4Ps or Non-4Ps).';
+    if ($program === 'slp') {
+        // The eligibility type is optional on the kiosk, but when given it must be one of the form's choices.
+        $elig = (string) ($d['eligibilityType'] ?? '');
+        if ($elig !== '' && !in_array($elig, ['Regular', 'Disaster-Affected', 'Area-Based Convergence', 'Walk-In', 'Referral'], true)) return 'Please choose a valid eligibility type.';
+        if (mb_strlen((string) ($d['referringParty'] ?? '')) > 255) return 'The referring party is too long.';
+    }
     if ($program === 'ofw') {
         if (!in_array($d['employmentStatus'] ?? '', ['Employed', 'Unemployed', 'Self Employed', 'Underemployed'], true)) return 'Please choose your employment status.';
         if (isset($d['typeOfRequest']) && !is_array($d['typeOfRequest'])) return 'Invalid request type.';
