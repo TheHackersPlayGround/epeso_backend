@@ -191,7 +191,7 @@ function epReferrals($a)
 function epPlacements($a)
 {
     $s = db()->prepare(
-        "SELECT p.placement_id, bs.beneficiary_id AS applicant_id, " . EP_NAME_SQL . " AS applicant_name, v.job_title, p.date_hired, p.status::text AS status
+        "SELECT p.placement_id, p.vacancy_id, bs.beneficiary_id AS applicant_id, " . EP_NAME_SQL . " AS applicant_name, v.job_title, p.date_hired, p.status::text AS status
          FROM employment_facilitation_placements p
          JOIN vacancies v ON v.vacancy_id = p.vacancy_id
          JOIN beneficiary_services bs ON bs.beneficiary_service_id = p.beneficiary_service_id
@@ -201,7 +201,7 @@ function epPlacements($a)
     $s->execute([':e' => (int) $a['employer_id']]);
     $open = epOpenRequests($a['employer_id']);
     json(['status' => 'ok', 'data' => array_map(fn ($r) => [
-        'id' => (int) $r['placement_id'], 'applicantId' => (int) $r['applicant_id'], 'applicantName' => $r['applicant_name'],
+        'id' => (int) $r['placement_id'], 'vacancyId' => (int) $r['vacancy_id'], 'applicantId' => (int) $r['applicant_id'], 'applicantName' => $r['applicant_name'],
         'jobTitle' => $r['job_title'], 'dateHired' => $r['date_hired'], 'status' => $r['status'],
         'openRequest' => $open['placement'][(int) $r['placement_id']] ?? null,
     ], $s->fetchAll())]);
