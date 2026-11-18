@@ -8,6 +8,7 @@
 include_once __DIR__ . '/../core/helpers.php';
 include_once __DIR__ . '/../core/guard.php';
 include_once __DIR__ . '/../core/activity_log.php';
+include_once __DIR__ . '/../core/portal_status.php';
 
 function handle($action, $id, $method)
 {
@@ -118,6 +119,12 @@ function eaCreate()
         error('Username must be 4-50 characters: letters, numbers, dot, dash or underscore.', 422);
     }
     if (eaFetch($emp['employer_id'])) error('This employer already has a portal account.', 409);
+    // The portal account always has the same status as its employer, so a login is not created for an Inactive employer.
+    $empStatus = db()->prepare("SELECT status::text FROM employers WHERE employer_id = :id");
+    $empStatus->execute([':id' => $emp['employer_id']]);
+    if ($empStatus->fetchColumn() === 'Inactive') {
+        error('This employer is Inactive. Set the employer to Active first (Edit → Status), then create the portal account.', 409);
+    }
     $taken = db()->prepare("SELECT 1 FROM employer_portal_accounts WHERE username = :u");
     $taken->execute([':u' => $username]);
     if ($taken->fetchColumn()) error('That username is already taken.', 409);
@@ -165,10 +172,21 @@ function eaSetStatus($employerId)
     if (!in_array($status, ['Active', 'Inactive'], true)) error('Invalid status.', 422);
     if (!eaFetch($emp['employer_id'])) error('This employer has no portal account yet.', 404);
 
-    db()->prepare("UPDATE employer_portal_accounts SET status = :s, updated_at = now() WHERE employer_id = :eid")
-        ->execute([':s' => $status, ':eid' => $emp['employer_id']]);
+    // One transaction: the portal account and its employer always have the same status, so they change together or not at all.
+    $pdo = db();
+    $employerChanged = false;
+    try {
+        $pdo->beginTransaction();
+        $pdo->prepare("UPDATE employer_portal_accounts SET status = :s, updated_at = now() WHERE employer_id = :eid")
+            ->execute([':s' => $status, ':eid' => $emp['employer_id']]);
+        $employerChanged = syncEmployerToPortalAccount($pdo, $emp['employer_id'], $status);
+        $pdo->commit();
+    } catch (Throwable $e) {
+        if ($pdo->inTransaction()) $pdo->rollBack();
+        error('Could not change the status. Please try again.', 500);
+    }
 
     logActivity($uid, $status === 'Active' ? 'Activate Employer Portal Account' : 'Deactivate Employer Portal Account', 'employment',
-        "Set the portal account of {$emp['company_name']} to {$status}");
+        "Set the portal account of {$emp['company_name']} to {$status}" . ($employerChanged ? " (the employer is now {$status} too)" : ''));
     json(['status' => 'ok', 'message' => "Portal account is now {$status}.", 'data' => eaRow(eaFetch($emp['employer_id']))]);
 }

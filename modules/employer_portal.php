@@ -5,9 +5,11 @@
 // Employers never change the PESO's records: they send REQUESTS (referral status, placement status, company details),
 // which staff accept or reject in Employers tab -> Employer Updates (modules/employer_updates.php).
 //
-// Applicant details: only people referred to / hired by THIS company, and only Sections I-VIII of the application form.
-// Section IX (Referred Program: which PESO programs the applicant was referred to) and Section X ("For PESO Office Only":
-// date applied, received by, uploaded documents, the photo) are never returned: they are PESO-internal, not about the applicant's work.
+// Applicant details: only people referred to / hired by THIS company, and only what an employer needs to decide on an interview:
+// the name (middle INITIAL only), sex, age, contact details, address, and the work-related sections (language, education, training,
+// eligibility / license, work experience, other skills). Everything personal or PESO-internal is never returned: birth date, religion,
+// civil status, height, TIN, disability, 4Ps, OFW details, employment status, job preference (Section II), Section IX (Referred Program)
+// and Section X ("For PESO Office Only": date applied, received by, uploaded documents, the photo).
 //
 // Uploaded documents are the one exception, and only the ones staff CHOSE to send for a referral of this company (Refer screen /
 // Referrals tab -> Shared Documents), and only while that referral is active or hired. Files are streamed from here after the
@@ -51,18 +53,15 @@ const EP_COMPANY_FIELDS = [
     'street'                => 'street',
 ];
 
-// Sections I-VIII of the application form. Anything not listed here (Section IX: referred program; Section X: date applied,
-// received by, uploaded documents, the photo; and the program placeholders) is never sent to an employer.
+// The only application-form fields ever sent to an employer. Anything not listed here is never sent (see the note at the top).
+// The middle name and the birth date are not listed: epApplicant adds only the middle INITIAL and the age.
 const EP_APPLICANT_KEYS = [
-    // I. Personal information
-    'surname', 'firstName', 'middleName', 'suffix', 'dateOfBirth', 'sex', 'religion', 'civilStatus', 'height',
-    'houseNo', 'barangay', 'municipality', 'province', 'hasDisability', 'disabilityOther', 'tin', 'contactNumber', 'email',
-    'employmentStatus', 'employmentType', 'selfEmploymentType', 'selfEmploymentOther', 'unemploymentReason', 'unemploymentReasonOther', 'monthsLookingForWork',
-    'isOFW', 'ofwCountry', 'isFormerOFW', 'formerOFWCountry', 'formerOFWReturnDate', 'is4PsBeneficiary', 'householdIdNo',
-    // II. Job preference   III. Language   IV. Education   V. Training   VI. Eligibility / license   VII. Work experience   VIII. Other skills
-    'jobPrefEmploymentType', 'jobPrefWorkLocation', 'jobPreferences',
+    // Name, sex, contact, address
+    'surname', 'firstName', 'suffix', 'sex',
+    'houseNo', 'barangay', 'municipality', 'province', 'contactNumber', 'email',
+    // Language, education, training, eligibility / license, work experience, other skills
     'languages',
-    'currentlyInSchool', 'elementary', 'secondary', 'tertiary', 'graduateStudies',
+    'elementary', 'secondary', 'tertiary', 'graduateStudies',
     'trainings', 'eligibilities', 'professionalLicenses', 'workExperiences',
     'otherSkills', 'otherSkillsSpecify',
 ];
@@ -231,6 +230,10 @@ function epApplicant($a, $id)
     $full = $applicant['fullFormData'] ?? [];
     $data = [];
     foreach (EP_APPLICANT_KEYS as $k) if (array_key_exists($k, $full)) $data[$k] = $full[$k];
+    // Middle INITIAL only (never the whole middle name), and the age instead of the birth date.
+    $middle = trim((string) ($full['middleName'] ?? ''));
+    $data['middleInitial'] = $middle !== '' ? mb_strtoupper(mb_substr($middle, 0, 1)) . '.' : '';
+    if (!empty($applicant['age'])) $data['age'] = (int) $applicant['age'];
 
     db()->prepare("INSERT INTO employer_access_log (account_id, employer_id, action, applicant_id, ip_address) VALUES (:acc, :e, 'view_applicant', :a, :ip)")
         ->execute([':acc' => (int) $a['account_id'], ':e' => (int) $a['employer_id'], ':a' => (int) $id, ':ip' => employerClientIp()]);
@@ -326,17 +329,80 @@ function epDocument($a, $id)
     exit;
 }
 
-// One request as the employer sees it.
-function epRequestRow($r)
+// The labels staff use for the fields of a company / opening request (the saved "before" of an accepted request is keyed by these).
+const EP_COMPANY_LABELS = [
+    'contactPersonName' => 'Contact person', 'contactPersonPosition' => 'Position', 'contactNumber' => 'Contact number',
+    'emailAddress' => 'Email', 'buildingNo' => 'Building no.', 'street' => 'Street',
+];
+const EP_VACANCY_LABELS = [
+    'jobTitle' => 'Job title', 'jobType' => 'Job type', 'description' => 'Description', 'requirements' => 'Requirements',
+    'salaryMin' => 'Minimum salary', 'salaryMax' => 'Maximum salary', 'slotsTotal' => 'Openings', 'status' => 'Status',
+];
+
+// What this employer's own records say NOW (referral and placement statuses, company details, openings), in four small queries,
+// so each request can show "what it was -> what was asked for". This is the employer's own data, nothing about anyone else.
+function epBeforeContext($employerId)
+{
+    $e = (int) $employerId;
+    $ctx = ['referral' => [], 'placement' => [], 'vacancy' => [], 'employer' => []];
+    $q = db()->prepare("SELECT r.referral_id, r.status::text AS status FROM employment_facilitation_referrals r JOIN vacancies v ON v.vacancy_id = r.vacancy_id WHERE v.employer_id = :e");
+    $q->execute([':e' => $e]);
+    foreach ($q->fetchAll() as $x) $ctx['referral'][(int) $x['referral_id']] = $x['status'];
+    $q = db()->prepare("SELECT p.placement_id, p.status::text AS status FROM employment_facilitation_placements p WHERE p.employer_id = :e");
+    $q->execute([':e' => $e]);
+    foreach ($q->fetchAll() as $x) $ctx['placement'][(int) $x['placement_id']] = $x['status'];
+    $q = db()->prepare(
+        "SELECT v.vacancy_id, v.job_title, v.job_type::text AS job_type, v.description, v.requirements, v.salary_min, v.salary_max, v.slots_total, v.status::text AS status
+         FROM vacancies v WHERE v.employer_id = :e"
+    );
+    $q->execute([':e' => $e]);
+    foreach ($q->fetchAll() as $x) $ctx['vacancy'][(int) $x['vacancy_id']] = vacancyRequestCurrent($x);
+    $q = db()->prepare("SELECT contact_person_name, contact_person_position, contact_number, email_address, building_no, street FROM employers WHERE employer_id = :e");
+    $q->execute([':e' => $e]);
+    $ctx['employer'] = $q->fetch() ?: [];
+    return $ctx;
+}
+
+// One request as the employer sees it. With $ctx (see epBeforeContext) it also carries what the thing was before the change:
+//   pending / rejected / withdrawn -> as it is now;  approved -> as it was when the PESO approved it (saved then; older ones have none).
+function epRequestRow($r, $ctx = null)
 {
     $p = json_decode((string) ($r['payload'] ?? '[]'), true) ?: [];
-    unset($p['_before']);   // staff-side record of the values before an accepted change; not shown to employers
+    $saved = is_array($p['_before'] ?? null) ? $p['_before'] : null;
+    unset($p['_before']);   // staff-side record of the values before an accepted change; only the "before" values are passed on below
+    $approved = ($r['status'] ?? '') === 'Approved';
+    $type = $r['request_type'];
+
+    $currentStatus = null;
+    $before = null;
+    if ($ctx !== null) {
+        if ($type === 'referral_status') {
+            $currentStatus = $approved ? ($saved['currentStatus'] ?? null) : ($ctx['referral'][(int) ($r['referral_id'] ?? 0)] ?? null);
+        } elseif ($type === 'placement_status') {
+            $currentStatus = $approved ? ($saved['currentStatus'] ?? null) : ($ctx['placement'][(int) ($r['placement_id'] ?? 0)] ?? null);
+        } elseif ($type === 'company_info' || $type === 'vacancy_update') {
+            $was = is_array($saved['changes'] ?? null) ? $saved['changes'] : [];
+            $labels = $type === 'company_info' ? EP_COMPANY_LABELS : EP_VACANCY_LABELS;
+            $now = $type === 'company_info'
+                ? array_combine(array_keys(EP_COMPANY_FIELDS), array_map(fn ($col) => $ctx['employer'][$col] ?? null, array_values(EP_COMPANY_FIELDS)))
+                : ($ctx['vacancy'][(int) ($r['q_vacancy_id'] ?? 0)] ?? []);
+            $before = [];
+            foreach (array_keys($p) as $k) {
+                if (!isset($labels[$k])) continue;
+                $v = $approved ? ($was[$labels[$k]] ?? null) : ($now[$k] ?? null);
+                $before[$k] = $v === null ? '' : (string) $v;
+            }
+            if (!$before) $before = null;
+        }
+    }
+
     return [
-        'id' => (int) $r['request_id'], 'type' => $r['request_type'], 'status' => $r['status'],
+        'id' => (int) $r['request_id'], 'type' => $type, 'status' => $r['status'],
         'applicantName' => $r['applicant_name'] ?? null,
-        'jobTitle' => $r['request_type'] === 'vacancy_new' ? ($p['jobTitle'] ?? null) : ($r['job_title'] ?? null),
+        'jobTitle' => $type === 'vacancy_new' ? ($p['jobTitle'] ?? null) : ($r['job_title'] ?? null),
         'requestedStatus' => $p['status'] ?? null, 'dateHired' => $p['dateHired'] ?? null,
-        'changes' => in_array($r['request_type'], ['company_info', 'vacancy_new', 'vacancy_update'], true) ? $p : null,
+        'currentStatus' => $currentStatus, 'before' => $before,
+        'changes' => in_array($type, ['company_info', 'vacancy_new', 'vacancy_update'], true) ? $p : null,
         'reviewNote' => $r['review_note'] ?? null, 'submittedAt' => $r['submitted_at'] ?? null, 'reviewedAt' => $r['reviewed_at'] ?? null,
     ];
 }
@@ -345,7 +411,8 @@ function epRequestRow($r)
 function epRequests($a)
 {
     $s = db()->prepare(
-        "SELECT q.request_id, q.request_type, q.status, q.review_note, q.submitted_at, q.reviewed_at, q.payload,
+        "SELECT q.request_id, q.request_type, q.status, q.review_note, q.submitted_at, q.reviewed_at, q.payload, q.referral_id, q.placement_id,
+                CAST(to_jsonb(q)->>'vacancy_id' AS bigint) AS q_vacancy_id,
                 COALESCE(rn.n, pn.n) AS applicant_name, COALESCE(rv.job_title, pv.job_title, vv.job_title) AS job_title
          FROM employer_requests q
          LEFT JOIN LATERAL (SELECT " . EP_NAME_SQL . " AS n, r.vacancy_id FROM employment_facilitation_referrals r
@@ -360,7 +427,8 @@ function epRequests($a)
          WHERE q.employer_id = :e ORDER BY q.submitted_at DESC, q.request_id DESC LIMIT 200"
     );
     $s->execute([':e' => (int) $a['employer_id']]);
-    json(['status' => 'ok', 'data' => array_map('epRequestRow', $s->fetchAll())]);
+    $ctx = epBeforeContext($a['employer_id']);
+    json(['status' => 'ok', 'data' => array_map(fn ($r) => epRequestRow($r, $ctx), $s->fetchAll())]);
 }
 
 // Clean a proposed hire date: Y-m-d, not in the future. Empty -> today.

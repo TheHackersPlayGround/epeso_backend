@@ -9,6 +9,7 @@ include_once __DIR__ . '/../core/activity_log.php';
 include_once __DIR__ . '/../core/ef_actions.php';
 include_once __DIR__ . '/../core/ef_applicant.php';
 include_once __DIR__ . '/../core/ef_shared_documents.php';
+include_once __DIR__ . '/../core/portal_status.php';
 
 // Router entry point. index.php calls this with the parsed action/id/method.
 function handle($action, $id, $method)
@@ -1330,8 +1331,12 @@ function efUpdateEmployer($id)
     $err = efValidateEmployer($d);
     if ($err) error($err, 422);
 
+    $portalChanged = false;
+    $pdo = db();
     try {
-        $stmt = db()->prepare(
+        // One transaction: the employer and its portal login (if it has one) change status together or not at all.
+        $pdo->beginTransaction();
+        $stmt = $pdo->prepare(
             "UPDATE employers SET
                 company_name = :name, industry = :industry, tin_number = :tin,
                 contact_person_name = :cname, contact_person_position = :cpos,
@@ -1342,11 +1347,16 @@ function efUpdateEmployer($id)
              WHERE employer_id = :eid"
         );
         efBindEmployer($stmt, $d, [':eid' => (int) $id]);
+        $newStatus = in_array($d['status'] ?? '', ['Active', 'Inactive'], true) ? $d['status'] : 'Active';
+        $portalChanged = syncPortalAccountToEmployer($pdo, (int) $id, $newStatus);
+        $pdo->commit();
     } catch (Throwable $e) {
+        if ($pdo->inTransaction()) $pdo->rollBack();
         error('Failed to update employer. Please try again.', 500);
     }
 
-    logActivity(currentUserId(), 'Update Employer', 'employment', "Updated employer: " . trim($d['companyName']));
+    logActivity(currentUserId(), 'Update Employer', 'employment', "Updated employer: " . trim($d['companyName'])
+        . ($portalChanged ? " (its portal account is now {$newStatus} too)" : ''));
     json(['status' => 'ok', 'message' => 'Employer updated.']);
 }
 
@@ -1359,7 +1369,7 @@ function efDeleteEmployer($id)
     $check = db()->prepare("SELECT COUNT(*) FROM vacancies WHERE employer_id = :id");
     $check->execute([':id' => (int) $id]);
     if ((int) $check->fetchColumn() > 0) {
-        error('Cannot delete: this employer has vacancies. Remove the vacancies first.', 409);
+        error("This employer has vacancies, so it can't be deleted. Set its status to Inactive instead.", 409);
     }
 
     $nameS = db()->prepare("SELECT company_name FROM employers WHERE employer_id=:id");
