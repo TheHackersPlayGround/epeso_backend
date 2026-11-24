@@ -32,15 +32,23 @@ function eauthPayload($acc)
     ];
 }
 
-function eauthIsLocked($username, $ip)
+// How many seconds are left until this sign-in may try again (0 = not locked). A lock ends when enough of the recent failures
+// have aged out of the window: with a limit of 5, five failures lock it, and it opens again when the OLDEST one is 15 minutes old.
+function eauthLockSeconds($username, $ip)
 {
-    $s = db()->prepare(
-        "SELECT COUNT(*) FILTER (WHERE username = :u) AS by_user, COUNT(*) FILTER (WHERE ip_address = :ip) AS by_ip
-         FROM employer_login_attempts WHERE created_at > now() - make_interval(mins => :m)"
-    );
-    $s->execute([':u' => $username, ':ip' => $ip, ':m' => EAUTH_LOCK_MINUTES]);
-    $r = $s->fetch();
-    return (int) $r['by_user'] >= EAUTH_MAX_FAILS_PER_USER || (int) $r['by_ip'] >= EAUTH_MAX_FAILS_PER_IP;
+    $left = 0;
+    foreach ([['username', $username, EAUTH_MAX_FAILS_PER_USER], ['ip_address', $ip, EAUTH_MAX_FAILS_PER_IP]] as [$col, $val, $max]) {
+        $s = db()->prepare(
+            "SELECT CEIL(EXTRACT(EPOCH FROM (created_at + make_interval(mins => :m1) - now()))) AS secs
+             FROM employer_login_attempts
+             WHERE {$col} = :v AND created_at > now() - make_interval(mins => :m2)
+             ORDER BY created_at ASC"
+        );
+        $s->execute([':v' => $val, ':m1' => EAUTH_LOCK_MINUTES, ':m2' => EAUTH_LOCK_MINUTES]);
+        $secs = array_map('intval', $s->fetchAll(PDO::FETCH_COLUMN));
+        if (count($secs) >= $max) $left = max($left, $secs[count($secs) - $max]);
+    }
+    return $left;
 }
 
 function eauthRecordFailure($username, $ip)
@@ -59,8 +67,11 @@ function eauthLogin()
     if (strlen($username) > 50 || strlen($password) > 200) error('Incorrect username or password.', 401);
 
     $ip = employerClientIp();
-    if (eauthIsLocked($username, $ip)) {
-        error('Too many sign-in attempts. Please wait ' . EAUTH_LOCK_MINUTES . ' minutes and try again.', 429);
+    $wait = eauthLockSeconds($username, $ip);
+    if ($wait > 0) {
+        $mins = (int) ceil($wait / 60);
+        // retryAfter lets the sign-in page show a live countdown.
+        error('Too many sign-in attempts. Please try again in ' . $mins . ' minute' . ($mins === 1 ? '' : 's') . '.', 429, ['code' => 'LOCKED', 'retryAfter' => $wait]);
     }
 
     $s = db()->prepare(

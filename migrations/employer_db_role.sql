@@ -16,7 +16,7 @@
 DO $$
 BEGIN
   IF NOT EXISTS (SELECT 1 FROM pg_roles WHERE rolname = 'employer_app') THEN
-    CREATE ROLE employer_app LOGIN PASSWORD 'gapo+x/@#$2005Toyang2005.....' NOSUPERUSER NOCREATEDB NOCREATEROLE;
+    CREATE ROLE employer_app LOGIN PASSWORD 'gapo+x/@#05Toyang2005.....' NOSUPERUSER NOCREATEDB NOCREATEROLE;
   END IF;
 END $$;
 
@@ -33,7 +33,8 @@ GRANT SELECT ON
   employers, vacancies, employment_facilitation_referrals, employment_facilitation_placements,
   beneficiaries, beneficiary_services, services, barangays, cities, provinces, regions,
   employment_facilitation_profiles, educations, trainings, applicant_credentials, work_experiences,
-  job_preferences, languages, skills, disabilities, attached_documents
+  job_preferences, languages, skills, disabilities, attached_documents,
+  placement_promotions   -- (the job title a placement has now; table from 011_placement_promotions.sql)
 TO employer_app;
 
 -- Employer tables: the only things this account may write.

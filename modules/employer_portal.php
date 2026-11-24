@@ -19,6 +19,7 @@ include_once __DIR__ . '/../core/employer_session.php';
 include_once __DIR__ . '/../core/ef_actions.php';
 include_once __DIR__ . '/../core/ef_applicant.php';
 include_once __DIR__ . '/../core/ef_vacancy_rules.php';
+include_once __DIR__ . '/../core/ef_promotion_rules.php';
 include_once __DIR__ . '/../core/ef_shared_documents.php';
 
 function handle($action, $id, $method)
@@ -76,11 +77,33 @@ function epOpenRequests($employerId)
     $out = ['referral' => [], 'placement' => [], 'vacancy' => [], 'company' => null];
     foreach ($s->fetchAll() as $r) {
         $p = json_decode((string) $r['payload'], true) ?: [];
-        $item = ['id' => (int) $r['request_id'], 'requestedStatus' => $p['status'] ?? null, 'dateHired' => $p['dateHired'] ?? null, 'submittedAt' => $r['submitted_at']];
+        $item = ['id' => (int) $r['request_id'], 'type' => $r['request_type'], 'requestedStatus' => $p['status'] ?? null, 'dateHired' => $p['dateHired'] ?? null,
+                 'newJobTitle' => $p['newJobTitle'] ?? null, 'submittedAt' => $r['submitted_at']];
         if ($r['request_type'] === 'referral_status')       $out['referral'][(int) $r['referral_id']] = $item;
-        elseif ($r['request_type'] === 'placement_status')  $out['placement'][(int) $r['placement_id']] = $item;
+        elseif ($r['request_type'] === 'placement_status' || $r['request_type'] === 'placement_promotion') $out['placement'][(int) $r['placement_id']] = $item;
         elseif ($r['request_type'] === 'vacancy_update')    $out['vacancy'][(int) $r['vacancy_id']] = ['id' => (int) $r['request_id'], 'changes' => $p, 'submittedAt' => $r['submitted_at']];
         elseif ($r['request_type'] === 'company_info')      $out['company'] = ['id' => (int) $r['request_id'], 'changes' => $p, 'submittedAt' => $r['submitted_at']];
+    }
+    return $out;
+}
+
+// Each of this employer's placements -> its job title NOW (latest promotion, else the opening's title).
+function epCurrentTitles($employerId)
+{
+    $out = [];
+    $q = db()->prepare("SELECT p.placement_id, v.job_title FROM employment_facilitation_placements p JOIN vacancies v ON v.vacancy_id = p.vacancy_id WHERE p.employer_id = :e");
+    $q->execute([':e' => (int) $employerId]);
+    foreach ($q->fetchAll() as $x) $out[(int) $x['placement_id']] = $x['job_title'];
+    try {
+        $q = db()->prepare(
+            "SELECT DISTINCT ON (pp.placement_id) pp.placement_id, pp.new_job_title
+             FROM placement_promotions pp JOIN employment_facilitation_placements p ON p.placement_id = pp.placement_id
+             WHERE p.employer_id = :e ORDER BY pp.placement_id, pp.promotion_date DESC, pp.promotion_id DESC"
+        );
+        $q->execute([':e' => (int) $employerId]);
+        foreach ($q->fetchAll() as $x) $out[(int) $x['placement_id']] = $x['new_job_title'];
+    } catch (PDOException $ex) {
+        error_log('epCurrentTitles: ' . $ex->getMessage());   // migration 089 not run yet: the opening's title is shown
     }
     return $out;
 }
@@ -199,9 +222,12 @@ function epPlacements($a)
     );
     $s->execute([':e' => (int) $a['employer_id']]);
     $open = epOpenRequests($a['employer_id']);
+    $titles = epCurrentTitles($a['employer_id']);
     json(['status' => 'ok', 'data' => array_map(fn ($r) => [
         'id' => (int) $r['placement_id'], 'vacancyId' => (int) $r['vacancy_id'], 'applicantId' => (int) $r['applicant_id'], 'applicantName' => $r['applicant_name'],
-        'jobTitle' => $r['job_title'], 'dateHired' => $r['date_hired'], 'status' => $r['status'],
+        'jobTitle' => $titles[(int) $r['placement_id']] ?? $r['job_title'],
+        // hiredAs = the opening's title: the position the person was hired into (jobTitle above changes after a promotion)
+        'hiredAs' => $r['job_title'], 'dateHired' => $r['date_hired'], 'status' => $r['status'],
         'openRequest' => $open['placement'][(int) $r['placement_id']] ?? null,
     ], $s->fetchAll())]);
 }
@@ -334,6 +360,9 @@ const EP_COMPANY_LABELS = [
     'contactPersonName' => 'Contact person', 'contactPersonPosition' => 'Position', 'contactNumber' => 'Contact number',
     'emailAddress' => 'Email', 'buildingNo' => 'Building no.', 'street' => 'Street',
 ];
+const EP_PROMOTION_LABELS = [
+    'promotionDate' => 'Promotion date', 'newJobTitle' => 'New job title', 'newSalaryMin' => 'New minimum salary', 'newSalaryMax' => 'New maximum salary', 'remarks' => 'Remarks',
+];
 const EP_VACANCY_LABELS = [
     'jobTitle' => 'Job title', 'jobType' => 'Job type', 'description' => 'Description', 'requirements' => 'Requirements',
     'salaryMin' => 'Minimum salary', 'salaryMax' => 'Maximum salary', 'slotsTotal' => 'Openings', 'status' => 'Status',
@@ -344,7 +373,7 @@ const EP_VACANCY_LABELS = [
 function epBeforeContext($employerId)
 {
     $e = (int) $employerId;
-    $ctx = ['referral' => [], 'placement' => [], 'vacancy' => [], 'employer' => []];
+    $ctx = ['referral' => [], 'placement' => [], 'vacancy' => [], 'employer' => [], 'title' => epCurrentTitles($e)];
     $q = db()->prepare("SELECT r.referral_id, r.status::text AS status FROM employment_facilitation_referrals r JOIN vacancies v ON v.vacancy_id = r.vacancy_id WHERE v.employer_id = :e");
     $q->execute([':e' => $e]);
     foreach ($q->fetchAll() as $x) $ctx['referral'][(int) $x['referral_id']] = $x['status'];
@@ -380,12 +409,14 @@ function epRequestRow($r, $ctx = null)
             $currentStatus = $approved ? ($saved['currentStatus'] ?? null) : ($ctx['referral'][(int) ($r['referral_id'] ?? 0)] ?? null);
         } elseif ($type === 'placement_status') {
             $currentStatus = $approved ? ($saved['currentStatus'] ?? null) : ($ctx['placement'][(int) ($r['placement_id'] ?? 0)] ?? null);
-        } elseif ($type === 'company_info' || $type === 'vacancy_update') {
+        } elseif ($type === 'company_info' || $type === 'vacancy_update' || $type === 'placement_promotion') {
             $was = is_array($saved['changes'] ?? null) ? $saved['changes'] : [];
-            $labels = $type === 'company_info' ? EP_COMPANY_LABELS : EP_VACANCY_LABELS;
+            $labels = $type === 'company_info' ? EP_COMPANY_LABELS : ($type === 'placement_promotion' ? EP_PROMOTION_LABELS : EP_VACANCY_LABELS);
             $now = $type === 'company_info'
                 ? array_combine(array_keys(EP_COMPANY_FIELDS), array_map(fn ($col) => $ctx['employer'][$col] ?? null, array_values(EP_COMPANY_FIELDS)))
-                : ($ctx['vacancy'][(int) ($r['q_vacancy_id'] ?? 0)] ?? []);
+                : ($type === 'placement_promotion'
+                    ? ['newJobTitle' => $ctx['title'][(int) ($r['placement_id'] ?? 0)] ?? null]   // the title before the promotion
+                    : ($ctx['vacancy'][(int) ($r['q_vacancy_id'] ?? 0)] ?? []));
             $before = [];
             foreach (array_keys($p) as $k) {
                 if (!isset($labels[$k])) continue;
@@ -402,7 +433,7 @@ function epRequestRow($r, $ctx = null)
         'jobTitle' => $type === 'vacancy_new' ? ($p['jobTitle'] ?? null) : ($r['job_title'] ?? null),
         'requestedStatus' => $p['status'] ?? null, 'dateHired' => $p['dateHired'] ?? null,
         'currentStatus' => $currentStatus, 'before' => $before,
-        'changes' => in_array($type, ['company_info', 'vacancy_new', 'vacancy_update'], true) ? $p : null,
+        'changes' => in_array($type, ['company_info', 'vacancy_new', 'vacancy_update', 'placement_promotion'], true) ? $p : null,
         'reviewNote' => $r['review_note'] ?? null, 'submittedAt' => $r['submitted_at'] ?? null, 'reviewedAt' => $r['reviewed_at'] ?? null,
     ];
 }
@@ -483,6 +514,16 @@ function epSubmitRequest($a)
         if (!in_array($target, EP_PLACEMENT_TARGETS, true)) error('Choose a valid status.', 422);
         if ($cur !== 'Active') error("This placement is already marked {$cur}.", 409);
         $payload = ['status' => $target];
+    } elseif ($type === 'placement_promotion') {
+        $placementId = ctype_digit((string) ($d['placementId'] ?? '')) ? (int) $d['placementId'] : 0;
+        $s = db()->prepare("SELECT status::text AS status, date_hired FROM employment_facilitation_placements WHERE placement_id = :p AND employer_id = :e");
+        $s->execute([':p' => $placementId, ':e' => $e]);
+        $row = $s->fetch();
+        if (!$row) error('Placement not found.', 404);
+        if ($row['status'] !== 'Active') error("Only an active placement can be promoted. This one is marked {$row['status']}.", 409);
+        $res = promotionRequestClean($payloadIn, $row['date_hired'], promotionCurrentTitle(db(), $placementId));
+        if ($res['error']) error($res['error'], 422);
+        $payload = $res['clean'];
     } elseif ($type === 'vacancy_new') {
         $s = db()->prepare("SELECT COUNT(*) FROM employer_requests WHERE employer_id = :e AND request_type = 'vacancy_new' AND status = 'Pending'");
         $s->execute([':e' => $e]);

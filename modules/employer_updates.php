@@ -13,6 +13,7 @@ include_once __DIR__ . '/../core/guard.php';
 include_once __DIR__ . '/../core/activity_log.php';
 include_once __DIR__ . '/../core/ef_actions.php';
 include_once __DIR__ . '/../core/ef_vacancy_rules.php';
+include_once __DIR__ . '/../core/ef_promotion_rules.php';
 
 function handle($action, $id, $method)
 {
@@ -38,6 +39,10 @@ const EU_COMPANY_FIELDS = [
 
 const EU_REFERRAL_TARGETS  = ['Interviewed', 'Hired', 'Not Hired'];
 const EU_PLACEMENT_TARGETS = ['Resigned', 'Terminated', 'Completed'];
+// The labels staff see for the fields of a promotion request (the saved "before" of an accepted request is keyed by these).
+const EU_PROMOTION_LABELS = [
+    'promotionDate' => 'Promotion date', 'newJobTitle' => 'New job title', 'newSalaryMin' => 'New minimum salary', 'newSalaryMax' => 'New maximum salary', 'remarks' => 'Remarks',
+];
 
 function euPayload($row)
 {
@@ -152,6 +157,16 @@ function euCheck($pdo, $q, $dateOverride = null)
         return ['problem' => null, 'ctx' => $pl, 'clean' => ['status' => $target]];
     }
 
+    if ($type === 'placement_promotion') {
+        $pl = euLoadPlacement($pdo, $q['placement_id']);
+        if (!$pl)                                         return ['problem' => 'This placement no longer exists.', 'ctx' => null];
+        if ((int) $pl['employer_id'] !== (int) $q['employer_id']) return ['problem' => 'This placement no longer belongs to this employer.', 'ctx' => $pl];
+        if ($pl['status'] !== 'Active')                   return ['problem' => "This placement is already marked {$pl['status']}, so it cannot be promoted.", 'ctx' => $pl];
+        $res = promotionRequestClean($p, $pl['date_hired'], promotionCurrentTitle($pdo, $q['placement_id']));
+        if ($res['error']) return ['problem' => $res['error'], 'ctx' => $pl];
+        return ['problem' => null, 'ctx' => $pl, 'clean' => $res['clean']];
+    }
+
     if ($type === 'vacancy_new') {
         $e = euLoadEmployer($pdo, $q['employer_id']);
         if (!$e) return ['problem' => 'This employer no longer exists.', 'ctx' => null];
@@ -212,6 +227,18 @@ function euDescribe($pdo, $q)
         $out['jobTitle']        = $pl['job_title'] ?? null;
         $out['currentStatus']   = $pl['status'] ?? null;
         $out['requestedStatus'] = $p['status'] ?? null;
+    } elseif ($q['request_type'] === 'placement_promotion') {
+        $pl = euLoadPlacement($pdo, $q['placement_id']);
+        $title = promotionCurrentTitle($pdo, $q['placement_id']);
+        $out['applicantName'] = $pl['applicant_name'] ?? null;
+        $out['jobTitle']      = $title ?? ($pl['job_title'] ?? null);
+        $out['currentStatus'] = $pl['status'] ?? null;
+        $changes = [];
+        foreach (PROMOTION_REQUEST_FIELDS as $key) {
+            if (!array_key_exists($key, $p)) continue;
+            $changes[] = ['field' => EU_PROMOTION_LABELS[$key], 'current' => $key === 'newJobTitle' ? (string) $title : '', 'requested' => trim((string) $p[$key])];
+        }
+        $out['changes'] = $changes;
     } elseif ($q['request_type'] === 'vacancy_new' || $q['request_type'] === 'vacancy_update') {
         $labels = [
             'jobTitle' => 'Job title', 'jobType' => 'Job type', 'description' => 'Description', 'requirements' => 'Requirements',
@@ -384,6 +411,14 @@ function euAccept($id)
             $pdo->prepare("UPDATE employment_facilitation_placements SET status = :s, updated_at = now() WHERE placement_id = :id")
                 ->execute([':s' => $clean['status'], ':id' => (int) $q['placement_id']]);
             $note = "Placement #{$q['placement_id']} ({$ctx['applicant_name']}) -> {$clean['status']}";
+        } elseif ($q['request_type'] === 'placement_promotion') {
+            // The same record staff create by hand (Placements -> Record Promotion); created_by is the staff member who accepted it.
+            $pdo->prepare(
+                "INSERT INTO placement_promotions (placement_id, promotion_date, new_job_title, new_salary_min, new_salary_max, remarks, created_by)
+                 VALUES (:pid, :d, :t, :smin, :smax, :rem, :uid)"
+            )->execute([':pid' => (int) $q['placement_id'], ':d' => $clean['promotionDate'], ':t' => $clean['newJobTitle'],
+                        ':smin' => $clean['newSalaryMin'] ?? null, ':smax' => $clean['newSalaryMax'] ?? null, ':rem' => $clean['remarks'] ?? null, ':uid' => $uid]);
+            $note = "Placement #{$q['placement_id']} ({$ctx['applicant_name']}) promoted to \"{$clean['newJobTitle']}\"";
         } elseif ($q['request_type'] === 'vacancy_new') {
             $ins = $pdo->prepare(
                 "INSERT INTO vacancies (employer_id, job_title, slots_total, job_type, salary_min, salary_max, description, requirements, status, source)
